@@ -1,5 +1,7 @@
 # NetFast
 
+[English](./README.md) | [简体中文](./README_zh.md)
+
 A high-performance userspace TCP/IP networking stack built on AF_XDP (eXpress Data Path), designed for low-latency, high-throughput scenarios. NetFast bypasses the kernel network stack entirely for data-plane operations while providing a POSIX-compatible socket API.
 
 ## Architecture
