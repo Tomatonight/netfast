@@ -1,0 +1,13 @@
+build/
+build-nohw/
+_VSCodeCounter/
+_VSCodeCounter(1)*/
+.vscode/
+_clinerules/
+todo
+ai_readme
+config.json
+*.o
+*.d
+*.so
+main/main
