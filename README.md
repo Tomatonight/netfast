@@ -133,6 +133,30 @@ automatic bind followed by `connect()`.
 
 ## Build
 
+### Guided setup (Debian/Ubuntu)
+
+For a first installation, use the guided setup script:
+
+```bash
+./setup.sh
+```
+
+It checks or installs build dependencies, avoids active/primary default-route
+and SSH interfaces, detects the selected interface's current queue count, writes a
+local `config.json`, builds the release profile, and installs NetFast under
+`/usr/local`. It does not attach XDP during installation; XDP is attached when a
+root process first loads `libnetfast.so`.
+
+For an unattended lab installation, specify the dedicated interface explicitly:
+
+```bash
+./setup.sh --interface ens192 --queues 2 --workers 2 --yes
+```
+
+Use `./setup.sh --help` for safety overrides and `--dry-run` to inspect the plan
+without changing the system. The script deliberately refuses to select the
+active management interface unless `--allow-management-interface` is supplied.
+
 ### Requirements
 
 - Linux with AF_XDP support

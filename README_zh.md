@@ -122,6 +122,29 @@ int submit_writes(int socket_fd, const void *buffers[BATCH],
 
 ## 构建
 
+### 引导式安装（Debian/Ubuntu）
+
+首次安装可以直接运行：
+
+```bash
+./setup.sh
+```
+
+脚本会检查或安装构建依赖，避开当前/主默认路由和 SSH 网卡，读取所选
+网卡的当前队列数，生成本机 `config.json`，构建 Release 版并安装到
+`/usr/local`。安装过程不会挂载 XDP；第一个以 root 身份加载
+`libnetfast.so` 的进程才会挂载。
+
+在可控实验环境中可以显式指定参数：
+
+```bash
+./setup.sh --interface ens192 --queues 2 --workers 2 --yes
+```
+
+使用 `./setup.sh --help` 查看安全覆盖选项，使用 `--dry-run` 只检查而不修改
+系统。除非显式传入 `--allow-management-interface`，脚本会拒绝使用
+当前管理网卡。
+
 ### 依赖
 
 - 支持 AF_XDP 的 Linux
