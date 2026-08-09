@@ -16,7 +16,7 @@
 #include "netlink.h"
 #include "loopback.h"
 #include "tcp.h"
-#include "../api/netfast.h"
+#include "netfast.h"
 
 worker *main_worker = NULL;
 worker *g_workers = NULL;
@@ -150,7 +150,7 @@ void set_current_worker(worker *w)
 }
 worker *random_worker(void)
 {
-    uint32_t state = random_state;
+    uint32_t state = get_current_time_ms();
     return &g_workers[state % (uint32_t)g_worker_num];
 }
 

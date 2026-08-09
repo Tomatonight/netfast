@@ -18,15 +18,11 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
 static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len, int flags, sockaddr_in* dest_addr, socklen_t addrlen);
 static int udp_recv_(skbuff* skb);
 static int udp_release(struct Socket *sock, req* r);
-static int udp_pcb_init(struct Socket* sock);
-static bool udp_drain_send_queue(Socket* sock);
 
-/* IP fragmentation mutates and splits its input skb.  Send a shallow clone
- * when fragmentation is expected so an EAGAIN retry keeps the queued UDP
- * datagram intact. */
-static int udp_output(skbuff* skb, bool* original_unchanged)
+/* IP fragmentation mutates and splits its input skb, so output a shallow
+ * clone when fragmentation is required. */
+static int udp_output(skbuff* skb)
 {
-    *original_unchanged = false;
     skbuff* output = skb;
     uint32_t ip_header = skb->family == AF_INET6
         ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
@@ -35,7 +31,6 @@ static int udp_output(skbuff* skb, bool* original_unchanged)
         output = skb_clone(skb);
         if (!output)
             return -ENOMEM;
-        *original_unchanged = true;
     }
 
     int ret = skb->family == AF_INET6
@@ -43,27 +38,6 @@ static int udp_output(skbuff* skb, bool* original_unchanged)
     if (output != skb)
         PUT_REF(output);
     return ret;
-}
-
-/* The socket queue is a backpressure queue, not the normal UDP output path.
- * The caller keeps success semantics after ownership has been transferred to
- * this queue; its timer retries the same skb in-order. */
-static void udp_enqueue_send(Socket* sock, skbuff* skb)
-{
-    udp_pcb* pcb = (udp_pcb*)sock->pcb;
-    uint32_t payload_len = skb_data_len(skb) - sizeof(udp_hdr);
-
-    INC_REF(skb);
-    add_queue(&sock->send_queue, &skb->queue_node);
-    sock->send_buffer_len += payload_len;
-
-    if (!pcb->send_task->registered || !pcb->send_task->timeout) {
-        pcb->send_task->timeout =
-            get_current_time_ms() + pcb->send_retry_interval;
-        register_task(sock->owner->master, pcb->send_task);
-    }
-
-    PUT_REF(skb);
 }
 
 static Socket* udp_lookup_recv_socket(uint32_t src_ip, uint16_t src_port,
@@ -100,11 +74,26 @@ static Socket* udp_lookup_recv_socket6(const uint8_t src_ip[16], uint16_t src_po
 
 static void make_udp_hdr(Socket* sock, skbuff* skb){
     udp_hdr* hdr = skb->udp_hdr;
+    skb->tx_checksum_offset = 0;
     uint16_t udp_len = (uint16_t)skb_data_len(skb);
     hdr->sport = sock->sport;
     hdr->dport = sock->dport;
     hdr->len = htons(udp_len);
     hdr->check = 0;
+
+    uint32_t ip_len = udp_len + (sock->family == AF_INET6
+        ? IPV6_HDR_LEN : (uint32_t)sizeof(ipv4_hdr));
+    if (sock->route->if_info->hw_tx_checksum_enabled &&
+        ip_len <= get_route_mtu(sock->route)) {
+        hdr->check = sock->family == AF_INET6
+            ? skb_checksum_protocol6(NULL, udp_len, sock->sip6,
+                                     sock->dip6, IPPROTO_UDP)
+            : skb_checksum_protocol(NULL, udp_len, sock->sip,
+                                    sock->dip, IPPROTO_UDP);
+        skb->tx_checksum_offset = offsetof(udp_hdr, check);
+        return;
+    }
+
     if (sock->family == AF_INET6)
         hdr->check = skb_checksum_protocol6(skb, udp_len, sock->sip6,
                                             sock->dip6, IPPROTO_UDP);
@@ -115,7 +104,6 @@ static void make_udp_hdr(Socket* sock, skbuff* skb){
      * permits an on-wire zero UDP checksum. */
     if (hdr->check == 0)
         hdr->check = 0xffffu;
-    skb->udp_hdr = hdr;
 }
 static int socket_recv_skb(Socket* sock, skbuff* skb)
 {
@@ -312,139 +300,8 @@ static int udp_write(struct Socket *sock, req* r, const void *buf, uint32_t len)
 }
 
 
-static bool udp_drain_send_queue(Socket* sock)
-{
-    uint8_t entry_sip6[16];
-    uint8_t entry_dip6[16];
-    uint32_t entry_dip6_scope = sock->dip6_scope_id;
-    memcpy(entry_sip6, sock->sip6, sizeof(entry_sip6));
-    memcpy(entry_dip6, sock->dip6, sizeof(entry_dip6));
-    uint16_t entry_dport = sock->dport;
-    bool any_success = false;
-
-    while (sock->send_queue.element_number) {
-        skbuff* skb = SKB_FROM_QUEUE_NODE(get_queue_first(&sock->send_queue));
-        if (!skb)
-            break;
-
-        uint32_t data_len = skb_data_len(skb) - sizeof(udp_hdr);
-
-        /* Restore the addresses used when this datagram was checksummed. */
-        if (sock->family == AF_INET6) {
-            memcpy(sock->sip6, skb->l4_private.udp.src_ip6, 16);
-            memcpy(sock->dip6, skb->l4_private.udp.dst_ip6, 16);
-        } else {
-            sock->sip = skb->l4_private.udp.src_ip;
-            sock->dip = skb->l4_private.udp.dst_ip;
-        }
-        if (sock->family == AF_INET6)
-            sock->dip6_scope_id = skb->l4_private.udp.dst_scope_id;
-        sock->dport = skb->udp_hdr->dport;
-
-        int route_ret = set_socket_route(sock,
-            sock->family == AF_INET6 ? sock->dip6 : (const uint8_t*)&sock->dip,
-            sock->family == AF_INET6 ? sock->dip6_scope_id : 0);
-        if (route_ret < 0) {
-            WARN_LOG("UDP send: route unavailable, dropping %u queued packets",
-                    sock->send_queue.element_number);
-            skbuff* drop;
-            while ((drop = SKB_FROM_QUEUE_NODE(pop_queue(&sock->send_queue))) != NULL) {
-                PUT_REF(drop);
-            }
-            sock->send_buffer_len = 0;
-            sock->error = EHOSTUNREACH;
-            socket_notify_event(sock, notify_err);
-            goto out;
-        }
-
-        uint32_t pre_len = skb_data_len(skb);
-        bool original_unchanged;
-        int send_ret = udp_output(skb, &original_unchanged);
-
-        if (send_ret < 0) {
-            uint32_t pushed = !original_unchanged &&
-                skb_data_len(skb) > pre_len ? skb_data_len(skb) - pre_len : 0;
-            if (pushed) {
-                skb_consume(skb, pushed, true);
-                skb->udp_hdr = (udp_hdr*)skb_start(skb);
-            }
-            if (send_ret == -EAGAIN)
-                goto out;
-
-            /* Permanent error: drop this skb, try next. */
-            DEBUG_LOG("UDP send failed: err=%d", -send_ret);
-            (void)pop_queue(&sock->send_queue);
-            sock->send_buffer_len -= data_len;
-            sock->error = (send_ret == -ENETDOWN) ? ENETDOWN : EHOSTUNREACH;
-            socket_notify_event(sock, notify_err);
-            PUT_REF(skb);
-            continue;
-        }
-
-        /* Success. */
-        (void)pop_queue(&sock->send_queue);
-        sock->send_buffer_len -= data_len;
-        any_success = true;
-        PUT_REF(skb);
-    }
-
-out:
-    memcpy(sock->sip6, entry_sip6, sizeof(entry_sip6));
-    memcpy(sock->dip6, entry_dip6, sizeof(entry_dip6));
-    sock->dip6_scope_id = entry_dip6_scope;
-    sock->dport = entry_dport;
-    return any_success;
-}
-
-/* Timer callback: retry draining the send queue.  Exponential backoff on
- * consecutive failures; drop all queued packets after the limit. */
-static void udp_send_timer_cb(task* tk)
-{
-    udp_pcb* pcb = (udp_pcb*)tk->argv;
-    Socket* sock = pcb->sock;
-
-    bool any_success = udp_drain_send_queue(sock);
-
-    if (any_success) {
-        pcb->send_retry_count = 0;
-        pcb->send_retry_interval = UDP_SEND_RETRY_MIN_MS;
-        socket_notify_event(sock, notify_data_write);
-    }
-
-    if (sock->send_queue.element_number) {
-        /* No progress made → apply exponential backoff. */
-        if (!any_success) {
-            pcb->send_retry_count++;
-            pcb->send_retry_interval = min(pcb->send_retry_interval * 2,
-                                           UDP_SEND_RETRY_MAX_MS);
-        }
-
-        if (pcb->send_retry_count > UDP_SEND_RETRY_LIMIT) {
-            WARN_LOG("UDP send retry limit reached, dropping %u queued packets",
-                     sock->send_queue.element_number);
-            skbuff* skb;
-            while ((skb = SKB_FROM_QUEUE_NODE(pop_queue(&sock->send_queue))) != NULL) {
-                uint32_t dl = skb_data_len(skb) - sizeof(udp_hdr);
-                sock->send_buffer_len -= dl;
-                PUT_REF(skb);
-            }
-            sock->error = ENETUNREACH;
-            socket_notify_event(sock, notify_err);
-            return;
-        }
-
-        update_task_timer(pcb->send_task,
-                          get_current_time_ms() + pcb->send_retry_interval);
-    } else {
-        /* Queue empty → stop the retry timer. */
-        if (pcb->send_task->timeout) {
-            pcb->send_task->timeout = 0;
-            unregister_task(pcb->send_task);
-        }
-    }
-}
-
 static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len, int flags, sockaddr_in* dest_addr, socklen_t addrlen){
+    (void)flags;
     int ret = 0;
     uint8_t orig_sip6[16], orig_dip6[16];
     uint32_t orig_sip6_scope = sock->sip6_scope_id;
@@ -580,30 +437,6 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         goto exit;
     }
 
-    /* Send-buffer space check. */
-    if (SOCKET_USEABLE_SEND_BUFF_SIZE(sock) < len) {
-        if ((flags & MSG_DONTWAIT) || (sock->file_flags & O_NONBLOCK)) {
-            r->saved_errno = EAGAIN;
-            ret = -1;
-            goto exit;
-        }
-        if (!sock->options.send_timeout) {
-            wait(sock, r, REQ_WAITING_WRITE);
-            ret = REQ_PENDING;
-            goto exit;
-        }
-        if (r->status == REQ_WAITING_WRITE && r->timeout_task &&
-            r->timeout_task->timeout <= get_current_time_ms()) {
-            r->saved_errno = EAGAIN;
-            ret = -1;
-            goto exit;
-        }
-        wait_until(sock, r, REQ_WAITING_WRITE,
-                   get_current_time_ms() + get_time(&sock->send_timeout));
-        ret = REQ_PENDING;
-        goto exit;
-    }
-
     /* Build skb. */
     uint32_t udp_l2_len = sock->route->if_info->l2_len;
     uint32_t hdr_len = sizeof(udp_hdr) + (is_v6 ? MAX_IP6_HDR_WITH_EXT_LEN : MAX_IP_HDR_WITH_OPT_LEN) + udp_l2_len;
@@ -643,48 +476,17 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
 
     set_skb_by_socket(skb, sock);
     make_udp_hdr(sock, skb);
-    if (is_v6) {
-        memcpy(skb->l4_private.udp.src_ip6, sock->sip6, 16);
-        memcpy(skb->l4_private.udp.dst_ip6, sock->dip6, 16);
-    } else {
-        skb->l4_private.udp.src_ip = sock->sip;
-        skb->l4_private.udp.dst_ip = sock->dip;
-    }
-    if (is_v6)
-        skb->l4_private.udp.dst_scope_id = sock->dip6_scope_id;
-
-    /* Preserve datagram order while a previous output is back-pressured. */
-    if (sock->send_queue.element_number) {
-        udp_enqueue_send(sock, skb);
-        ret = (int)len;
-        goto exit;
-    }
 
     /* Immediate output path. */
-    uint32_t pre_len = skb_data_len(skb);
-    bool original_unchanged;
-    int send_ret = udp_output(skb, &original_unchanged);
+    int send_ret = udp_output(skb);
     if (send_ret == 0) {
         PUT_REF(skb);
         ret = (int)len;
         goto exit;
     }
 
-    /* Pop headers pushed by ipv4_output, restoring UDP-hdr-only state. */
-    uint32_t pushed = !original_unchanged && skb_data_len(skb) > pre_len
-        ? skb_data_len(skb) - pre_len : 0;
-    if (pushed) {
-        skb_consume(skb, pushed, true);
-        skb->udp_hdr = (udp_hdr*)skb_start(skb);
-    }
-
-    if (send_ret == -EAGAIN) {
-        udp_enqueue_send(sock, skb);
-        ret = (int)len;
-        goto exit;
-    }
-
-    r->saved_errno = (send_ret == -ENETDOWN) ? ENETDOWN : EHOSTUNREACH;
+    r->saved_errno = send_ret == -EAGAIN ? ENOBUFS
+        : send_ret == -ENETDOWN ? ENETDOWN : EHOSTUNREACH;
     PUT_REF(skb);
     ret = -1;
 
@@ -948,7 +750,7 @@ static uint32_t udp_poll(struct Socket* sock)
     if (sock->recv_buffer_len > 0 && !sock->flag.close_recv)
         mask |= EPOLLIN;
 
-    if (SOCKET_USEABLE_SEND_BUFF_SIZE(sock) > 0 && !sock->flag.close_send)
+    if (!sock->flag.close_send)
         mask |= EPOLLOUT;
 
     return mask;
@@ -957,44 +759,7 @@ static uint32_t udp_poll(struct Socket* sock)
 static int udp_release(struct Socket *sock, req* r)
 {
     (void)r;
-    udp_pcb* pcb = (udp_pcb*)sock->pcb;
-    if (pcb) {
-        if (pcb->send_task) {
-            destroy_task(pcb->send_task);
-        }
-        skbuff* skb;
-        while ((skb = SKB_FROM_QUEUE_NODE(pop_queue(&sock->send_queue))) != NULL) {
-            PUT_REF(skb);
-        }
-        free(pcb);
-        sock->pcb = NULL;
-    }
     destroy_socket(sock);
-    return 0;
-}
-static int udp_pcb_init(struct Socket* sock)
-{
-    udp_pcb* pcb = calloc(1, sizeof(udp_pcb));
-    if (!pcb) {
-        ERR_LOG("udp_pcb_init: calloc failed");
-        return -1;
-    }
-    sock->pcb = pcb;
-    pcb->sock = sock;
-
-    pcb->send_task = create_task(TASK_TYPE_TIMER);
-    if (!pcb->send_task) {
-        ERR_LOG("udp_pcb_init: create_task failed");
-        free(pcb);
-        sock->pcb = NULL;
-        return -1;
-    }
-    pcb->send_task->cb_timer = udp_send_timer_cb;
-    pcb->send_task->argv = (uint64_t)pcb;
-
-    pcb->send_retry_interval = UDP_SEND_RETRY_MIN_MS;
-    pcb->send_retry_count = 0;
-
     return 0;
 }
 
@@ -1012,7 +777,7 @@ static int udp_icmp_process(struct Socket* sock,
 }
 protocol_ops udp_protocol_ops = {
     .protocol = IPPROTO_UDP,
-    .pcb_init = udp_pcb_init,
+    .pcb_init = NULL,
     .icmp_process = udp_icmp_process,
     .read = udp_read,
     .write = udp_write,

@@ -32,23 +32,15 @@ typedef struct skbuff {
 
 	int family;
 	int protocol;
+	/* Offset from l4_hdr to its checksum field.  Zero disables TX checksum
+	 * offload. */
+	uint16_t tx_checksum_offset;
 	struct Socket* sock;
 	union {
 		struct {
 			uint32_t seq;
 			uint8_t flag;
 		} tcp;
-		struct {
-			union {
-				uint32_t src_ip;
-				uint8_t src_ip6[16];
-			};
-			union {
-				uint32_t dst_ip;
-				uint8_t dst_ip6[16];
-			};
-			uint32_t dst_scope_id;
-		} udp;
 	} l4_private;
 	union {
 		struct ether_hdr* ether_hdr;

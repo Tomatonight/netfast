@@ -2,252 +2,229 @@
 
 [English](./README.md) | [简体中文](./README_zh.md)
 
-A high-performance userspace TCP/IP networking stack built on AF_XDP (eXpress Data Path), designed for low-latency, high-throughput scenarios. NetFast bypasses the kernel network stack entirely for data-plane operations while providing a POSIX-compatible socket API.
+NetFast is an experimental userspace TCP/IP stack built on Linux AF_XDP. It
+combines a worker-owned network stack, UMEM-backed packet buffers, an epoll-like
+readiness API, and a completion-queue-based asynchronous API in one C library.
+
+The asynchronous API is the primary high-throughput interface: applications can
+submit many socket operations in one batch, keep multiple requests in flight,
+and consume completions in batches without running one blocking call per
+operation.
+
+> NetFast is under active development. Use it on dedicated test interfaces
+> before considering production deployment.
+
+## Highlights
+
+- **Asynchronous completion queues** with single and batch submission.
+- **Batched completion waits** with `min_complete`, `max_complete`, and an
+  overall timeout.
+- **Multiple waiters per CQ**; each completion is delivered to exactly one
+  waiter.
+- **AF_XDP data plane** with copy and zero-copy modes, depending on driver and
+  device support.
+- **Multi-worker ownership** and Toeplitz RSS steering for connection affinity.
+- **TCP and UDP over IPv4/IPv6**, including routing, ARP/NDP, ICMP, timers,
+  retransmission, fragmentation, and reassembly.
+- **POSIX-style synchronous and non-blocking APIs**, plus an epoll-compatible
+  readiness interface.
+- **UMEM-aware frame caches** and scatter-gather-capable socket buffers.
+- **Netlink integration** for routes, addresses, and neighbor state.
+
+## Async API at a Glance
+
+```c
+#include <errno.h>
+#include <stdint.h>
+#include <netfast.h>
+
+enum { BATCH = 64 };
+
+int submit_writes(int socket_fd, const void *buffers[BATCH],
+                  const uint32_t lengths[BATCH])
+{
+    int cq_fd = net_async_create();
+    if (cq_fd < 0)
+        return -1;
+
+    net_async_req *submitted[BATCH];
+    for (uint32_t i = 0; i < BATCH; ++i) {
+        submitted[i] = net_async_req_create(socket_fd, NET_ASYNC_WRITE,
+                                             buffers[i], lengths[i]);
+        if (!submitted[i])
+            return -1;
+    }
+
+    int accepted = net_async_submit_batch(cq_fd, submitted, BATCH);
+    if (accepted != BATCH)
+        return -1;
+
+    uint32_t remaining = BATCH;
+    while (remaining) {
+        net_async_req *completed[BATCH];
+        uint32_t desired = remaining < 16 ? remaining : 16;
+        int count = net_async_wait(cq_fd, completed,
+                                   desired,  /* desired completion batch */
+                                   BATCH,    /* output array capacity */
+                                   250);     /* overall timeout in ms */
+        if (count < 0)
+            return -1;
+        if (count == 0)
+            continue;
+
+        for (int i = 0; i < count; ++i) {
+            int request_errno = 0;
+            int result = net_async_req_result(completed[i], &request_errno);
+            if (result < 0)
+                errno = request_errno;
+            net_async_req_destroy(completed[i]);
+        }
+        remaining -= (uint32_t)count;
+    }
+
+    return net_async_close(cq_fd);
+}
+```
+
+Async ownership rules:
+
+1. `net_async_req_create()` returns a request owned by the application.
+2. A successful `net_async_submit()` transfers ownership to the CQ.
+3. A positive `net_async_submit_batch()` result transfers only the accepted
+   prefix of the request array.
+4. `net_async_wait()` returns ownership of completed requests to the caller.
+5. Inspect each result, then release it with `net_async_req_destroy()`.
+6. Buffers and address objects referenced by a request must stay valid until
+   that request completes.
+
+`net_async_wait()` may return a partial batch when its overall timeout expires.
+Concurrent threads may wait on the same CQ with different `min_complete`
+values.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    Application                       │
-│         (net_socket / net_connect / net_read ...)    │
-├─────────────────────────────────────────────────────┤
-│                  Public API (api/netfast.h)           │
-│   ┌──────────┬──────────┬──────────┬──────────┐     │
-│   │  Socket  │  Epoll   │  Async   │  Fcntl   │     │
-│   │   API    │   API    │   API    │   API    │     │
-│   └──────────┴──────────┴──────────┴──────────┘     │
-├─────────────────────────────────────────────────────┤
-│               Request Layer (main/req*.c)            │
-│   ┌──────────────┬──────────────┬────────────────┐  │
-│   │  req_socket  │  req_epoll   │   req_async    │  │
-│   │  (blocking)  │  (event poll)│  (completion Q) │  │
-│   └──────────────┴──────────────┴────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│             Protocol Stack (main/)                    │
-│   ┌──────────────────────────────────────────────┐  │
-│   │  TCP (tcp.c)          UDP (udp.c)             │  │
-│   │  ├─ Congestion Ctrl  ├─ Sendto/Recvfrom      │  │
-│   │  ├─ Retransmit       ├─ Connect              │  │
-│   │  ├─ Timers           └───────────────────────┘  │
-│   │  └─ State Machine                               │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  IP (ip.c)           IPv6 (ipv6.c)            │  │
-│   │  ├─ Fragmentation    ├─ Extension Headers     │  │
-│   │  └─ Forwarding       └─ IPv6 Frag            │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  ICMP (icmp.c)        ARP/NDP (route_arp_ndp) │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  Socket Layer (socket.c)                      │  │
-│   │  ├─ Bind/Unbind        ├─ Tuple Hash         │  │
-│   │  └─ Auto-bind          └─ SO_REUSEPORT       │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  skbuff (skbuff.c) — Zero-copy buffer mgmt   │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  Loopback (loopback.c)                        │  │
-│   └──────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│                 Worker Layer (main/worker.c)          │
-│   ┌──────────┬──────────┬──────────┬──────────┐     │
-│   │ Worker 0 │ Worker 1 │ Worker 2 │   ...    │     │
-│   │ (CPU 0)  │ (CPU 1)  │ (CPU 2)  │          │     │
-│   │ ┌──────┐ │ ┌──────┐ │ ┌──────┐ │          │     │
-│   │ │AF_XDP│ │ │AF_XDP│ │ │AF_XDP│ │          │     │
-│   │ │  XSK │ │ │  XSK │ │ │  XSK │ │          │     │
-│   │ └──────┘ │ └──────┘ │ └──────┘ │          │     │
-│   └──────────┴──────────┴──────────┴──────────┘     │
-│         ▲                    ▲                       │
-│         │  Toeplitz RSS     │                        │
-│         │  select_worker_by_tuple()                  │
-├─────────────────────────────────────────────────────┤
-│             Base Library (lib/)                       │
-│   ┌─────────┬─────────┬──────────┬──────────────┐   │
-│   │  hash   │  list   │  queue   │ frame_cache  │   │
-│   │ (MPMC)  │(doubly) │(lockfree)│ (UMEM mgmt)  │   │
-│   ├─────────┼─────────┼──────────┼──────────────┤   │
-│   │  rss    │  trie   │  thread  │    base      │   │
-│   │(Toeplitz)│(radix) │ (utils)  │  (helpers)   │   │
-│   └─────────┴─────────┴──────────┴──────────────┘   │
-├─────────────────────────────────────────────────────┤
-│              AF_XDP Data Plane (lib/xdp.c)            │
-│   ┌──────────────────────────────────────────────┐  │
-│   │  UMEM (XDP_UMEM_FRAME_CNT × 4KB = 256 MB)    │  │
-│   │  ├─ Fill Ring (RX buffers)                    │  │
-│   │  ├─ RX Ring    (incoming packets)             │  │
-│   │  ├─ TX Ring    (outgoing packets)             │  │
-│   │  └─ Completion Ring (TX done)                 │  │
-│   └──────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│         eBPF Program (lib/xdp_redirect.bpf.c)         │
-│     XDP_REDIRECT to userspace AF_XDP socket          │
-└─────────────────────────────────────────────────────┘
+```text
+Application
+  |-- synchronous socket API
+  |-- epoll-compatible readiness API
+  `-- async submit / completion queues
+                 |
+          request routing
+                 |
+      +----------+----------+
+      |          |          |
+   Worker 0   Worker 1   Worker N
+      |          |          |
+      +---- TCP / UDP -------+
+            IPv4 / IPv6
+          routing + ARP/NDP
+                 |
+        skbuff + frame cache
+                 |
+       AF_XDP RX/TX/CQ rings
+                 |
+      XDP_REDIRECT / network
 ```
 
-## Key Design Concepts
-
-### Multi-Worker Architecture
-
-Each worker thread is pinned to a dedicated CPU core, owning its own AF_XDP socket (XSK). Packets are steered to the correct worker using **Toeplitz RSS hashing** on the 5-tuple `(sip, sport, dip, dport, protocol)`. This ensures all packets for a connection land on the same worker, enabling lock-free per-connection processing.
-
-### Zero-Copy Data Path
-
-- **UMEM-backed frame cache**: All packet buffers reside in a shared UMEM region mapped by AF_XDP, eliminating kernel-to-userspace copies.
-- **skbuff (socket buffer)**: A lightweight buffer abstraction supporting scatter-gather I/O, clone-on-write, and reference counting.
-- **XDP redirect**: The eBPF program `xdp_redirect.bpf.c` redirects packets directly into the userspace UMEM via `XDP_REDIRECT`.
-
-### Lock-Free Socket Tables
-
-- **MPMC hash tables** (`lib/hash.c`): Concurrent lock-free hash maps for socket tuple lookups.
-- **Bind tables**: Track address/port bindings per protocol family (IPv4/IPv6).
-- **SO_REUSEPORT**: Multiple sockets can bind the same port; RSS distributes incoming connections.
-
-### Protocol Virtual Table
-
-Each protocol (TCP, UDP) implements `protocol_ops` — a virtual function table with callbacks for `connect`, `bind`, `listen`, `accept`, `read`, `write`, `sendto`, `recvfrom`, `poll`, `shutdown`, etc. The socket layer dispatches through these ops, making the stack extensible.
-
-### Async & Sync Request Model
-
-- **Blocking (req_socket)**: Traditional blocking socket calls with timeout support.
-- **Non-blocking**: `O_NONBLOCK` flag returns `EAGAIN` immediately.
-- **Epoll (req_epoll)**: Full `epoll_create`/`epoll_ctl`/`epoll_wait` integration.
-- **Async CQ (req_async)**: Completion-queue based async API for batch submission and completion.
-
-### Connection Migration
-
-When a socket's addresses change (e.g., `connect()` finalizes the 5-tuple, or `sendto()` picks a source IP for a wildcard bind), the RSS hash may map to a different worker. NetFast handles this by **migrating the socket and pending request** (`change_req_worker`) to the correct worker transparently.
-
-## Project Structure
-
-```
-.
-├── api/
-│   └── netfast.h              # Public C API header
-├── lib/                       # Base library
-│   ├── base.c/h               # Helper utilities, time, reference counting
-│   ├── frame_cache.c/h        # UMEM-backed frame allocator
-│   ├── hash.c/h               # Lock-free MPMC hash table
-│   ├── list.c/h               # Doubly-linked list
-│   ├── log.c/h                # Logging subsystem
-│   ├── queue.c/h              # Lock-free MPSC queue
-│   ├── rss.c/h                # Toeplitz RSS hash & worker selection
-│   ├── thread.c/h             # Thread utilities
-│   ├── trie.c/h               # Radix trie (routing table)
-│   ├── xdp.c/h                # AF_XDP setup, UMEM, RX/TX rings
-│   └── xdp_redirect.bpf.c     # eBPF XDP redirect program
-├── main/                      # Core protocol stack
-│   ├── ether.c/h              # Ethernet frame handling
-│   ├── fd_entry.c/h           # File descriptor management
-│   ├── icmp.c/h               # ICMP error processing
-│   ├── if.c/h                 # Network interface management
-│   ├── init.c/h               # Stack initialization & configuration
-│   ├── ip.c/h                 # IPv4 input/output/fragmentation
-│   ├── ip_frag.c/h            # IPv4 fragment reassembly
-│   ├── ipv6.c/h               # IPv6 input/output
-│   ├── ipv6_ext.c/h           # IPv6 extension headers
-│   ├── ipv6_frag.h            # IPv6 fragment reassembly
-│   ├── loopback.c/h           # Loopback device
-│   ├── netlink.c/h            # Netlink (route/addr monitoring)
-│   ├── req.c/h                # Request infrastructure
-│   ├── req_async.c/h          # Async completion queue API
-│   ├── req_epoll.c/h          # Epoll integration
-│   ├── req_socket.c/h         # Blocking socket request handling
-│   ├── route_arp_ndp.c/h      # Route lookup, ARP, NDP
-│   ├── skbuff.c/h             # Socket buffer (zero-copy, scatter-gather)
-│   ├── socket.c/h             # Socket layer (bind, tuple install, auto-bind)
-│   ├── stack.c/h              # Per-worker stack instance
-│   ├── tcp.c/h                # TCP protocol (state machine, timers, retransmit)
-│   ├── tcp_congestion.c       # TCP congestion control (Reno/CUBIC)
-│   ├── tcp_metrics.c/h        # TCP metrics & RTT estimation
-│   ├── udp.c/h                # UDP protocol
-│   └── worker.c/h             # Worker thread & cross-worker communication
-├── docs/                      # Design documentation
-│   ├── tcp_sack_design.md     # TCP SACK design notes
-│   └── tcp_sack_tested_diff.md
-├── example/                   # Example applications
-├── test/                      # Test & benchmark suite
-│   ├── tcp_stream_perf.c      # TCP throughput benchmark
-│   ├── bench_*.c              # Micro-benchmarks
-│   └── integration_*.c        # Integration tests
-├── Makefile                   # Build system
-└── config.json                # Runtime configuration
-```
+Each socket is owned by a worker. Requests are routed to that worker instead of
+letting application threads manipulate socket state directly. RSS keeps a flow
+on a stable worker, while connection migration handles tuple changes such as an
+automatic bind followed by `connect()`.
 
 ## Build
 
-### Prerequisites
+### Requirements
 
-- Linux kernel ≥ 5.4 with AF_XDP support
-- `libbpf`, `libxdp`, `libelf`, `libz`, `libcjson`
-- Clang (for eBPF compilation)
+- Linux with AF_XDP support
+- C compiler and Clang for the eBPF program
+- `libbpf`, `libxdp`, `libelf`, `zlib`, `libcjson`, and pthreads
+- Root privileges when attaching XDP and configuring the runtime
 
-### Compile
+Build one of the supported profiles:
 
 ```bash
-# Debug build
-make PROFILE=debug -j$(nproc)
-
-# Release build
-make PROFILE=release -j$(nproc)
-
-# Release with debug info
-make PROFILE=relwithdebinfo -j$(nproc)
+make debug -j$(nproc)
+make release -j$(nproc)
+make relwithdebinfo -j$(nproc)
 ```
 
-Output: `build/libnetfast.so`
+The shared library is written to `build/libnetfast.so`. Install a release build
+with:
 
-### Configuration
+```bash
+sudo make PROFILE=release install
+```
 
-Edit `config.json` or place at `/usr/local/etc/netfast/config.json`:
+This installs the library, public header, XDP redirect object, and configuration
+under `/usr/local` by default.
+
+## Configuration
+
+NetFast reads `config.json`, or the installed configuration at
+`/usr/local/etc/netfast/config.json`.
 
 ```json
 {
-    "thread_num": 4,
-    "ifs": [
-        { "name": "eth0", "queues": 4 }
-    ],
-    "logfile": "/var/log/netfast.log",
-    "ipv4_forward": false,
-    "ipv6_forward": false
+  "thread_num": 2,
+  "open_if": [
+    { "name": "ens192", "queues": 2 }
+  ],
+  "ipv4_forward": true,
+  "ipv6_forward": true,
+  "toeplitz_rss_key": "6d5a56da255b0ec24167253d43a38fb0d0ca2bcbae7b30b477cb2da38030f20c6a42b73bbeac01fa",
+  "logfile": "/tmp/user_stack.log"
 }
 ```
 
-## Quick Start
+After changing the installed configuration, run the install command again or
+copy the updated file to the installed configuration path.
+
+### Network safety
+
+- Do **not** attach NetFast to the interface carrying your SSH, desktop, or web
+  management connection. XDP redirection takes that traffic away from the
+  kernel stack and may disconnect the machine.
+- Routes and neighbors are learned through Netlink; interfaces not listed in
+  `open_if` are filtered from the NetFast data plane.
+- Packets redirected by XDP are not visible to a normal `tcpdump` capture on
+  the kernel network stack.
+- AF_XDP zero-copy availability depends on the NIC driver. Unsupported devices
+  fall back to copy mode unless zero-copy is forced.
+
+## Synchronous and Epoll APIs
+
+The public header also exposes familiar calls such as:
 
 ```c
-#include <netfast.h>
-
-int main() {
-    // Create a TCP socket
-    int fd = net_socket(AF_INET, SOCK_STREAM, 0);
-
-    // Connect to remote
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(8080)
-    };
-    inet_pton(AF_INET, "192.168.1.1", &addr.sin_addr);
-    net_connect(fd, (struct sockaddr*)&addr, sizeof(addr));
-
-    // Send data
-    net_write(fd, "hello", 5);
-
-    // Receive response
-    char buf[1024];
-    int n = net_read(fd, buf, sizeof(buf));
-
-    net_close(fd);
-    return 0;
-}
+int fd = net_socket(AF_INET, SOCK_STREAM, 0);
+net_connect(fd, (struct sockaddr *)&peer, sizeof(peer));
+net_write(fd, request, request_len);
+net_read(fd, response, response_capacity);
+net_close(fd);
 ```
 
-## Features
+For readiness-driven programs, use `net_epoll_create()`, `net_epoll_ctl()`, and
+`net_epoll_wait()`.
 
-- **TCP**: Full state machine (RFC 793), retransmission with exponential backoff, keepalive, delayed ACK, Nagle, window scaling, timestamps (PAWS), SACK, congestion control (Reno/CUBIC), FIN-WAIT-2/TIME-WAIT timeouts
-- **UDP**: Connectionless datagrams, `sendto`/`recvfrom`, implicit connect
-- **IPv4/IPv6**: Fragmentation/reassembly, extension headers, ICMP error processing
-- **ARP/NDP**: Address resolution and neighbor discovery
-- **Socket options**: `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `TCP_NODELAY`, `TCP_CORK`, `TCP_QUICKACK`
-- **Epoll**: Level-triggered `EPOLLIN`/`EPOLLOUT`/`EPOLLERR`/`EPOLLHUP`/`EPOLLRDHUP`
-- **Non-blocking I/O**: `O_NONBLOCK` via `net_fcntl`
-- **Async API**: Completion-queue based with batch submit/completion
-- **Loopback**: Direct intra-stack delivery without hitting AF_XDP
-- **Netlink**: Route and address monitoring for dynamic configuration
+## Testing and Analysis
+
+```bash
+make test
+make static-analysis
+```
+
+The test target covers the base library, Netlink behavior, TCP/UDP loopback,
+epoll-related protocol paths, and asynchronous CQ concurrency. Static-analysis
+reports are stored under `build/test/static-analysis/`.
+
+## Repository Layout
+
+```text
+lib/       AF_XDP, queues, RSS, frame cache, and base utilities
+main/      TCP/IP stack, sockets, workers, epoll, and async requests
+docs/      protocol design notes
+example/   example programs and test resources
+test/      unit, integration, stress, and analysis tooling
+```
+
+The public API source is [`main/netfast.h`](./main/netfast.h).

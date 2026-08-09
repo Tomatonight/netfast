@@ -1,13 +1,23 @@
 build/
-build-nohw/
+build-*/
 _VSCodeCounter/
 _VSCodeCounter(1)*/
 .vscode/
 _clinerules/
+
+config.json
 todo
 ai_readme
-config.json
+ai_must_read.txt
+test/ai read
+**/doc
+
 *.o
 *.d
 *.so
+*.plist
+*.log
+*.py[cod]
+**/__pycache__/
+
 main/main

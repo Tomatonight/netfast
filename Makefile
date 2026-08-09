@@ -20,6 +20,7 @@ $(error unknown PROFILE '$(PROFILE)'; use debug, release, or relwithdebinfo)
 endif
 
 LIB := $(BUILD_DIR)/libnetfast.so
+HEADER := $(BUILD_DIR)/netfast.h
 BPF_DIR := $(BUILD_DIR)/bpf
 BPF_SRC := lib/xdp_redirect.bpf.c
 BPF_OBJ := $(BPF_DIR)/xdp_redirect.bpf.o
@@ -90,13 +91,27 @@ CONFIG_DIR ?= $(PREFIX)/etc/netfast
 
 .DEFAULT_GOAL := debug
 
-.PHONY: all build clean bpf install uninstall debug release relwithdebinfo FORCE
+TEST_BUILD_DIR := $(BUILD_DIR)/test
+TEST_BINS := \
+	$(TEST_BUILD_DIR)/test_protocol_loopback \
+	$(TEST_BUILD_DIR)/test_lib \
+	$(TEST_BUILD_DIR)/test_netlink_events
+
+TEST_CFLAGS := $(CFLAGS) -Itest
+TEST_LDFLAGS := -L$(BUILD_DIR) -Wl,-rpath,'$$ORIGIN/..'
+
+.PHONY: all build clean bpf install uninstall debug release relwithdebinfo test \
+	static-analysis FORCE
 
 all: debug
 
-build: $(LIB) $(BPF_OBJ)
+build: $(LIB) $(BPF_OBJ) $(HEADER)
 
 bpf: $(BPF_OBJ)
+
+$(HEADER): main/netfast.h
+	@mkdir -p $(dir $@)
+	cp $< $@
 
 $(LIB): $(OBJS)
 	@mkdir -p $(dir $@)
@@ -135,11 +150,32 @@ release:
 relwithdebinfo:
 	$(MAKE) PROFILE=relwithdebinfo build
 
-install: $(LIB) $(BPF_OBJ)
+$(TEST_BUILD_DIR)/test_protocol_loopback: test/test1/test_protocol_loopback.c test/test_common.h $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
+
+$(TEST_BUILD_DIR)/test_lib: test/test2/test_lib.c test/test_common.h $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
+
+$(TEST_BUILD_DIR)/test_netlink_events: test/test3/test_netlink_events.c test/test_common.h $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
+
+test: $(TEST_BINS)
+	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_lib
+	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_netlink_events
+	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_protocol_loopback
+	$(MAKE) static-analysis
+
+static-analysis:
+	sh test/test4/run_static_analysis.sh
+
+install: $(LIB) $(BPF_OBJ) $(HEADER)
 	install -d $(DESTDIR)$(LIB_DIR)
 	install -m 755 $(LIB) $(DESTDIR)$(LIB_DIR)/libnetfast.so
 	install -d $(DESTDIR)$(INCLUDE_DIR)
-	install -m 644 api/netfast.h $(DESTDIR)$(INCLUDE_DIR)/netfast.h
+	install -m 644 $(HEADER) $(DESTDIR)$(INCLUDE_DIR)/netfast.h
 	install -d $(DESTDIR)$(BPF_INSTALL_DIR)
 	for f in $(BPF_OBJ); do install -m 644 $$f $(DESTDIR)$(BPF_INSTALL_DIR)/ ; done
 	install -d $(DESTDIR)$(CONFIG_DIR)

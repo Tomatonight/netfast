@@ -19,7 +19,7 @@
 #include "fd_entry.h"
 #include "req_socket.h"
 #include "xdp.h"
-#include "../api/netfast.h"
+#include "netfast.h"
 
 static void tcp_timer_cb(task* tk);
 static void tcp_reset_timer(tcp_pcb* pcb);
@@ -610,8 +610,7 @@ int tcp_recv(struct skbuff *skb)
     skb->tcp_hdr = tcp;
     if (!check_tcp_hdr(skb))
         return -1;
-    skb->l4_private.tcp.seq = ntohl(tcp->seq);
-    skb->l4_private.tcp.flag = tcp->flags;
+
     uint32_t tcp_hdr_len = (tcp->doff_res_flags >> 4) * 4;
     if (skb_consume(skb, tcp_hdr_len, true) != tcp_hdr_len) {
         DEBUG_LOG("tcp_recv: failed to consume TCP header len=%u", tcp_hdr_len);
@@ -634,6 +633,7 @@ find_socket:
         if (tcp->flags & TCP_FLAG_RST)
             return 0;
         static __thread Socket sock_tmp;
+        uint32_t reply_scope_id = is_v6 && skb->route ? skb->route->ifindex : 0;
         if (is_v6) {
             ipv6_hdr* ip6 = skb->ipv6_hdr;
             memcpy(sock_tmp.sip6, ip6->daddr, 16);
@@ -641,6 +641,7 @@ find_socket:
             memcpy(sock_tmp.dip6, ip6->saddr, 16);
             sock_tmp.dport = tcp->sport;
             sock_tmp.family = AF_INET6;
+            sock_tmp.dip6_scope_id = reply_scope_id;
         } else {
             ipv4_hdr* ip = skb->ipv4_hdr;
             sock_tmp.sip = ip->daddr;
@@ -650,8 +651,26 @@ find_socket:
             sock_tmp.family = AF_INET;
         }
         sock_tmp.protocol = IPPROTO_TCP;
-        tcp_reply_rst(&sock_tmp, skb);
-        return 0;
+
+        /* The input route describes the local destination.  Resolve the
+         * reversed destination before emitting the RST, then lend that
+         * route to the thread-local temporary socket for this call only. */
+        PUT_REF(skb->route);
+        skb->route = NULL;
+        skb->sock = &sock_tmp;
+        const uint8_t* reply_dip = is_v6 ? sock_tmp.dip6 : (const uint8_t*)&sock_tmp.dip;
+        if (set_skb_route(skb, sock_tmp.family, reply_dip) < 0)
+            return -EHOSTUNREACH;
+
+        /* tcp_send_flag() obtains its output route from the socket.  Hold a
+         * temporary reference for this RST only; sock_tmp is thread-local
+         * and must not retain a route for the next unmatched packet. */
+        PUT_REF(sock_tmp.route);
+        GET_REF(sock_tmp.route, skb->route);
+        int ret = tcp_reply_rst(&sock_tmp, skb);
+        PUT_REF(sock_tmp.route);
+        sock_tmp.route = NULL;
+        return ret;
     }
     if(aim_worker != get_current_worker()){
         transmit_skb_2_worker(aim_worker, skb, tcp_recv);
@@ -790,6 +809,8 @@ static int tcp_send_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag)
 
     tcp_hdr* hdr = (tcp_hdr*)skb_data_push(send_skb, sizeof(tcp_hdr));
     memset(hdr, 0, sizeof(*hdr));
+    send_skb->tcp_hdr = hdr;
+    send_skb->tx_checksum_offset = 0;
 
     hdr->sport = sock->sport;
     hdr->dport = sock->dport;
@@ -810,11 +831,20 @@ static int tcp_send_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag)
     /* NOTE: URG not supported yet. */
     hdr->urg_ptr = 0;
     hdr->check = 0;
-    hdr->check = sock->family == AF_INET6
-        ? skb_checksum_protocol6(send_skb, skb_data_len(send_skb),
-                                 sock->sip6, sock->dip6, IPPROTO_TCP)
-        : skb_checksum_protocol(send_skb, skb_data_len(send_skb),
-                                sock->sip, sock->dip, IPPROTO_TCP);
+    if (sock->route->if_info->hw_tx_checksum_enabled) {
+        hdr->check = sock->family == AF_INET6
+            ? skb_checksum_protocol6(NULL, skb_data_len(send_skb),
+                                     sock->sip6, sock->dip6, IPPROTO_TCP)
+            : skb_checksum_protocol(NULL, skb_data_len(send_skb),
+                                    sock->sip, sock->dip, IPPROTO_TCP);
+        send_skb->tx_checksum_offset = offsetof(tcp_hdr, check);
+    } else {
+        hdr->check = sock->family == AF_INET6
+            ? skb_checksum_protocol6(send_skb, skb_data_len(send_skb),
+                                     sock->sip6, sock->dip6, IPPROTO_TCP)
+            : skb_checksum_protocol(send_skb, skb_data_len(send_skb),
+                                    sock->sip, sock->dip, IPPROTO_TCP);
+    }
 
     int ret = sock->family == AF_INET6 ? ipv6_output(send_skb)
                                        : ipv4_output(send_skb);
@@ -1004,6 +1034,8 @@ static int tcp_input(Socket *sock, skbuff *skb)
     uint32_t data_len = skb_data_len(skb);
     uint32_t seg_len = data_len + ((flags & TCP_FLAG_SYN) ? 1u : 0u) + ((flags & TCP_FLAG_FIN) ? 1u : 0u);
 
+    skb->l4_private.tcp.seq = seq;
+    skb->l4_private.tcp.flag = flags;
     if (pcb->state == TCP_STATE_CLOSED) {
         if (flags & TCP_FLAG_RST)
             return 0;
@@ -1578,6 +1610,8 @@ static void make_tcp_hdr(tcp_pcb* pcb, skbuff* skb){
 
     tcp_hdr* hdr = (tcp_hdr*)skb_data_push(skb, sizeof(tcp_hdr));
     memset(hdr, 0, sizeof(tcp_hdr));
+    skb->tcp_hdr = hdr;
+    skb->tx_checksum_offset = 0;
 
     hdr->sport = pcb->sock->sport;
     hdr->dport = pcb->sock->dport;
@@ -1593,12 +1627,25 @@ static void make_tcp_hdr(tcp_pcb* pcb, skbuff* skb){
     hdr->urg_ptr = 0;
 
     hdr->check = 0;
-    if (pcb->sock->family == AF_INET6)
-        hdr->check = skb_checksum_protocol6(skb, skb_data_len(skb),
-                                       pcb->sock->sip6, pcb->sock->dip6, IPPROTO_TCP);
-    else
-        hdr->check = skb_checksum_protocol(skb, skb_data_len(skb),
-                                       pcb->sock->sip, pcb->sock->dip, IPPROTO_TCP);
+    if (pcb->sock->route->if_info->hw_tx_checksum_enabled) {
+        hdr->check = pcb->sock->family == AF_INET6
+            ? skb_checksum_protocol6(NULL, skb_data_len(skb),
+                                     pcb->sock->sip6, pcb->sock->dip6,
+                                     IPPROTO_TCP)
+            : skb_checksum_protocol(NULL, skb_data_len(skb),
+                                    pcb->sock->sip, pcb->sock->dip,
+                                    IPPROTO_TCP);
+        skb->tx_checksum_offset = offsetof(tcp_hdr, check);
+    } else {
+        if (pcb->sock->family == AF_INET6)
+            hdr->check = skb_checksum_protocol6(
+                skb, skb_data_len(skb), pcb->sock->sip6,
+                pcb->sock->dip6, IPPROTO_TCP);
+        else
+            hdr->check = skb_checksum_protocol(
+                skb, skb_data_len(skb), pcb->sock->sip,
+                pcb->sock->dip, IPPROTO_TCP);
+    }
 }
 
 int tcp_output(tcp_pcb* pcb){
@@ -2172,7 +2219,11 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
                 (sock->family == AF_INET6 ? MAX_IP6_HDR_WITH_EXT_LEN
                                           : MAX_IP_HDR_WITH_OPT_LEN) +
                 send_l2_len;
-            skb = skb_alloc(tcp_hdr_len + chunk);
+            /* Reserve one complete MSS of payload capacity.  A short first
+             * write (for example an HTTP header) can then be extended by the
+             * next write without turning one TCP segment into a multi-data
+             * skb that must be linearized at the non-SG XDP TX boundary. */
+            skb = skb_alloc(tcp_hdr_len + seg_limit);
             if (!skb) {
                 ERR_LOG("Failed to allocate skb for TCP write");
                 break;

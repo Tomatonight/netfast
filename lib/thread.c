@@ -51,6 +51,8 @@ task* create_task(int type)
 
 void destroy_task(task* t)
 {
+	if (!t)
+		return;
 	unregister_task(t);
 	free(t);
 }

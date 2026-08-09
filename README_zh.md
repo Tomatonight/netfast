@@ -2,252 +2,207 @@
 
 [English](./README.md) | 简体中文
 
-基于 AF_XDP（eXpress Data Path）构建的高性能用户态 TCP/IP 网络协议栈，专为低延迟、高吞吐场景设计。NetFast 在数据面完全绕过内核网络栈，同时提供兼容 POSIX 的 socket API。
+NetFast 是一个基于 Linux AF_XDP 的实验性用户态 TCP/IP 协议栈。它将
+worker 独占的网络协议栈、UMEM 数据缓冲、类 epoll 就绪接口和基于完成
+队列（CQ）的异步接口整合为一个 C 动态库。
+
+异步 CQ 是 NetFast 面向高吞吐的核心接口：应用可以批量提交 socket
+操作、保持多个请求同时在途，并一次取回多个完成，避免每个操作都
+执行一次阻塞系统调用。
+
+> NetFast 仍在快速开发中。请先在独立的测试网卡和可控网络中验证。
+
+## 核心特性
+
+- **异步完成队列**：支持单请求和批量提交。
+- **批量等待**：同时支持 `min_complete`、`max_complete` 和整体超时。
+- **多线程等待同一 CQ**：每个完成只会交给其中一个 waiter。
+- **AF_XDP 数据面**：根据网卡和驱动能力运行 copy 或 zero-copy 模式。
+- **多 worker 所有权模型**：通过 Toeplitz RSS 让同一连接稳定落到同一 worker。
+- **IPv4/IPv6 上的 TCP/UDP**：包含路由、ARP/NDP、ICMP、定时器、重传、分片与重组。
+- **POSIX 风格 API**：同时提供同步、非阻塞和类 epoll 就绪接口。
+- **UMEM 缓存体系**：线程级和全局 frame cache，skbuff 支持 scatter-gather。
+- **Netlink 集成**：动态获取路由、地址和邻居信息。
+
+## 异步 API 快速上手
+
+```c
+#include <errno.h>
+#include <stdint.h>
+#include <netfast.h>
+
+enum { BATCH = 64 };
+
+int submit_writes(int socket_fd, const void *buffers[BATCH],
+                  const uint32_t lengths[BATCH])
+{
+    int cq_fd = net_async_create();
+    if (cq_fd < 0)
+        return -1;
+
+    net_async_req *submitted[BATCH];
+    for (uint32_t i = 0; i < BATCH; ++i) {
+        submitted[i] = net_async_req_create(socket_fd, NET_ASYNC_WRITE,
+                                             buffers[i], lengths[i]);
+        if (!submitted[i])
+            return -1;
+    }
+
+    int accepted = net_async_submit_batch(cq_fd, submitted, BATCH);
+    if (accepted != BATCH)
+        return -1;
+
+    uint32_t remaining = BATCH;
+    while (remaining) {
+        net_async_req *completed[BATCH];
+        uint32_t desired = remaining < 16 ? remaining : 16;
+        int count = net_async_wait(cq_fd, completed,
+                                   desired,  /* 期望的完成批次 */
+                                   BATCH,    /* completed 数组容量 */
+                                   250);     /* 整体最多等待 250 ms */
+        if (count < 0)
+            return -1;
+        if (count == 0)
+            continue;
+
+        for (int i = 0; i < count; ++i) {
+            int request_errno = 0;
+            int result = net_async_req_result(completed[i], &request_errno);
+            if (result < 0)
+                errno = request_errno;
+            net_async_req_destroy(completed[i]);
+        }
+        remaining -= (uint32_t)count;
+    }
+
+    return net_async_close(cq_fd);
+}
+```
+
+异步请求所有权规则：
+
+1. `net_async_req_create()` 返回由应用持有的请求。
+2. `net_async_submit()` 成功后，请求所有权转移给 CQ。
+3. `net_async_submit_batch()` 返回正数时，只转移数组前缀中已接受的请求。
+4. `net_async_wait()` 把已完成请求的所有权交回调用者。
+5. 读取结果后，调用 `net_async_req_destroy()` 释放请求。
+6. 请求引用的数据缓冲和地址对象必须保持有效，直到请求完成。
+
+`net_async_wait()` 在整体超时到期时可以返回不足 `min_complete` 的部分批次。
+多个线程可以在同一 CQ 上使用不同的 `min_complete`。
 
 ## 架构
 
-```
-┌─────────────────────────────────────────────────────┐
-│                     应用程序                         │
-│         (net_socket / net_connect / net_read ...)    │
-├─────────────────────────────────────────────────────┤
-│                  公共 API (api/netfast.h)             │
-│   ┌──────────┬──────────┬──────────┬──────────┐     │
-│   │  Socket  │  Epoll   │  Async   │  Fcntl   │     │
-│   │   API    │   API    │   API    │   API    │     │
-│   └──────────┴──────────┴──────────┴──────────┘     │
-├─────────────────────────────────────────────────────┤
-│                请求层 (main/req*.c)                   │
-│   ┌──────────────┬──────────────┬────────────────┐  │
-│   │  req_socket  │  req_epoll   │   req_async    │  │
-│   │   (同步阻塞)  │  (事件轮询)   │   (完成队列)    │  │
-│   └──────────────┴──────────────┴────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│               协议栈 (main/)                          │
-│   ┌──────────────────────────────────────────────┐  │
-│   │  TCP (tcp.c)          UDP (udp.c)             │  │
-│   │  ├─ 拥塞控制          ├─ Sendto/Recvfrom      │  │
-│   │  ├─ 重传              ├─ Connect              │  │
-│   │  ├─ 定时器            └───────────────────────┘  │
-│   │  └─ 状态机                                     │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  IP (ip.c)           IPv6 (ipv6.c)            │  │
-│   │  ├─ 分片重组          ├─ 扩展头                │  │
-│   │  └─ 转发             └─ IPv6 分片             │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  ICMP (icmp.c)        ARP/NDP (route_arp_ndp) │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  Socket 层 (socket.c)                         │  │
-│   │  ├─ Bind/Unbind        ├─ 五元组哈希          │  │
-│   │  └─ 自动绑定            └─ SO_REUSEPORT       │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  skbuff (skbuff.c) — 零拷贝缓冲区管理          │  │
-│   ├──────────────────────────────────────────────┤  │
-│   │  Loopback (loopback.c)                        │  │
-│   └──────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│                  Worker 层 (main/worker.c)            │
-│   ┌──────────┬──────────┬──────────┬──────────┐     │
-│   │ Worker 0 │ Worker 1 │ Worker 2 │   ...    │     │
-│   │ (CPU 0)  │ (CPU 1)  │ (CPU 2)  │          │     │
-│   │ ┌──────┐ │ ┌──────┐ │ ┌──────┐ │          │     │
-│   │ │AF_XDP│ │ │AF_XDP│ │ │AF_XDP│ │          │     │
-│   │ │  XSK │ │ │  XSK │ │ │  XSK │ │          │     │
-│   │ └──────┘ │ └──────┘ │ └──────┘ │          │     │
-│   └──────────┴──────────┴──────────┴──────────┘     │
-│         ▲                    ▲                       │
-│         │  Toeplitz RSS     │                        │
-│         │  select_worker_by_tuple()                  │
-├─────────────────────────────────────────────────────┤
-│               基础库 (lib/)                           │
-│   ┌─────────┬─────────┬──────────┬──────────────┐   │
-│   │  hash   │  list   │  queue   │ frame_cache  │   │
-│   │ (MPMC)  │ (双向)   │ (无锁)    │ (UMEM 管理)  │   │
-│   ├─────────┼─────────┼──────────┼──────────────┤   │
-│   │  rss    │  trie   │  thread  │    base      │   │
-│   │(Toeplitz)│(基数树) │ (线程工具) │  (辅助函数)   │   │
-│   └─────────┴─────────┴──────────┴──────────────┘   │
-├─────────────────────────────────────────────────────┤
-│              AF_XDP 数据面 (lib/xdp.c)                │
-│   ┌──────────────────────────────────────────────┐  │
-│   │  UMEM (XDP_UMEM_FRAME_CNT × 4KB = 256 MB)    │  │
-│   │  ├─ Fill Ring (RX 缓冲区)                     │  │
-│   │  ├─ RX Ring    (入站数据包)                    │  │
-│   │  ├─ TX Ring    (出站数据包)                    │  │
-│   │  └─ Completion Ring (TX 完成)                 │  │
-│   └──────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────┤
-│         eBPF 程序 (lib/xdp_redirect.bpf.c)            │
-│     XDP_REDIRECT → 用户态 AF_XDP socket              │
-└─────────────────────────────────────────────────────┘
+```text
+应用程序
+  |-- 同步 socket API
+  |-- 类 epoll 就绪 API
+  `-- 异步提交 / 完成队列
+                 |
+              请求路由
+                 |
+      +----------+----------+
+      |          |          |
+   Worker 0   Worker 1   Worker N
+      |          |          |
+      +---- TCP / UDP -------+
+            IPv4 / IPv6
+          路由 + ARP/NDP
+                 |
+        skbuff + frame cache
+                 |
+       AF_XDP RX/TX/CQ rings
+                 |
+      XDP_REDIRECT / 物理网络
 ```
 
-## 核心设计
-
-### 多 Worker 架构
-
-每个 worker 线程绑定到独立的 CPU 核心，拥有自己的 AF_XDP socket（XSK）。数据包通过 **Toeplitz RSS 哈希** 对五元组 `(sip, sport, dip, dport, protocol)` 进行路由，确保同一连接的所有数据包落在同一个 worker 上，从而实现无锁的逐连接处理。
-
-### 零拷贝数据路径
-
-- **UMEM 帧缓存**：所有数据包缓冲区位于 AF_XDP 映射的共享 UMEM 区域中，消除了内核到用户态的拷贝。
-- **skbuff（socket 缓冲区）**：轻量级缓冲区抽象，支持 scatter-gather I/O、写时复制和引用计数。
-- **XDP 重定向**：eBPF 程序 `xdp_redirect.bpf.c` 通过 `XDP_REDIRECT` 将数据包直接重定向到用户态 UMEM。
-
-### 无锁 Socket 表
-
-- **MPMC 哈希表**（`lib/hash.c`）：并发的无锁哈希表，用于 socket 五元组查找。
-- **绑定表**：按协议族（IPv4/IPv6）跟踪地址/端口绑定。
-- **SO_REUSEPORT**：多个 socket 可绑定同一端口；RSS 分发入站连接。
-
-### 协议虚表
-
-每种协议（TCP、UDP）实现 `protocol_ops`——一个虚函数表，包含 `connect`、`bind`、`listen`、`accept`、`read`、`write`、`sendto`、`recvfrom`、`poll`、`shutdown` 等回调。Socket 层通过这些 ops 进行分发，使协议栈易于扩展。
-
-### 同步与异步请求模型
-
-- **同步阻塞（req_socket）**：传统的阻塞 socket 调用，支持超时。
-- **非阻塞**：`O_NONBLOCK` 标志立即返回 `EAGAIN`。
-- **Epoll（req_epoll）**：完整的 `epoll_create`/`epoll_ctl`/`epoll_wait` 集成。
-- **异步完成队列（req_async）**：基于完成队列的异步 API，支持批量提交和完成。
-
-### 连接迁移
-
-当 socket 的地址发生变化时（例如 `connect()` 确定五元组，或 `sendto()` 为通配符绑定选择源 IP），RSS 哈希可能映射到不同的 worker。NetFast 通过 **迁移 socket 和挂起的请求**（`change_req_worker`）透明地处理此问题。
-
-## 项目结构
-
-```
-.
-├── api/
-│   └── netfast.h              # 公共 C API 头文件
-├── lib/                       # 基础库
-│   ├── base.c/h               # 辅助工具、时间、引用计数
-│   ├── frame_cache.c/h        # 基于 UMEM 的帧分配器
-│   ├── hash.c/h               # 无锁 MPMC 哈希表
-│   ├── list.c/h               # 双向链表
-│   ├── log.c/h                # 日志子系统
-│   ├── queue.c/h              # 无锁 MPSC 队列
-│   ├── rss.c/h                # Toeplitz RSS 哈希与 worker 选择
-│   ├── thread.c/h             # 线程工具
-│   ├── trie.c/h               # 基数树（路由表）
-│   ├── xdp.c/h                # AF_XDP 设置、UMEM、RX/TX 环
-│   └── xdp_redirect.bpf.c     # eBPF XDP 重定向程序
-├── main/                      # 核心协议栈
-│   ├── ether.c/h              # 以太网帧处理
-│   ├── fd_entry.c/h           # 文件描述符管理
-│   ├── icmp.c/h               # ICMP 错误处理
-│   ├── if.c/h                 # 网络接口管理
-│   ├── init.c/h               # 协议栈初始化与配置
-│   ├── ip.c/h                 # IPv4 输入/输出/分片
-│   ├── ip_frag.c/h            # IPv4 分片重组
-│   ├── ipv6.c/h               # IPv6 输入/输出
-│   ├── ipv6_ext.c/h           # IPv6 扩展头
-│   ├── ipv6_frag.h            # IPv6 分片重组
-│   ├── loopback.c/h           # 回环设备
-│   ├── netlink.c/h            # Netlink（路由/地址监控）
-│   ├── req.c/h                # 请求基础设施
-│   ├── req_async.c/h          # 异步完成队列 API
-│   ├── req_epoll.c/h          # Epoll 集成
-│   ├── req_socket.c/h         # 同步阻塞 socket 请求处理
-│   ├── route_arp_ndp.c/h      # 路由查找、ARP、NDP
-│   ├── skbuff.c/h             # Socket 缓冲区（零拷贝、scatter-gather）
-│   ├── socket.c/h             # Socket 层（bind、五元组安装、自动绑定）
-│   ├── stack.c/h              # 每个 worker 的协议栈实例
-│   ├── tcp.c/h                # TCP 协议（状态机、定时器、重传）
-│   ├── tcp_congestion.c       # TCP 拥塞控制（Reno/CUBIC）
-│   ├── tcp_metrics.c/h        # TCP 指标与 RTT 估算
-│   ├── udp.c/h                # UDP 协议
-│   └── worker.c/h             # Worker 线程与跨 worker 通信
-├── docs/                      # 设计文档
-│   ├── tcp_sack_design.md     # TCP SACK 设计笔记
-│   └── tcp_sack_tested_diff.md
-├── example/                   # 示例应用
-├── test/                      # 测试与基准测试
-│   ├── tcp_stream_perf.c      # TCP 吞吐量基准测试
-│   ├── bench_*.c              # 微基准测试
-│   └── integration_*.c        # 集成测试
-├── Makefile                   # 构建系统
-└── config.json                # 运行时配置
-```
+每个 socket 由一个 worker 独占管理。应用线程不直接修改 socket 状态，而是把请求
+路由给对应 worker。RSS 保持连接亲和性；自动 bind、`connect()` 等操作改变五元
+组时，连接迁移机制会将 socket 和待处理请求移到新 worker。
 
 ## 构建
 
-### 前置依赖
+### 依赖
 
-- Linux 内核 ≥ 5.4，支持 AF_XDP
-- `libbpf`、`libxdp`、`libelf`、`libz`、`libcjson`
-- Clang（用于 eBPF 编译）
-
-### 编译
+- 支持 AF_XDP 的 Linux
+- C 编译器，以及用于编译 eBPF 程序的 Clang
+- `libbpf`、`libxdp`、`libelf`、`zlib`、`libcjson` 和 pthread
+- 挂载 XDP 和初始化运行时所需的 root 权限
 
 ```bash
-# Debug 构建（开发调试）
-make PROFILE=debug -j$(nproc)
-
-# Release 构建（生产部署）
-make PROFILE=release -j$(nproc)
-
-# 带调试符号的 Release 构建（支持 perf/profile 分析）
-make PROFILE=relwithdebinfo -j$(nproc)
+make debug -j$(nproc)
+make release -j$(nproc)
+make relwithdebinfo -j$(nproc)
 ```
 
-产物：`build/libnetfast.so`
+动态库位于 `build/libnetfast.so`。安装 Release 版本：
 
-### 配置
+```bash
+sudo make PROFILE=release install
+```
 
-编辑 `config.json` 或放置在 `/usr/local/etc/netfast/config.json`：
+默认安装到 `/usr/local`，包含动态库、公共头文件、XDP 重定向程序和配置文件。
+
+## 配置
+
+NetFast 读取当前目录的 `config.json`，或安装后的
+`/usr/local/etc/netfast/config.json`。
 
 ```json
 {
-    "thread_num": 4,
-    "ifs": [
-        { "name": "eth0", "queues": 4 }
-    ],
-    "logfile": "/var/log/netfast.log",
-    "ipv4_forward": false,
-    "ipv6_forward": false
+  "thread_num": 2,
+  "open_if": [
+    { "name": "ens192", "queues": 2 }
+  ],
+  "ipv4_forward": true,
+  "ipv6_forward": true,
+  "toeplitz_rss_key": "6d5a56da255b0ec24167253d43a38fb0d0ca2bcbae7b30b477cb2da38030f20c6a42b73bbeac01fa",
+  "logfile": "/tmp/user_stack.log"
 }
 ```
 
-## 快速开始
+修改安装配置后，需要重新执行安装命令，或手动将配置复制到安装路径。
+
+### 网络安全注意事项
+
+- **不要**在承载 SSH、桌面或 Web 管理连接的网卡上挂载 NetFast。XDP 重定向会使
+  这些流量离开内核协议栈，可能立即断开连接。
+- 路由和邻居信息由 Netlink 获取；未列入 `open_if` 的网卡不会进入 NetFast 数据面。
+- XDP 重定向后的报文不会出现在内核协议栈的普通 `tcpdump` 抓包中。
+- AF_XDP zero-copy 取决于网卡驱动；不支持时会回退到 copy mode，除非强制要求 zero-copy。
+
+## 同步与 Epoll 接口
+
+公共头文件同时提供熟悉的 socket 风格调用：
 
 ```c
-#include <netfast.h>
-
-int main() {
-    // 创建 TCP socket
-    int fd = net_socket(AF_INET, SOCK_STREAM, 0);
-
-    // 连接到远程
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(8080)
-    };
-    inet_pton(AF_INET, "192.168.1.1", &addr.sin_addr);
-    net_connect(fd, (struct sockaddr*)&addr, sizeof(addr));
-
-    // 发送数据
-    net_write(fd, "hello", 5);
-
-    // 接收响应
-    char buf[1024];
-    int n = net_read(fd, buf, sizeof(buf));
-
-    net_close(fd);
-    return 0;
-}
+int fd = net_socket(AF_INET, SOCK_STREAM, 0);
+net_connect(fd, (struct sockaddr *)&peer, sizeof(peer));
+net_write(fd, request, request_len);
+net_read(fd, response, response_capacity);
+net_close(fd);
 ```
 
-## 特性
+就绪驱动程序可以使用 `net_epoll_create()`、`net_epoll_ctl()` 和 `net_epoll_wait()`。
 
-- **TCP**：完整状态机（RFC 793），指数退避重传，Keepalive，延迟 ACK，Nagle 算法，窗口缩放，时间戳（PAWS），SACK，拥塞控制（Reno/CUBIC），FIN-WAIT-2/TIME-WAIT 超时
-- **UDP**：无连接数据报，`sendto`/`recvfrom`，隐式 connect
-- **IPv4/IPv6**：分片与重组，扩展头，ICMP 错误处理
-- **ARP/NDP**：地址解析与邻居发现
-- **Socket 选项**：`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_KEEPALIVE`、`SO_RCVBUF`、`SO_SNDBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`TCP_NODELAY`、`TCP_CORK`、`TCP_QUICKACK`
-- **Epoll**：水平触发 `EPOLLIN`/`EPOLLOUT`/`EPOLLERR`/`EPOLLHUP`/`EPOLLRDHUP`
-- **非阻塞 I/O**：通过 `net_fcntl` 设置 `O_NONBLOCK`
-- **异步 API**：基于完成队列，支持批量提交与完成
-- **Loopback**：协议栈内部直接交付，无需经过 AF_XDP
-- **Netlink**：路由与地址监控，支持动态配置
+## 测试与静态分析
+
+```bash
+make test
+make static-analysis
+```
+
+测试覆盖基础库、Netlink、TCP/UDP loopback、epoll 相关协议路径和异步 CQ 并发。
+静态分析报告保存在 `build/test/static-analysis/`。
+
+## 目录结构
+
+```text
+lib/       AF_XDP、队列、RSS、frame cache 和基础组件
+main/      TCP/IP 协议栈、socket、worker、epoll 和异步请求
+docs/      协议设计文档
+example/   示例程序和测试资源
+test/      单元、集成、压力和静态分析工具
+```
+
+公共 API 源文件为 [`main/netfast.h`](./main/netfast.h)。

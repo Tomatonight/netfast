@@ -263,14 +263,6 @@ void set_socket_worker(Socket* sock, worker* w)
 
     }
 
-    if (sock->protocol == IPPROTO_UDP && sock->pcb) {
-        udp_pcb* pcb = (udp_pcb*)sock->pcb;
-
-        if (pcb->send_task && pcb->send_task->parent_thread != w->master) {
-            unregister_task(pcb->send_task);
-            register_task(w->master, pcb->send_task);
-        }
-    }
 }
 
 static hash* select_tuple_hash_by_protocol(int protocol, int family)

@@ -175,6 +175,10 @@ void skb_truncate(skbuff* skb, uint32_t new_len)
 		cum += len;
 		di = di->next;
 	}
+	if (!di) {
+		ERR_LOG("skb_truncate: data chain shorter than data_total_len");
+		return;
+	}
 	data_info* next = di->next;
 	di->next = NULL;
 	while(next){
@@ -427,26 +431,31 @@ skbuff* skb_clone(skbuff* skb){
 
 	new_skb->family   = skb->family;
 	new_skb->protocol = skb->protocol;
+	new_skb->tx_checksum_offset = skb->tx_checksum_offset;
 	new_skb->sock     = skb->sock;
 	new_skb->l4_private = skb->l4_private;
 
 	data_info* orig = &skb->data0;
-	data_info* prev = &new_skb->data0;
+	data_info* prev = NULL;
 	while (orig) {
-		if (prev != &new_skb->data0) {
-			prev->next = (data_info*)malloc(sizeof(data_info));
-			prev = prev->next;
-			if (!prev) {
+		data_info* dst;
+		if (!prev) {
+			dst = &new_skb->data0;
+		} else {
+			dst = (data_info*)malloc(sizeof(*dst));
+			if (!dst) {
 				PUT_REF(new_skb);
 				return NULL;
 			}
+			prev->next = dst;
 		}
-		prev->slot  = orig->slot;
+		dst->slot  = orig->slot;
 		INC_REF(orig->slot);
-		prev->start = orig->start;
-		prev->end   = orig->end;
-		prev->size  = orig->size;
-		prev->next  = NULL;
+		dst->start = orig->start;
+		dst->end   = orig->end;
+		dst->size  = orig->size;
+		dst->next  = NULL;
+		prev = dst;
 		new_skb->data_num++;
 		orig = orig->next;
 	}
@@ -473,40 +482,43 @@ skbuff* skb_copy(skbuff* skb)
 
 	new_skb->family   = skb->family;
 	new_skb->protocol = skb->protocol;
+	new_skb->tx_checksum_offset = skb->tx_checksum_offset;
 	new_skb->sock     = skb->sock;
 	new_skb->l4_private = skb->l4_private;
 
 	data_info* orig = &skb->data0;
-	data_info* prev = &new_skb->data0;
+	data_info* prev = NULL;
 	while (orig) {
 		uint32_t n = orig->end - orig->start;
 		uint32_t headroom = (uint32_t)(orig->start - orig->slot->data);
+		data_info* dst;
 
-		if (prev != &new_skb->data0) {
-			prev->next = alloc_data_info(orig->size);
-			prev = prev->next;
-			if (prev) {
-				prev->start = prev->slot->data + headroom;
-				prev->end = prev->start + n;
-			}
-		} else {
-			/* First element: init embedded data0 directly. */
+		if (!prev) {
+			dst = &new_skb->data0;
 			frame_slot* slot = frame_slot_alloc(orig->size);
 			if (!slot) {
 				PUT_REF(new_skb);
 				return NULL;
 			}
-			prev->slot  = slot;
-			prev->start = slot->data + headroom;
-			prev->end   = slot->data + headroom + n;
-			prev->size  = orig->size;
+			dst->slot  = slot;
+			dst->start = slot->data + headroom;
+			dst->end   = dst->start + n;
+			dst->size  = orig->size;
+		} else {
+			dst = alloc_data_info(orig->size);
+			if (dst) {
+				dst->start = dst->slot->data + headroom;
+				dst->end = dst->start + n;
+				prev->next = dst;
+			}
 		}
-		if (!prev) {
+		if (!dst) {
 			PUT_REF(new_skb);
 			return NULL;
 		}
-		memcpy(prev->start, orig->start, n);
-		prev->next = NULL;
+		memcpy(dst->start, orig->start, n);
+		dst->next = NULL;
+		prev = dst;
 		new_skb->data_num++;
 		orig = orig->next;
 	}

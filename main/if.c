@@ -33,6 +33,21 @@ static const if_l2_ops g_l2_ops[] = {
 static list_node g_if_list;
 pthread_rwlock_t g_if_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
+bool if_has_loopback(void)
+{
+    bool found = false;
+    IF_RDLOCK();
+    if_info* info;
+    FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
+        if (info->ops == &loopback_ops) {
+            found = true;
+            break;
+        }
+    }
+    IF_UNLOCK();
+    return found;
+}
+
 static inline uint32_t if_load_ipv4(const uint8_t* ip)
 {
     uint32_t value;

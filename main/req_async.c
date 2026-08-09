@@ -9,11 +9,54 @@
 #include "fd_entry.h"
 #include "stack.h"
 #include "worker.h"
-#include "../api/netfast.h"
+#include "netfast.h"
 
 _Static_assert((int)NET_ASYNC_SOCKET == (int)REQ_SOCKET &&
                (int)NET_ASYNC_FCNTL == (int)REQ_FCNTL,
                "public async operations must match internal request types");
+
+typedef struct async_waiter {
+    struct async_waiter* next;
+    uint32_t need;
+} async_waiter;
+
+static void async_waiter_add(async_cq* cq, async_waiter* waiter)
+{
+    waiter->next = cq->waiters;
+    cq->waiters = waiter;
+
+    unsigned int need = atomic_load_explicit(&cq->wait_need,
+                                              memory_order_relaxed);
+    if (waiter->need < need)
+        atomic_store_explicit(&cq->wait_need, waiter->need,
+                              memory_order_release);
+}
+
+static void async_waiter_remove(async_cq* cq, async_waiter* waiter)
+{
+    async_waiter** link = &cq->waiters;
+    while (*link != waiter) {
+        assert(*link);
+        link = &(*link)->next;
+    }
+    *link = waiter->next;
+    waiter->next = NULL;
+
+    unsigned int need = UINT_MAX;
+    for (async_waiter* it = cq->waiters; it; it = it->next)
+        need = min(need, it->need);
+    atomic_store_explicit(&cq->wait_need, need, memory_order_release);
+}
+
+static void async_notify_ready_waiters(async_cq* cq)
+{
+    unsigned int need = atomic_load_explicit(&cq->wait_need,
+                                              memory_order_acquire);
+    if (need != UINT_MAX &&
+        atomic_load_explicit(&cq->complete_count,
+                             memory_order_acquire) >= need)
+        notify_queue_notify(&cq->completions);
+}
 
 static void async_req_free(req* r)
 {
@@ -26,7 +69,9 @@ static void async_req_free(req* r)
 
 static void destroy_async_cq(async_cq* cq)
 {
+    assert(!cq->waiters);
     notify_queue_close(&cq->completions);
+    mutex_destroy(&cq->waiters_mtx);
     free(cq);
 }
 
@@ -35,6 +80,11 @@ static req* async_cq_pop(async_cq* cq)
     mpscq_node* node = notify_queue_pop(&cq->completions);
     if (!node)
         return NULL;
+
+    unsigned int old = atomic_fetch_sub_explicit(&cq->complete_count, 1,
+                                                  memory_order_seq_cst);
+    (void)old;
+    assert(old != 0);
 
     req* r = (req*)((uint8_t*)node - offsetof(req, async.completion_node));
     assert(LIST_ATTACHED(&r->async.submit_node));
@@ -48,7 +98,7 @@ static req* async_cq_pop(async_cq* cq)
 
 static int async_submit_batch(fd_entry* entry, req** reqs, uint32_t count);
 static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
-                      uint32_t max, int timeout_ms);
+                      uint32_t max, int total_timeout_ms);
 static int async_close(fd_entry* entry);
 
 static const fd_entry_ops async_fd_ops = {
@@ -64,6 +114,9 @@ int net_async_create(void)
     }
 
     cq->completions.efd = -1;
+    atomic_init(&cq->complete_count, 0);
+    atomic_init(&cq->wait_need, UINT_MAX);
+    mutex_init(&cq->waiters_mtx);
     if (notify_queue_init(&cq->completions) < 0) {
         if (errno == 0)
             errno = EIO;
@@ -149,8 +202,21 @@ static int async_submit_batch(fd_entry* entry, req** reqs, uint32_t count)
     return submitted ? (int)submitted : -1;
 }
 
+static uint64_t async_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t async_add_ns(uint64_t now, uint64_t delta)
+{
+    return UINT64_MAX - now < delta ? UINT64_MAX : now + delta;
+}
+
 static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
-                      uint32_t max, int timeout_ms)
+                      uint32_t max, int total_timeout_ms)
 {
     if (!reqs || min == 0 || max < min || max > INT_MAX) {
         errno = EINVAL;
@@ -159,14 +225,10 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
 
     int count = 0;
     int saved_errno = 0;
-    const bool finite = timeout_ms >= 0;
-    uint64_t deadline = 0;
-
-    if (finite) {
-        uint64_t now = read_now_ms();
-        uint64_t delta = (uint64_t)timeout_ms;
-        deadline = UINT64_MAX - now < delta ? UINT64_MAX : now + delta;
-    }
+    uint64_t now = async_now_ns();
+    uint64_t total_deadline = total_timeout_ms >= 0
+        ? async_add_ns(now, (uint64_t)total_timeout_ms * UINT64_C(1000000))
+        : UINT64_MAX;
 
     mutex_lock(&entry->mtx);
     async_cq* cq = (async_cq*)entry->value;
@@ -175,6 +237,7 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
         errno = EBADF;
         return -1;
     }
+
     INC_REF(cq);
     for (;;) {
         while ((uint32_t)count < max) {
@@ -187,13 +250,36 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
         if ((uint32_t)count >= min)
             break;
 
-        int poll_timeout = -1;
-        if (finite) {
-            uint64_t now = read_now_ms();
-            if (now >= deadline)
-                break;
-            uint64_t remaining = deadline - now;
-            poll_timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        now = async_now_ns();
+        if (now >= total_deadline)
+            break;
+
+        async_waiter waiter = {
+            .need = min - (uint32_t)count,
+        };
+        mutex_lock(&cq->waiters_mtx);
+        async_waiter_add(cq, &waiter);
+
+        /* The producer increments complete_count before publishing its queue
+         * node.  Recheck after arming so a completion cannot fall between the
+         * empty check and poll(). */
+        if (atomic_load_explicit(&cq->complete_count,
+                                 memory_order_acquire) >= waiter.need) {
+            async_waiter_remove(cq, &waiter);
+            mutex_unlock(&cq->waiters_mtx);
+            continue;
+        }
+        mutex_unlock(&cq->waiters_mtx);
+
+        struct timespec timeout;
+        struct timespec* timeout_ptr = NULL;
+        if (total_deadline != UINT64_MAX) {
+            now = async_now_ns();
+            uint64_t remaining = total_deadline > now
+                ? total_deadline - now : 0;
+            timeout.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
+            timeout.tv_nsec = (long)(remaining % UINT64_C(1000000000));
+            timeout_ptr = &timeout;
         }
 
         struct pollfd pfd = {
@@ -202,9 +288,16 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
             .revents = 0,
         };
         mutex_unlock(&entry->mtx);
-        int poll_ret = poll(&pfd, 1, poll_timeout);
-        saved_errno = errno;
+        int poll_ret = ppoll(&pfd, 1, timeout_ptr, NULL);
+        int poll_errno = errno;
         mutex_lock(&entry->mtx);
+
+        if (poll_ret > 0)
+            notify_queue_drain(&cq->completions);
+        mutex_lock(&cq->waiters_mtx);
+        async_waiter_remove(cq, &waiter);
+        mutex_unlock(&cq->waiters_mtx);
+        async_notify_ready_waiters(cq);
 
         if (entry->value != cq) {
             if (count == 0) {
@@ -214,17 +307,12 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
             break;
         }
         if (poll_ret < 0) {
+            saved_errno = poll_errno;
             if (count == 0)
                 count = -1;
             break;
         }
-        if (poll_ret == 0)
-            break;
-        notify_queue_drain(&cq->completions);
     }
-
-    if (!notify_queue_is_empty(&cq->completions))
-        notify_queue_notify(&cq->completions);
 
     mutex_unlock(&entry->mtx);
     PUT_REF(cq); /* wait reference: keeps eventfd alive across poll() */
@@ -556,12 +644,12 @@ int net_async_submit_batch(int cq_fd, req** reqs, uint32_t count)
 }
 
 int net_async_wait(int cq_fd, req** reqs, uint32_t min,
-                   uint32_t max, int timeout_ms)
+                   uint32_t max, int total_timeout_ms)
 {
     fd_entry* entry = hold_async_entry(cq_fd);
     if (!entry)
         return -1;
-    int ret = async_wait(entry, reqs, min, max, timeout_ms);
+    int ret = async_wait(entry, reqs, min, max, total_timeout_ms);
     PUT_REF(entry);
     return ret;
 }

@@ -76,11 +76,14 @@ int net_async_submit(int cq_fd, net_async_req *request);
  * requests at and after that index remain owned by the caller. */
 int net_async_submit_batch(int cq_fd, net_async_req **requests,
                            uint32_t count);
-/* Wait for at least min_complete requests and return as many immediately
- * available completions as possible, up to max_complete. */
+/* Wait for min_complete requests and return as many immediately available
+ * completions as possible, up to max_complete.  On total timeout, a partial
+ * batch is returned.  A negative total_timeout_ms waits indefinitely.
+ * Multiple threads may wait on the same CQ; each completion is returned to
+ * exactly one waiter. */
 int net_async_wait(int cq_fd, net_async_req **requests,
 	                   uint32_t min_complete, uint32_t max_complete,
-	                   int timeout_ms);
+	                   int total_timeout_ms);
 int net_async_close(int cq_fd);
 
 	#ifdef __cplusplus

@@ -314,6 +314,7 @@ bool ipv4_frag(skbuff* skb){
     /* Individual IP fragments are not complete L4 packets and therefore
      * must not request AF_XDP L4 checksum offload. */
     skb->l4_hdr = NULL;
+    skb->tx_checksum_offset = 0;
     return true;
 
 fail:

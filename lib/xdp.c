@@ -602,37 +602,8 @@ static void xdp_tx_kick_loop(task* tk)
  * data_buf references until they are returned through the completion ring. */
 static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
 {
-    uint32_t frames = skb->data_num;
-
     uint8_t* packet = skb_start(skb);
-    struct xsk_tx_metadata* meta =
-        (struct xsk_tx_metadata*)(packet - XDP_TX_METADATA_LEN);
-    meta->flags = 0;
-
-    bool checksum = ix->info->hw_tx_checksum_enabled && skb->l4_hdr &&
-        (skb->protocol == IPPROTO_TCP || skb->protocol == IPPROTO_UDP) &&
-        (skb->family == AF_INET || skb->family == AF_INET6);
-    uintptr_t packet_addr = (uintptr_t)packet;
-    uintptr_t l4_addr = (uintptr_t)skb->l4_hdr;
-    uint16_t offset = skb->protocol == IPPROTO_TCP
-        ? offsetof(tcp_hdr, check) : offsetof(udp_hdr, check);
-    uint64_t start = l4_addr >= packet_addr ? l4_addr - packet_addr : UINT64_MAX;
-
-    if (checksum && start <= UINT16_MAX &&
-        start + offset + sizeof(uint16_t) <= skb_data0_len(skb) &&
-        start <= skb_data_len(skb)) {
-        uint32_t len = skb_data_len(skb) - (uint32_t)start;
-        uint16_t seed = skb->family == AF_INET
-            ? skb_checksum_protocol(NULL, len, skb->ipv4_hdr->saddr,
-                                    skb->ipv4_hdr->daddr, skb->protocol)
-            : skb_checksum_protocol6(NULL, len, skb->ipv6_hdr->saddr,
-                                     skb->ipv6_hdr->daddr, skb->protocol);
-
-        meta->flags = XDP_TXMD_FLAGS_CHECKSUM;
-        meta->request.csum_start = (uint16_t)start;
-        meta->request.csum_offset = offset;
-        memcpy((uint8_t*)skb->l4_hdr + offset, &seed, sizeof(seed));
-    }
+    uint32_t frames = skb->data_num;
 
     uint32_t tx_idx = 0;
     umem_refill_fq(ix, &ix->fq);
@@ -645,15 +616,25 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
         return -EAGAIN;
     }
 
+    struct xsk_tx_metadata* meta =
+        (struct xsk_tx_metadata*)(packet - XDP_TX_METADATA_LEN);
+    meta->flags = 0;
+
+    if (skb->tx_checksum_offset) {
+        meta->flags = XDP_TXMD_FLAGS_CHECKSUM;
+        meta->request.csum_start =
+            (uint16_t)((uint8_t*)skb->l4_hdr - packet);
+        meta->request.csum_offset = skb->tx_checksum_offset;
+    }
+
     data_info* di = &skb->data0;
     for (uint32_t i = 0; i < frames; ++i, di = di->next) {
-        assert(di);
         frame_slot* slot = di->slot;
         struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
         d->addr = (uint64_t)(di->start -
                              (uint8_t*)g_xdp_frame_pool.buffer);
         d->len = di->end - di->start;
-        d->options = (i + 1 == frames) ? 0 : XDP_PKT_CONTD;
+        d->options = 0;
         if (i == 0 && meta->flags)
             d->options |= XDP_TX_METADATA;
         INC_REF(slot);
@@ -668,14 +649,12 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
 
 static int xdp_tx_enqueue(if_xdp* ix, skbuff* skb)
 {
-    uint32_t frames = skb->data_num;
-
-    if (ix->pending_tx_frames + frames > XDP_TX_PENDING_FRAME_LIMIT)
-        return -EAGAIN;
+    if (ix->pending_tx_frames >= XDP_TX_PENDING_FRAME_LIMIT)
+        return 0;
 
     INC_REF(skb);
     add_queue(&ix->pending_tx_queue, &skb->tx_node);
-    ix->pending_tx_frames += frames;
+    ix->pending_tx_frames++;
     xdp_tx_update_watch(ix);
     return 0;
 }
@@ -700,7 +679,7 @@ static void xdp_tx_drain_pending(if_xdp* ix)
             break;
 
         (void)pop_queue(&ix->pending_tx_queue);
-        ix->pending_tx_frames -= skb->data_num;
+        ix->pending_tx_frames--;
         if (ret < 0) {
             WARN_LOG("xdp: drop pending TX skb if=%s q=%u err=%d",
                      ix->info ? ix->info->name : "?", ix->queue_id, -ret);
@@ -1227,21 +1206,22 @@ static int if_set_hw_rss_toeplitz(if_info* info, int queues)
 
 int xdp_if_start(if_info *info)
 {
-    int queues = cfg_get_if_queues(info->name);
-
     /* Netlink reports every link, whereas only open_if entries are AF_XDP
      * interfaces.  Leave all other links untouched. */
-    if (!info || queues <= 0)
+    if (!info)
+        return 0;
+
+    int queues = cfg_get_if_queues(info->name);
+    if (queues <= 0)
         return 0;
 
     worker* w = get_current_worker();
     int w_idx = (int)(w - g_workers);
 
     /* RSS configuration is performed once by the main worker. */
-    if (w == main_worker &&
+    if (w == main_worker && queues > 1 &&
         if_set_hw_rss_toeplitz(info, queues) < 0) {
         ERR_LOG("xdp: RSS configuration failed if=%s", info->name);
-        return -1;
     }
 
     /* Create XSK for every queue assigned to this worker
@@ -1342,14 +1322,13 @@ int xdp_if_stop(if_info *info)
 	        info->xdp_data[q] = NULL;
 
 			/* Stop callbacks before touching rings. */
-		destroy_task(ix->tx_kick_task);
-		ix->tx_kick_task = NULL;
+			destroy_task(ix->tx_kick_task);
+			ix->tx_kick_task = NULL;
 		if (ix->tk) {
 			unregister_task(ix->tk);
 			destroy_task(ix->tk);
 			ix->tk = NULL;
 		}
-
         xdp_tx_drop_pending(ix);
         umem_complete_tx(&ix->cq);
 
@@ -1503,9 +1482,11 @@ void xdp_if_read(task *tk)
 				if (!more) break;
 				continue;
             }
-            INC_REF(slot);
-
-            data_info* ni = create_data_info(slot, 0, chunk);
+            /* The kernel has consumed the FQ descriptor.  Transfer its
+             * existing frame reference to data_info; taking another one here
+             * would keep every received frame permanently out of the pool. */
+            uint32_t pkt_offset = (uint32_t)(payload - slot->data);
+            data_info* ni = create_data_info(slot, pkt_offset, pkt_offset + chunk);
             if (!ni) {
                 PUT_REF(slot);
 				packet_bad = true;

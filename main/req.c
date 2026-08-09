@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -372,8 +373,16 @@ void req_notify(req* r, int ret)
 
         /* Publish all metadata before the node.  Once mpscq_push() returns,
          * a waiter may dequeue and destroy r immediately. */
+        /* Reserve the count before publishing the node so a consumer can
+         * never dequeue it before complete_count accounts for it. */
+        unsigned int queued = atomic_fetch_add_explicit(
+            &cq->complete_count, 1, memory_order_seq_cst) + 1;
         mpscq_push(&cq->completions.q, &r->async.completion_node);
-        notify_queue_notify(&cq->completions);
+
+        unsigned int need = atomic_load_explicit(&cq->wait_need,
+                                                  memory_order_acquire);
+        if (need != UINT_MAX && queued >= need)
+            notify_queue_notify(&cq->completions);
         return;
     }
 

@@ -85,5 +85,7 @@ bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
 
 if_info* if_create_virtual_loopback(void);
 
+bool if_has_loopback(void);
+
 #endif
 

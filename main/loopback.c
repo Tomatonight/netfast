@@ -45,21 +45,17 @@ const if_ops loopback_ops = {
 
 int loopback_init(void)
 {
-    /* Do not call search_if_by_name() while holding IF_WRLOCK(): it takes
-     * IF_RDLOCK() itself.  pthread rwlocks are not recursive, and ignoring
-     * that failed nested lock corrupted g_if_rwlock's reader count. */
-    if_info* lo = search_if_by_name("loopback");
-    if (lo) {
-        PUT_REF(lo);
+    /* Check if a loopback interface already exists by querying the
+     * interface list for one with loopback ops. */
+    if (if_has_loopback())
         return 0;
-    }
 
     IF_WRLOCK();
 
     /* Create and publish the interface under the list lock.  Address helpers
      * acquire the same lock internally, so they must run after it is
      * released; pthread rwlocks are not recursive. */
-    lo = if_create_virtual_loopback();
+    if_info* lo = if_create_virtual_loopback();
     if (!lo) {
         IF_UNLOCK();
         ERR_LOG("loopback_init: failed to create loopback interface");
