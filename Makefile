@@ -88,6 +88,7 @@ INCLUDE_DIR ?= $(PREFIX)/include
 LIB_DIR ?= $(PREFIX)/lib
 BPF_INSTALL_DIR ?= $(PREFIX)/lib/bpf
 CONFIG_DIR ?= $(PREFIX)/etc/netfast
+CONFIG_FILE ?= $(firstword $(wildcard config.json) config.example.json)
 
 .DEFAULT_GOAL := debug
 
@@ -171,7 +172,7 @@ test: $(TEST_BINS)
 static-analysis:
 	sh test/test4/run_static_analysis.sh
 
-install: $(LIB) $(BPF_OBJ) $(HEADER)
+install: $(LIB) $(BPF_OBJ) $(HEADER) $(CONFIG_FILE)
 	install -d $(DESTDIR)$(LIB_DIR)
 	install -m 755 $(LIB) $(DESTDIR)$(LIB_DIR)/libnetfast.so
 	install -d $(DESTDIR)$(INCLUDE_DIR)
@@ -179,7 +180,7 @@ install: $(LIB) $(BPF_OBJ) $(HEADER)
 	install -d $(DESTDIR)$(BPF_INSTALL_DIR)
 	for f in $(BPF_OBJ); do install -m 644 $$f $(DESTDIR)$(BPF_INSTALL_DIR)/ ; done
 	install -d $(DESTDIR)$(CONFIG_DIR)
-	install -m 644 config.json $(DESTDIR)$(CONFIG_DIR)/config.json
+	install -m 644 $(CONFIG_FILE) $(DESTDIR)$(CONFIG_DIR)/config.json
 	ldconfig $(DESTDIR)$(LIB_DIR) 2>/dev/null || true
 
 uninstall:

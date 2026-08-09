@@ -160,8 +160,25 @@ under `/usr/local` by default.
 
 ## Configuration
 
-NetFast reads `config.json`, or the installed configuration at
-`/usr/local/etc/netfast/config.json`.
+The versioned [`config.example.json`](./config.example.json) is the installation
+template; a local `config.json` is ignored by Git so that machine-specific
+settings stay private. A default build loads
+`/usr/local/etc/netfast/config.json` when `libnetfast.so` is loaded and does not
+search the application's current working directory.
+
+Create a local configuration and install it with the library:
+
+```bash
+cp config.example.json config.json
+editor config.json
+sudo make PROFILE=release install
+```
+
+The Makefile uses the local `config.json` when it exists, otherwise it installs
+`config.example.json`. Use `CONFIG_FILE=/path/to/config.json` to select another
+source file explicitly.
+
+Example configuration:
 
 ```json
 {
@@ -176,8 +193,39 @@ NetFast reads `config.json`, or the installed configuration at
 }
 ```
 
-After changing the installed configuration, run the install command again or
-copy the updated file to the installed configuration path.
+### Configuration fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `thread_num` | Yes | Number of worker threads, from 1 to 64. Workers are pinned to CPUs on a best-effort basis. |
+| `open_if` | Yes | Non-empty array of interfaces owned by NetFast. Interface names must be unique. Interfaces omitted from this list do not get AF_XDP sockets. |
+| `open_if[].name` | Yes | Linux interface name, for example `ens192`. Check it with `ip -br link`. Do not select the interface used for SSH or desktop management. |
+| `open_if[].queues` | No | Number of AF_XDP RX/TX queues, from 1 to 32. Missing or `0` means `thread_num`. The NIC must expose all requested queue IDs. |
+| `ipv4_forward` | No | Enables forwarding of non-local IPv4 packets. Defaults to `true`. |
+| `ipv6_forward` | No | Enables forwarding of non-local IPv6 packets. Defaults to `true`. |
+| `toeplitz_rss_key` | No | 40-byte Toeplitz key encoded as 80 hexadecimal characters. If omitted, the compiled-in key is used. The same key drives hardware RSS setup and software worker selection. |
+| `logfile` | Yes | Non-empty log path shorter than 256 bytes. NetFast creates the file if its parent directory exists and permissions allow it. |
+
+`queues` describes hardware queue IDs, not a per-worker queue count. Queue `q`
+is assigned to worker `q % thread_num`; a multi-queue configuration therefore
+normally uses at least as many queues as workers. Inspect the device before
+choosing the value:
+
+```bash
+ethtool -l ens192
+ethtool -x ens192
+```
+
+For a one-queue NIC, set `queues` to `1`; NetFast skips RSS programming. With
+multiple queues it attempts to install a Toeplitz indirection table. An RSS
+ioctl failure is logged and initialization continues, but traffic may not be
+distributed evenly.
+
+The configuration is parsed once by the shared-library constructor. Invalid
+JSON, a missing required field, an out-of-range value, an unavailable queue, or
+an unwritable log path makes initialization fail. Restart the application after
+editing the installed file. Running `make install` again overwrites the
+installed configuration with the selected `CONFIG_FILE`.
 
 ### Network safety
 

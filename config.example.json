@@ -1,0 +1,13 @@
+{
+  "thread_num": 2,
+  "open_if": [
+    {
+      "name": "ens192",
+      "queues": 2
+    }
+  ],
+  "ipv4_forward": true,
+  "ipv6_forward": true,
+  "toeplitz_rss_key": "6d5a56da255b0ec24167253d43a38fb0d0ca2bcbae7b30b477cb2da38030f20c6a42b73bbeac01fa",
+  "logfile": "/tmp/user_stack.log"
+}

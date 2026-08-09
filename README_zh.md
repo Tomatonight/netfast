@@ -145,8 +145,24 @@ sudo make PROFILE=release install
 
 ## 配置
 
-NetFast 读取当前目录的 `config.json`，或安装后的
-`/usr/local/etc/netfast/config.json`。
+版本库跟踪的 [`config.example.json`](./config.example.json) 是安装模板；本机
+`config.json` 被 Git 忽略，避免上传网卡名、日志路径等机器专用设置。
+默认构建的 `libnetfast.so` 在被加载时只读取
+`/usr/local/etc/netfast/config.json`，不会搜索应用的当前工作目录。
+
+复制模板、按实际环境修改，然后随动态库一起安装：
+
+```bash
+cp config.example.json config.json
+editor config.json
+sudo make PROFILE=release install
+```
+
+Makefile 在本地 `config.json` 存在时优先安装它，否则安装
+`config.example.json`。也可用 `CONFIG_FILE=/path/to/config.json` 显式选择
+其他源配置。
+
+配置示例：
 
 ```json
 {
@@ -161,7 +177,36 @@ NetFast 读取当前目录的 `config.json`，或安装后的
 }
 ```
 
-修改安装配置后，需要重新执行安装命令，或手动将配置复制到安装路径。
+### 配置字段
+
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `thread_num` | 是 | worker 线程数，范围为 1～64。worker 会尽力绑定到 CPU。 |
+| `open_if` | 是 | NetFast 接管的网卡数组，不能为空，网卡名不能重复。未列入的网卡不会创建 AF_XDP socket。 |
+| `open_if[].name` | 是 | Linux 网卡名，例如 `ens192`，可用 `ip -br link` 查看。不要选择承载 SSH 或桌面管理连接的网卡。 |
+| `open_if[].queues` | 否 | AF_XDP RX/TX 队列数，范围为 1～32。省略或填 `0` 时等于 `thread_num`；网卡必须实际提供这些队列 ID。 |
+| `ipv4_forward` | 否 | 是否转发非本机 IPv4 报文，默认为 `true`。 |
+| `ipv6_forward` | 否 | 是否转发非本机 IPv6 报文，默认为 `true`。 |
+| `toeplitz_rss_key` | 否 | 40 字节 Toeplitz key，写成 80 个十六进制字符。省略时使用编译内置值；硬件 RSS 和软件 worker 选择使用同一个 key。 |
+| `logfile` | 是 | 非空日志路径，长度小于 256 字节。父目录存在且权限允许时，NetFast 会创建该文件。 |
+
+`queues` 表示硬件队列 ID 数量，不是每个 worker 的队列数。队列 `q` 分配给
+worker `q % thread_num`，因此多队列配置通常至少使用与 worker 数相同的
+队列数。配置前先查看网卡能力：
+
+```bash
+ethtool -l ens192
+ethtool -x ens192
+```
+
+单队列网卡应设置 `"queues": 1`，NetFast 会跳过 RSS 配置。多队列时
+NetFast 会尝试写入 Toeplitz RSS 间接表；RSS ioctl 失败会记录日志并
+继续初始化，但流量可能无法均匀分配。
+
+配置在动态库构造阶段只解析一次。JSON 格式错误、缺少必填字段、数值
+越界、队列不存在或日志路径不可写都会导致初始化失败。修改安装配置
+后必须重启应用。重新执行 `make install` 会用当前选中的 `CONFIG_FILE`
+覆盖已安装配置。
 
 ### 网络安全注意事项
 
