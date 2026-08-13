@@ -115,38 +115,45 @@ static int test_mpsc_queue_concurrency(void)
 
 typedef struct hash_thread_arg {
     hash *table;
+    struct hash_test_item *items;
     uint32_t start;
     uint32_t count;
 } hash_thread_arg;
+
+typedef struct hash_test_item {
+    uint32_t key;
+    uint64_t value;
+    hash_node hash_node;
+} hash_test_item;
 
 static void *hash_writer(void *opaque)
 {
     hash_thread_arg *arg = opaque;
     for (uint32_t i = 0; i < arg->count; ++i) {
-        uint32_t key = arg->start + i;
-        if (!hash_add(arg->table, (const uint8_t *)&key, sizeof(key),
-                      (uint64_t)key + 1u))
+        hash_test_item *item = &arg->items[arg->start + i];
+        if (!hash_add_node(arg->table, &item->hash_node))
             return (void *)1;
     }
     return NULL;
 }
 
-static int increment_hash_element(uint64_t *element, void *ctx)
-{
-    uint64_t add = *(uint64_t *)ctx;
-    *element += add;
-    return 77;
-}
-
 static int test_safe_hash_concurrency(void)
 {
     enum { THREADS = 4, PER_THREAD = 400 };
-    hash *table = hash_create_safe(32);
+    hash_test_item *items = calloc(THREADS * PER_THREAD, sizeof(*items));
+    TEST_ASSERT(items);
+    for (uint32_t i = 0; i < THREADS * PER_THREAD; ++i) {
+        items[i].key = i;
+        items[i].value = (uint64_t)i + 1u;
+    }
+    hash *table = hash_create_safe(32,
+        HASH_KEY_OFFSET(hash_test_item, hash_node, key), sizeof(uint32_t));
     pthread_t threads[THREADS];
     hash_thread_arg args[THREADS];
     TEST_ASSERT(table);
     for (uint32_t i = 0; i < THREADS; ++i) {
-        args[i] = (hash_thread_arg){.table = table, .start = i * PER_THREAD,
+        args[i] = (hash_thread_arg){.table = table, .items = items,
+                                    .start = i * PER_THREAD,
                                     .count = PER_THREAD};
         TEST_ASSERT(pthread_create(&threads[i], NULL, hash_writer,
                                    &args[i]) == 0);
@@ -155,19 +162,23 @@ static int test_safe_hash_concurrency(void)
         void *result = NULL;
         TEST_ASSERT(pthread_join(threads[i], &result) == 0 && result == NULL);
     }
-    for (uint32_t key = 0; key < THREADS * PER_THREAD; ++key)
-        TEST_ASSERT(hash_get_element(table, (uint8_t *)&key, sizeof(key)) ==
-                    (uint64_t)key + 1u);
+    for (uint32_t key = 0; key < THREADS * PER_THREAD; ++key) {
+        hash_node *node = hash_find_node(table, &key);
+        hash_test_item *item = node
+            ? HASH_CONTAINER_OF(node, hash_test_item, hash_node) : NULL;
+        TEST_ASSERT(item && item->value == (uint64_t)key + 1u);
+    }
 
     uint32_t key = 23;
-    uint64_t increment = 9;
-    TEST_ASSERT(hash_operate_element(table, (uint8_t *)&key, sizeof(key),
-                                     increment_hash_element, &increment) == 77);
-    TEST_ASSERT(hash_get_element(table, (uint8_t *)&key, sizeof(key)) == 33);
+    hash_node *node = hash_find_node(table, &key);
+    hash_test_item *item = node
+        ? HASH_CONTAINER_OF(node, hash_test_item, hash_node) : NULL;
+    TEST_ASSERT(item && item->value == 24);
     for (uint32_t i = 0; i < THREADS * PER_THREAD; ++i)
-        TEST_ASSERT(hash_del(table, (uint8_t *)&i, sizeof(i)) != 0);
+        hash_del_node(table, &items[i].hash_node);
     TEST_ASSERT(hash_is_empty(table));
     hash_destroy(table);
+    free(items);
     return 0;
 }
 

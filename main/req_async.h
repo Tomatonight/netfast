@@ -21,7 +21,7 @@ req* net_async_req_create(int fd, int operation, ...);
 
 /* Destroy an unsubmitted request, or one returned by net_async_wait(). */
 void net_async_req_destroy(req* r);
-int net_async_req_result(const req* r, int* saved_errno);
+int net_async_req_result(const req* r);
 
 
 /* ── public API (fd-based) ── */

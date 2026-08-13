@@ -1,6 +1,5 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -11,7 +10,9 @@
 
 #include "req.h"
 #include "req_async.h"
+#ifdef TEST_EPOLL
 #include "req_epoll.h"
+#endif
 #include "req_socket.h"
 #include "fd_entry.h"
 #include "log.h"
@@ -19,13 +20,12 @@
 
 req* req_create(void)
 {
-    req* r = calloc(1, sizeof(req));
+    req* r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     spin_lock_init(&r->done_mtx);
     pthread_mutex_init(&r->done_wait_mtx, NULL);
     pthread_cond_init(&r->done_cv, NULL);
     r->status = REQ_IN_PROGRESS;
-    r->saved_errno = 0;
     return r;
 }
 
@@ -43,8 +43,6 @@ int req_push_wait(worker* w, req* r)
 {
     if (!w) {
         errno = EBADF;
-        if (r)
-            r->saved_errno = EBADF;
         return -1;
     }
 
@@ -68,11 +66,9 @@ int req_push_wait(worker* w, req* r)
     if (no_wait)
         return 0;
 
-    if (r->saved_errno != 0) {
-        errno = r->saved_errno;
-    } else if (r->ret == -1) {
-        /* Never expose a stale errno when a worker forgot to provide one. */
-        errno = EIO;
+    if (r->ret < 0) {
+        errno = -r->ret;
+        return -1;
     }
 
     return r->ret;
@@ -297,11 +293,16 @@ int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 
 int net_epoll_create(void)
 {
+#ifdef TEST_EPOLL
     return req_epoll_create();
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
 }
-
 int net_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event)
 {
+#ifdef TEST_EPOLL
     fd_entry *entry = hold_fd_entry(epfd);
     if (!entry || !entry->ops->epoll_ctl) {
         errno = entry ? EINVAL : EBADF;
@@ -311,11 +312,19 @@ int net_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event)
     int ret = entry->ops->epoll_ctl(entry, op, sockfd, event);
     PUT_REF(entry);
     return ret;
+#else
+    (void)epfd;
+    (void)op;
+    (void)sockfd;
+    (void)event;
+    errno = ENOTSUP;
+    return -1;
+#endif
 }
-
 int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
                    int timeout_ms)
 {
+#ifdef TEST_EPOLL
     fd_entry *entry = hold_fd_entry(epfd);
     if (!entry || !entry->ops->epoll_wait) {
         errno = entry ? EINVAL : EBADF;
@@ -325,6 +334,14 @@ int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
     int ret = entry->ops->epoll_wait(entry, events, maxevents, timeout_ms);
     PUT_REF(entry);
     return ret;
+#else
+    (void)epfd;
+    (void)events;
+    (void)maxevents;
+    (void)timeout_ms;
+    errno = ENOTSUP;
+    return -1;
+#endif
 }
 
 void req_notify(req* r, int ret)

@@ -108,23 +108,15 @@ fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
 fd_entry* hold_fd_entry(int fd)
 {
     int slot = fd_to_slot(fd);
-    if (slot < 0)
-        return NULL;
-
-    if ((uint32_t)slot >= FD_TABLE_CAP)
+    if (slot < 0 || (uint32_t)slot >= FD_TABLE_CAP)
         return NULL;
 
     uint32_t idx = fd_lock_idx((uint32_t)slot);
     spin_rwlock_rdlock(&g_fd_locks[idx]);
     fd_entry* entry = g_fd_table[slot];
-    if (entry && (!REF_USABLE(entry) || !INC_REF_NOT_ZERO(entry)))
+    if (entry && !INC_REF_NOT_ZERO(entry))
         entry = NULL;
     spin_rwlock_unlock(&g_fd_locks[idx]);
-
-    if (entry && !REF_USABLE(entry)) {
-        PUT_REF(entry);
-        entry = NULL;
-    }
     return entry;
 }
 
@@ -148,7 +140,9 @@ fd_entry* get_sock_entry_by_req(const req* r)
     case REQ_GETSOCKOPT:   return r->argv.getsockopt.entry;
     case REQ_FCNTL:        return r->argv.fcntl.entry;
     case REQ_POLL:        return r->argv.poll.entry;
+#ifdef TEST_EPOLL
     case REQ_EPOLL_CTL:  return r->argv.epoll_ctl.entry;
+#endif
     default:               return NULL;
     }
 }

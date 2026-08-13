@@ -5,7 +5,7 @@ _VSCodeCounter(1)*/
 .vscode/
 _clinerules/
 
-config.json
+netfast_config.json
 todo
 ai_readme
 ai_must_read.txt

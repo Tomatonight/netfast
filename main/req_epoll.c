@@ -17,6 +17,8 @@
 #include "req_socket.h"
 #include "socket.h"
 
+#ifdef TEST_EPOLL
+
 static void destroy_net_epoll(net_epoll* ep);
 
 static void destroy_net_epoll_item(net_epoll_item* item)
@@ -131,7 +133,8 @@ int req_epoll_create(void)
     ep->ready_q.efd = -1;
     spin_lock_init(&ep->ready_lock);
 
-    ep->registered_sockfds = hash_create_safe(1024);
+    ep->registered_sockfds = hash_create_safe(1024,
+        HASH_KEY_OFFSET(net_epoll_item, hash_node, sockfd), sizeof(int));
     if (!ep->registered_sockfds) {
         errno = ENOMEM;
         PUT_REF(ep);
@@ -174,7 +177,7 @@ int req_epoll_close(fd_entry* entry)
     }
     for (uint32_t i = 0; i < h->size; i++) {
         HASH_BUCKET_RDLOCK(h, i);
-        for (list_node* node = h->hash_lists[i]->next; node; node = node->next)
+        for (hash_node* node = h->buckets[i]; node; node = node->next)
             sockfd_count++;
         HASH_BUCKET_UNLOCK(h, i);
     }
@@ -189,11 +192,11 @@ int req_epoll_close(fd_entry* entry)
         uint32_t n = 0;
         for (uint32_t i = 0; i < h->size && n < sockfd_count; i++) {
             HASH_BUCKET_RDLOCK(h, i);
-            for (list_node* node = h->hash_lists[i]->next;
+            for (hash_node* node = h->buckets[i];
                  node && n < sockfd_count; node = node->next) {
-                hash_data* data = (hash_data*)((uint8_t*)node
-                                     - offsetof(hash_data, node));
-                memcpy(&sockfds[n++], data->key, sizeof(int));
+                net_epoll_item* item = HASH_CONTAINER_OF(
+                    node, net_epoll_item, hash_node);
+                sockfds[n++] = item->sockfd;
             }
             HASH_BUCKET_UNLOCK(h, i);
         }
@@ -314,12 +317,9 @@ static int epoll_ctl_add(Socket* sock, net_epoll* ep, int sockfd,
     item->node.value = item;
     item->node.cb = epoll_pending_cb;
 
-    if (!hash_add(ep->registered_sockfds, (uint8_t*)&sockfd,
-                  sizeof(sockfd), (uint64_t)(uintptr_t)item)) {
-        int error = hash_element_exist(ep->registered_sockfds,
-                    (uint8_t*)&sockfd, sizeof(sockfd)) ? EEXIST : ENOMEM;
+    if (!hash_add_node(ep->registered_sockfds, &item->hash_node)) {
         DESTROY_REF(item);
-        return error;
+        return EEXIST;
     }
 
     add_list_node(&sock->pending, &item->node.node);
@@ -327,12 +327,27 @@ static int epoll_ctl_add(Socket* sock, net_epoll* ep, int sockfd,
     return 0;
 }
 
+static net_epoll_item* epoll_find_item(net_epoll* ep, int sockfd)
+{
+    hash* h = ep->registered_sockfds;
+    uint32_t value = general_hash_algorithm((const uint8_t*)&sockfd,
+                                            h->key_len);
+    uint32_t index = hash_bucket_index(h, value);
+
+    HASH_BUCKET_RDLOCK(h, index);
+    hash_node* node = hash_find_node_locked(h, index, &sockfd, value);
+    net_epoll_item* item = node
+        ? HASH_CONTAINER_OF(node, net_epoll_item, hash_node) : NULL;
+    if (item)
+        INC_REF(item);
+    HASH_BUCKET_UNLOCK(h, index);
+    return item;
+}
+
 static int epoll_ctl_mod(Socket* sock, net_epoll* ep, int sockfd,
                          const struct epoll_event* event)
 {
-    net_epoll_item* item = (net_epoll_item*)hash_get_element_ref(
-        ep->registered_sockfds, (uint8_t*)&sockfd, sizeof(sockfd),
-        offsetof(net_epoll_item, ref));
+    net_epoll_item* item = epoll_find_item(ep, sockfd);
     if (!item)
         return ENOENT;
 
@@ -352,8 +367,9 @@ static int epoll_ctl_mod(Socket* sock, net_epoll* ep, int sockfd,
 
 static int epoll_ctl_del(net_epoll* ep, int sockfd)
 {
-    net_epoll_item* item = (net_epoll_item*)(uintptr_t)hash_del(
-        ep->registered_sockfds, (uint8_t*)&sockfd, sizeof(sockfd));
+    hash_node* node = hash_del_key(ep->registered_sockfds, &sockfd);
+    net_epoll_item* item = node
+        ? HASH_CONTAINER_OF(node, net_epoll_item, hash_node) : NULL;
     if (!item)
         return ENOENT;
 
@@ -391,8 +407,7 @@ void _epoll_ctl(req* r)
         }
     }
 
-    r->saved_errno = error;
-    req_notify(r, error ? -1 : 0);
+    req_notify(r, -error);
 }
 
 typedef struct epoll_snapshot {
@@ -622,3 +637,5 @@ static void destroy_net_epoll(net_epoll* ep)
 
     free(ep);
 }
+
+#endif /* TEST_EPOLL */

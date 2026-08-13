@@ -25,8 +25,8 @@ typedef enum req_status req_status;
 typedef struct protocol_map{
     bind_table* bound_table4; // IPv4 addr_key -> atomic bind count
     bind_table* bound_table6; // IPv6 addr_key -> atomic bind count
-    hash* tuple_hash4; // IPv4 addr_tuple -> sock_group*
-    hash* tuple_hash6; // IPv6 addr_tuple -> sock_group*
+    hash* tuple_hash4; // Global IPv4 tuple -> socket group
+    hash* tuple_hash6; // Global IPv6 tuple -> socket group
 } protocol_map;
 
 typedef struct stack_maps {

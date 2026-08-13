@@ -42,8 +42,9 @@ int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
 /* ── asynchronous request API ──
  * A successful submit transfers request ownership to the completion queue.
  * net_async_wait() returns ownership to the caller; then inspect the result
- * and call net_async_req_destroy().  All pointed-to buffers must remain valid
- * until completion. */
+ * and call net_async_req_destroy().  A completed request result is
+ * non-negative on success and -errno on failure.  All pointed-to buffers must
+ * remain valid until completion. */
 typedef struct req net_async_req;
 
 typedef enum net_async_op {
@@ -67,7 +68,10 @@ typedef enum net_async_op {
 
 net_async_req *net_async_req_create(int fd, int operation, ...);
 void net_async_req_destroy(net_async_req *request);
-int net_async_req_result(const net_async_req *request, int *saved_errno);
+/* Returns the completed operation result directly: non-negative on success,
+ * or -errno on failure.  Returns -EINVAL if request is not a detached
+ * completion. */
+int net_async_req_result(const net_async_req *request);
 int net_async_create(void);
 int net_async_submit(int cq_fd, net_async_req *request);
 /* Submit requests in array order.  On success, returns the number submitted

@@ -3,6 +3,7 @@ CLANG ?= clang
 
 BUILD_DIR := build
 PROFILE ?= debug
+TEST_EPOLL ?= 0
 
 PROFILE_CFLAGS_debug := -Og -g3 -DDEBUG
 PROFILE_CFLAGS_release := -O2 -DNDEBUG
@@ -70,12 +71,15 @@ BPF_ARCH ?= $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
 CFLAGS ?= $(PROFILE_CFLAGS) -Wall -Wextra -MMD -MP -D_GNU_SOURCE
 CFLAGS += -I. -Ilib -Imain -pthread -fPIC
 
+ifeq ($(TEST_EPOLL),1)
+CFLAGS += -DTEST_EPOLL
+endif
+
 # 处理大静态数据/.bss 场景下的重定位溢出
 CFLAGS += -mcmodel=large
 
 BPF_CFLAGS ?= $(PROFILE_BPF_CFLAGS) -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
-# Ubuntu keeps asm headers under the multiarch include directory.  Clang's
-# BPF target does not add that directory automatically.
+
 BPF_MULTIARCH ?= $(shell $(CC) -print-multiarch 2>/dev/null)
 ifneq ($(strip $(BPF_MULTIARCH)),)
 BPF_CFLAGS += -I/usr/include/$(BPF_MULTIARCH)
@@ -88,21 +92,11 @@ INCLUDE_DIR ?= $(PREFIX)/include
 LIB_DIR ?= $(PREFIX)/lib
 BPF_INSTALL_DIR ?= $(PREFIX)/lib/bpf
 CONFIG_DIR ?= $(PREFIX)/etc/netfast
-CONFIG_FILE ?= $(firstword $(wildcard config.json) config.example.json)
+CONFIG_FILE ?= $(firstword $(wildcard netfast_config.json) config.example.json)
 
 .DEFAULT_GOAL := debug
 
-TEST_BUILD_DIR := $(BUILD_DIR)/test
-TEST_BINS := \
-	$(TEST_BUILD_DIR)/test_protocol_loopback \
-	$(TEST_BUILD_DIR)/test_lib \
-	$(TEST_BUILD_DIR)/test_netlink_events
-
-TEST_CFLAGS := $(CFLAGS) -Itest
-TEST_LDFLAGS := -L$(BUILD_DIR) -Wl,-rpath,'$$ORIGIN/..'
-
-.PHONY: all build clean bpf install uninstall debug release relwithdebinfo test \
-	static-analysis FORCE
+.PHONY: all build clean bpf install uninstall debug release relwithdebinfo ftp-async FORCE
 
 all: debug
 
@@ -151,26 +145,11 @@ release:
 relwithdebinfo:
 	$(MAKE) PROFILE=relwithdebinfo build
 
-$(TEST_BUILD_DIR)/test_protocol_loopback: test/test1/test_protocol_loopback.c test/test_common.h $(LIB)
+$(BUILD_DIR)/example/ftp_async_server: example/ftp_async.c $(LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -Wl,-rpath,'$$ORIGIN/..' -lnetfast -o $@
 
-$(TEST_BUILD_DIR)/test_lib: test/test2/test_lib.c test/test_common.h $(LIB)
-	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
-
-$(TEST_BUILD_DIR)/test_netlink_events: test/test3/test_netlink_events.c test/test_common.h $(LIB)
-	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_LDFLAGS) -lnetfast -o $@
-
-test: $(TEST_BINS)
-	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_lib
-	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_netlink_events
-	NETFAST_TEST_NO_AUTO_INIT=1 $(TEST_BUILD_DIR)/test_protocol_loopback
-	$(MAKE) static-analysis
-
-static-analysis:
-	sh test/test4/run_static_analysis.sh
+ftp-async: $(BUILD_DIR)/example/ftp_async_server
 
 install: $(LIB) $(BPF_OBJ) $(HEADER) $(CONFIG_FILE)
 	install -d $(DESTDIR)$(LIB_DIR)
@@ -180,14 +159,14 @@ install: $(LIB) $(BPF_OBJ) $(HEADER) $(CONFIG_FILE)
 	install -d $(DESTDIR)$(BPF_INSTALL_DIR)
 	for f in $(BPF_OBJ); do install -m 644 $$f $(DESTDIR)$(BPF_INSTALL_DIR)/ ; done
 	install -d $(DESTDIR)$(CONFIG_DIR)
-	install -m 644 $(CONFIG_FILE) $(DESTDIR)$(CONFIG_DIR)/config.json
+	install -m 644 $(CONFIG_FILE) $(DESTDIR)$(CONFIG_DIR)/netfast_config.json
 	ldconfig $(DESTDIR)$(LIB_DIR) 2>/dev/null || true
 
 uninstall:
 	rm -f $(DESTDIR)$(LIB_DIR)/libnetfast.so
 	rm -f $(DESTDIR)$(INCLUDE_DIR)/netfast.h
 	for f in $(notdir $(BPF_OBJ)); do rm -f $(DESTDIR)$(BPF_INSTALL_DIR)/$$f; done
-	rm -f $(DESTDIR)$(CONFIG_DIR)/config.json
+	rm -f $(DESTDIR)$(CONFIG_DIR)/netfast_config.json
 	ldconfig $(DESTDIR)$(LIB_DIR) 2>/dev/null || true
 
 -include $(OBJS:.o=.d)

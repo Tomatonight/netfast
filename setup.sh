@@ -359,11 +359,6 @@ case "$logfile" in
     *\"*|*\\*) die "logfile must not contain quotes or backslashes" ;;
 esac
 
-rss_key=$(awk -F'"' '/"toeplitz_rss_key"/ { print $4; exit }' \
-    "$SCRIPT_DIR/config.example.json")
-[[ "$rss_key" =~ ^[[:xdigit:]]{80}$ ]] ||
-    die "config.example.json contains an invalid Toeplitz RSS key"
-
 info "installation plan"
 printf '  interface : %s (driver=%s, rx=%s, tx=%s)\n' \
     "$interface" "$(driver_name "$interface")" "$rx_queues" "$tx_queues"
@@ -381,16 +376,16 @@ fi
 confirm "Build and install NetFast with this configuration" ||
     die "installation declined"
 
-config_path="$SCRIPT_DIR/config.json"
+config_path="$SCRIPT_DIR/netfast_config.json"
 if [[ -e "$config_path" ]]; then
     backup_dir="$SCRIPT_DIR/build/setup"
     mkdir -p "$backup_dir"
-    backup_path="$backup_dir/config.json.$(date +%Y%m%d-%H%M%S).bak"
+    backup_path="$backup_dir/netfast_config.json.$(date +%Y%m%d-%H%M%S).bak"
     cp -p -- "$config_path" "$backup_path"
     info "saved previous configuration to $backup_path"
 fi
 
-config_tmp=$(mktemp "$SCRIPT_DIR/.config.json.XXXXXX")
+config_tmp=$(mktemp "$SCRIPT_DIR/.netfast_config.json.XXXXXX")
 trap 'rm -f -- "${config_tmp:-}"' EXIT
 cat >"$config_tmp" <<EOF
 {
@@ -401,9 +396,6 @@ cat >"$config_tmp" <<EOF
       "queues": $queues
     }
   ],
-  "ipv4_forward": true,
-  "ipv6_forward": true,
-  "toeplitz_rss_key": "$rss_key",
   "logfile": "$logfile"
 }
 EOF
@@ -419,10 +411,10 @@ run_root make -C "$SCRIPT_DIR" PROFILE=release \
 [[ -r /usr/local/lib/libnetfast.so ]] || die "installed library is missing"
 [[ -r /usr/local/include/netfast.h ]] || die "installed public header is missing"
 [[ -r /usr/local/lib/bpf/xdp_redirect.bpf.o ]] || die "installed XDP object is missing"
-[[ -r /usr/local/etc/netfast/config.json ]] || die "installed configuration is missing"
+[[ -r /usr/local/etc/netfast/netfast_config.json ]] || die "installed configuration is missing"
 
 info "installation complete"
-printf '  configuration: /usr/local/etc/netfast/config.json\n'
+printf '  configuration: /usr/local/etc/netfast/netfast_config.json\n'
 printf '  log:           %s\n' "$logfile"
 printf '\nNetFast does not attach XDP during setup. The first root process that loads\n'
 printf 'libnetfast.so initializes the stack and attaches XDP to %s.\n' "$interface"

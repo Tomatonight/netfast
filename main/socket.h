@@ -16,10 +16,9 @@
 #include "req.h"
 #include "list.h"
 
-#define REQ_PENDING (-2)
-
 typedef struct bind_slot bind_slot;
 typedef struct bind_table bind_table;
+typedef struct tuple_entry tuple_entry;
 typedef struct icmp_error_info icmp_error_info;
 
 #define SOCKET_USEABLE_RECV_BUFF_SIZE(sock) \
@@ -38,11 +37,6 @@ typedef struct addr_key {
     uint16_t family; /* AF_INET or AF_INET6 */
     uint32_t scope_id;
 } addr_key;
-
-typedef struct addr_tuple {
-    addr_key s_key;
-    addr_key d_key;
-} addr_tuple;
 
 typedef struct protocol_ops {
     int protocol;
@@ -73,7 +67,6 @@ typedef struct Socket {
     int type;
     int protocol;
 
-    /* fcntl(F_GETFL/F_SETFL) emulation: only a subset (e.g. O_NONBLOCK). */
     int file_flags;
 
     struct {
@@ -124,6 +117,7 @@ typedef struct Socket {
     int error;
 
     list_node tuple_node;
+    tuple_entry* tuple_entry;
     bind_slot* bind_reservation;
 
 
@@ -157,15 +151,20 @@ void _poll(req* req);
 int socket_setsockopt(struct Socket* sock, int level, int optname, const void* optval, socklen_t optlen);
 int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval, socklen_t* optlen);
 
-Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport, hash* h, worker** socket_worker);
+Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport, uint32_t daddr,
+                               uint16_t dport, hash* table,
+                               worker** socket_worker);
 Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
                                 const uint8_t daddr[16], uint16_t dport,
-                                hash* h, worker** socket_worker);
-bool install_tuple(Socket* sock, hash* tuple_hash);
-bool uninstall_tuple(Socket* sock, hash* tuple_hash);
+                                hash* table, worker** socket_worker);
+hash* tuple_hash_create(uint32_t size, int family);
+bool install_tuple(Socket* sock, hash* table);
+bool uninstall_tuple(Socket* sock, hash* table);
 bind_table* bind_table_create(void);
 void bind_table_destroy(bind_table* table);
 bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table);
+int socket_bind_local(Socket* sock, const struct sockaddr_in* addr,
+                      socklen_t addrlen, bind_table* bound_table);
 bool unbind_saddr(Socket* sock, bind_table* bound_table);
 bool bind_exist(const addr_key* key, const bind_table* bound_table);
 
@@ -174,8 +173,8 @@ int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id);
 void destroy_socket(Socket* sock);
 
 int socket_auto_bind(Socket* sock, bind_table* bound_table,
-                      const uint8_t* dest_ip, uint16_t dest_port,
-                      uint32_t scope_id);
+                     const addr_key* local_key, const uint8_t* dest_ip,
+                     uint16_t dest_port, uint32_t scope_id);
 
 Socket* socket_select(Socket* sock, uint32_t rss);
 void set_socket_worker(Socket* sock, worker* w);

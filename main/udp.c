@@ -10,7 +10,6 @@
 #include "ether.h"
 #include "fd_entry.h"
 #include "worker.h" /* g_workers/g_worker_num */
-#include "req_epoll.h"
 #include "icmp.h"
 #include "thread.h"
 
@@ -192,28 +191,24 @@ static int udp_read(struct Socket *sock, req* r, void *buf, uint32_t len){
 }
 static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, int flags, sockaddr_in* daddr, socklen_t* addrlen){
     if(!sock->flag.is_bound){
-        r->saved_errno = ENOTCONN;
         //DEBUG_LOG("UDP Socket is not bound");
-        return -1;
+        return -ENOTCONN;
     }
     if(!sock->flag.is_hash){
-        r->saved_errno = ENOTCONN;
         //DEBUG_LOG("UDP Socket is not hashed");
-        return -1;
+        return -ENOTCONN;
     }
     if (sock->recv_queue.element_number == 0 && sock->error) {
         int err = sock->error;
         sock->error = 0;
-        r->saved_errno = err;
-        return -1;
+        return -err;
     }
 
     queue *q=&sock->recv_queue;
     if(q->element_number==0){
         /* MSG_DONTWAIT or O_NONBLOCK �?EAGAIN */
         if ((flags & MSG_DONTWAIT) || (sock->file_flags & O_NONBLOCK)) {
-            r->saved_errno = EAGAIN;
-            return -1;
+            return -EAGAIN;
         }
 
         /* Blocking semantics */
@@ -225,8 +220,7 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
         /* SO_RCVTIMEO semantics */
         if(r->status == REQ_WAITING_READ && r->timeout_task
             && r->timeout_task->timeout <= get_current_time_ms()){
-            r->saved_errno = EAGAIN;
-            return -1;
+            return -EAGAIN;
         }
 
         wait_until(sock, r, REQ_WAITING_READ, get_current_time_ms() + get_time(&sock->recv_timeout));
@@ -257,8 +251,7 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     if (!skb_copy_bits(skb, 0, buf, recv_len)) {
         if (!is_peek)
             PUT_REF(skb);
-        r->saved_errno = EIO;
-        return -1;
+        return -EIO;
     }
 
     if (daddr && addrlen) {
@@ -316,21 +309,15 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
 
     uint32_t max_payload = UINT16_MAX - sizeof(udp_hdr) -
         (is_v6 ? 0u : (uint32_t)sizeof(ipv4_hdr));
-    if (len > max_payload) {
-        r->saved_errno = EMSGSIZE;
-        return -1;
-    }
+    if (len > max_payload)
+        return -EMSGSIZE;
     bind_table* bound_table = udp_bound_table(sock->family);
 
     socklen_t required = is_v6 ? sizeof(*dest6) : sizeof(*dest_addr);
-    if (dest_addr && addrlen < required) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
-    if (dest_addr && dest_addr->sin_family != sock->family) {
-        r->saved_errno = EAFNOSUPPORT;
-        return -1;
-    }
+    if (dest_addr && addrlen < required)
+        return -EINVAL;
+    if (dest_addr && dest_addr->sin_family != sock->family)
+        return -EAFNOSUPPORT;
 
     if (sock->flag.is_connected) {
         bool different = false;
@@ -342,15 +329,11 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
                 : (dest_addr->sin_port != sock->dport ||
                    dest_addr->sin_addr.s_addr != sock->dip);
         }
-        if (different) {
-            r->saved_errno = EISCONN;
-            return -1;
-        }
+        if (different)
+            return -EISCONN;
     } else {
-        if (!dest_addr) {
-            r->saved_errno = EDESTADDRREQ;
-            return -1;
-        }
+        if (!dest_addr)
+            return -EDESTADDRREQ;
         if (is_v6) {
             memcpy(sock->dip6, &dest6->sin6_addr, 16);
             sock->dip6_scope_id = dest6->sin6_scope_id;
@@ -364,8 +347,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     if (sock->error) {
         int err = sock->error;
         sock->error = 0;
-        r->saved_errno = err;
-        ret = -1;
+        ret = -err;
         goto exit;
     }
 
@@ -373,19 +355,17 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
         is_v6 ? sock->dip6_scope_id : 0);
     if (route_ret < 0) {
-        r->saved_errno = EHOSTUNREACH;
-        ret = -1;
+        ret = -EHOSTUNREACH;
         goto exit;
     }
 
     if (!sock->flag.is_bound) {
-        int bind_ret = socket_auto_bind(sock, bound_table,
+        int bind_ret = socket_auto_bind(sock, bound_table, NULL,
             is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
             sock->dport,
             is_v6 ? sock->dip6_scope_id : 0);
         if (bind_ret < 0) {
-            r->saved_errno = EADDRINUSE;
-            ret = -1;
+            ret = -EADDRINUSE;
             goto exit;
         }
     } else if ((is_v6 && memcmp(sock->sip6, zero6, 16) == 0) ||
@@ -394,8 +374,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         const uint8_t* daddr = is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip;
         if (!if_search_best_saddr_by_daddr(sock->route->if_info, sock->family,
                                            daddr, saddr)) {
-            r->saved_errno = EADDRNOTAVAIL;
-            ret = -1;
+            ret = -EADDRNOTAVAIL;
             goto exit;
         }
 
@@ -407,8 +386,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         else
             memcpy(&key.addr, saddr, 4);
         if (bind_exist(&key, bound_table)) {
-            r->saved_errno = EADDRINUSE;
-            ret = -1;
+            ret = -EADDRINUSE;
             goto exit;
         }
         if (is_v6)
@@ -431,9 +409,8 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     }
 
     if (!is_v6 && route_is_broadcast(sock->route) && !sock->options.broadcast) {
-        r->saved_errno = EACCES;
         DEBUG_LOG("Broadcast address requires SO_BROADCAST option");
-        ret = -1;
+        ret = -EACCES;
         goto exit;
     }
 
@@ -442,17 +419,15 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     uint32_t hdr_len = sizeof(udp_hdr) + (is_v6 ? MAX_IP6_HDR_WITH_EXT_LEN : MAX_IP_HDR_WITH_OPT_LEN) + udp_l2_len;
     skbuff* skb = skb_alloc(hdr_len + len);
     if (!skb) {
-        r->saved_errno = ENOMEM;
         ERR_LOG("skb alloc failed");
-        ret = -1;
+        ret = -ENOMEM;
         goto exit;
     }
     skb_reserve(skb, hdr_len);
     udp_hdr* udp = (udp_hdr*)skb_data_push(skb, sizeof(*udp));
     if (!udp) {
-        r->saved_errno = ENOMEM;
         PUT_REF(skb);
-        ret = -1;
+        ret = -ENOMEM;
         goto exit;
     }
     skb->udp_hdr = udp;
@@ -467,10 +442,9 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     pre_size = ip_headers + l2_len;
 
     if (!skb_data_append(skb, buf, len, pre_size, seg_len)) {
-        r->saved_errno = ENOMEM;
         ERR_LOG("skb_data_append failed len=%u", (uint32_t)len);
         PUT_REF(skb);
-        ret = -1;
+        ret = -ENOMEM;
         goto exit;
     }
 
@@ -485,10 +459,9 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         goto exit;
     }
 
-    r->saved_errno = send_ret == -EAGAIN ? ENOBUFS
-        : send_ret == -ENETDOWN ? ENETDOWN : EHOSTUNREACH;
     PUT_REF(skb);
-    ret = -1;
+    ret = send_ret == -EAGAIN ? -ENOBUFS
+        : send_ret == -ENETDOWN ? -ENETDOWN : -EHOSTUNREACH;
 
 exit:
     if (was_bound)
@@ -514,40 +487,30 @@ static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *ad
     uint16_t old_dport = sock->dport;
     memcpy(old_dip6, sock->dip6, sizeof(old_dip6));
 
-    if (addrlen < required) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
-    if (addr->sin_family != sock->family) {
-        r->saved_errno = EAFNOSUPPORT;
-        return -1;
-    }
+    if (addrlen < required)
+        return -EINVAL;
+    if (addr->sin_family != sock->family)
+        return -EAFNOSUPPORT;
 
     int route_ret = set_socket_route(sock,
         is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
         is_v6 ? addr6->sin6_scope_id : 0);
-    if (route_ret < 0) {
-        r->saved_errno = EHOSTUNREACH;
-        return -1;
-    }
+    if (route_ret < 0)
+        return -EHOSTUNREACH;
 
     if (!sock->flag.is_bound) {
-        int bind_ret = socket_auto_bind(sock, udp_bound_table(sock->family),
+        int bind_ret = socket_auto_bind(sock, udp_bound_table(sock->family), NULL,
             is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
             is_v6 ? addr6->sin6_port : addr->sin_port,
             is_v6 ? addr6->sin6_scope_id : 0);
-        if (bind_ret < 0) {
-            r->saved_errno = EADDRINUSE;
-            return -1;
-        }
+        if (bind_ret < 0)
+            return -EADDRINUSE;
     }
 
     /* Reconnecting UDP is supported, but the old tuple must be removed
      * before overwriting the peer fields used to construct its hash key. */
-    if (was_hashed && !uninstall_tuple(sock, udp_tuple_hash(sock->family))) {
-        r->saved_errno = EIO;
-        return -1;
-    }
+    if (was_hashed && !uninstall_tuple(sock, udp_tuple_hash(sock->family)))
+        return -EIO;
 
     if (is_v6) {
         memcpy(sock->dip6, &addr6->sin6_addr, 16);
@@ -580,8 +543,7 @@ static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *ad
         sock->flag.is_connected = was_connected;
         if (was_hashed && !install_tuple(sock, udp_tuple_hash(sock->family)))
             ERR_LOG("Failed to restore old UDP tuple after reconnect failure");
-        r->saved_errno = EADDRINUSE;
-        return -1;
+        return -EADDRINUSE;
     }
     sock->flag.is_connected = 1;
     return 0;
@@ -589,67 +551,16 @@ static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *ad
 
 static int udp_bind(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
 {
+    (void)r;
     bind_table* bound_table = udp_bound_table(sock->family);
-    hash* tuple_hash = udp_tuple_hash(sock->family);
+    int ret = socket_bind_local(sock, addr, addrlen, bound_table);
+    if (ret < 0)
+        return ret;
 
-    bool is_v6 = sock->family == AF_INET6;
-    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
-    socklen_t required = is_v6 ? sizeof(*addr6) : sizeof(*addr);
-    if (addrlen < required) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
-    if (addr->sin_family != sock->family) {
-        r->saved_errno = EAFNOSUPPORT;
-        return -1;
-    }
-    if (sock->flag.is_bound) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
-    uint16_t port = is_v6 ? addr6->sin6_port : addr->sin_port;
-    if (!port) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
-    static const uint8_t zero6[16];
-    const uint8_t* ip = is_v6 ? (const uint8_t*)&addr6->sin6_addr
-                              : (const uint8_t*)&addr->sin_addr.s_addr;
-    bool any = is_v6 ? memcmp(ip, zero6, 16) == 0
-                     : addr->sin_addr.s_addr == INADDR_ANY;
-    if (is_v6 && IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr) && !addr6->sin6_scope_id) {
-        r->saved_errno = EINVAL;
-        DEBUG_LOG("IPv6 link-local bind requires a scope ID (e.g. fe80::1%%eth0)");
-        return -1;
-    }
-    if (!any && !search_addr_exist(sock->family, ip,
-            is_v6 ? addr6->sin6_scope_id : 0)) {
-        r->saved_errno = EADDRNOTAVAIL;
-        DEBUG_LOG("UDP bind address is not available for family=%d", sock->family);
-        return -1;
-    }
-
-
-    addr_key key = {
-        .port = port,
-        .family = is_v6 ? AF_INET6 : AF_INET,
-        .scope_id = is_v6 ? addr6->sin6_scope_id : 0
-    };
-    if (is_v6)
-        memcpy(key.addr6, ip, 16);
-    else
-        memcpy(&key.addr, ip, 4);
-    if (!bind_saddr(sock, &key, bound_table)) {
-        r->saved_errno = EADDRINUSE;
-        return -1;
-    }
-    if (is_v6)
-        sock->sip6_scope_id = addr6->sin6_scope_id;
-    if (!install_tuple(sock, tuple_hash)) {
-        r->saved_errno = EADDRINUSE;
+    if (!install_tuple(sock, udp_tuple_hash(sock->family))) {
         WARN_LOG("Failed to install UDP Socket tuple");
         unbind_saddr(sock, bound_table);
-        return -1;
+        return -EADDRINUSE;
     }
     return 0;
 }
@@ -683,10 +594,9 @@ static int udp_getsockname(struct Socket *sock, req* r, struct sockaddr_in *addr
 
 static int udp_getpeername(struct Socket *sock, req* r, struct sockaddr_in *addr, socklen_t *addrlen)
 {
-    if (!sock->flag.is_connected) {
-        r->saved_errno = ENOTCONN;
-        return -1;
-    }
+    (void)r;
+    if (!sock->flag.is_connected)
+        return -ENOTCONN;
     struct sockaddr_storage out;
     socklen_t required;
     memset(&out, 0, sizeof(out));
@@ -713,31 +623,21 @@ static int udp_getpeername(struct Socket *sock, req* r, struct sockaddr_in *addr
 
 static int udp_setsockopt(struct Socket* sock, req* r, int level, int optname, const void* optval, socklen_t optlen)
 {
-    if (level == SOL_SOCKET) {
-        int ret = socket_setsockopt(sock, level, optname, optval, optlen);
-        if (ret < 0 && r->saved_errno == 0)
-            r->saved_errno = ENOPROTOOPT;
-        return ret;
-    }
-    r->saved_errno = ENOPROTOOPT;
-    return -1;
+    (void)r;
+    if (level == SOL_SOCKET)
+        return socket_setsockopt(sock, level, optname, optval, optlen);
+    return -ENOPROTOOPT;
 }
 
 static int udp_getsockopt(struct Socket* sock, req* r, int level, int optname, void* optval, socklen_t* optlen)
 {
-    if (!optval || !optlen || *optlen == 0) {
-        r->saved_errno = EINVAL;
-        return -1;
-    }
+    (void)r;
+    if (!optval || !optlen || *optlen == 0)
+        return -EINVAL;
 
-    if (level == SOL_SOCKET) {
-        int ret = socket_getsockopt(sock, level, optname, optval, optlen);
-        if (ret < 0 && r->saved_errno == 0)
-            r->saved_errno = ENOPROTOOPT;
-        return ret;
-    }
-    r->saved_errno = ENOPROTOOPT;
-    return -1;
+    if (level == SOL_SOCKET)
+        return socket_getsockopt(sock, level, optname, optval, optlen);
+    return -ENOPROTOOPT;
 }
 
 static uint32_t udp_poll(struct Socket* sock)

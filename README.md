@@ -73,10 +73,9 @@ int submit_writes(int socket_fd, const void *buffers[BATCH],
             continue;
 
         for (int i = 0; i < count; ++i) {
-            int request_errno = 0;
-            int result = net_async_req_result(completed[i], &request_errno);
+            int result = net_async_req_result(completed[i]);
             if (result < 0)
-                errno = request_errno;
+                errno = -result;
             net_async_req_destroy(completed[i]);
         }
         remaining -= (uint32_t)count;
@@ -96,6 +95,10 @@ Async ownership rules:
 5. Inspect each result, then release it with `net_async_req_destroy()`.
 6. Buffers and address objects referenced by a request must stay valid until
    that request completes.
+
+Each asynchronous completion stores a non-negative result on success or
+`-errno` on failure. Synchronous `net_*` calls keep POSIX semantics: they
+return `-1` and set `errno`.
 
 `net_async_wait()` may return a partial batch when its overall timeout expires.
 Concurrent threads may wait on the same CQ with different `min_complete`
@@ -143,7 +146,7 @@ For a first installation, use the guided setup script:
 
 It checks or installs build dependencies, avoids active/primary default-route
 and SSH interfaces, detects the selected interface's current queue count, writes a
-local `config.json`, builds the release profile, and installs NetFast under
+local `netfast_config.json`, builds the release profile, and installs NetFast under
 `/usr/local`. It does not attach XDP during installation; XDP is attached when a
 root process first loads `libnetfast.so`.
 
@@ -185,21 +188,21 @@ under `/usr/local` by default.
 ## Configuration
 
 The versioned [`config.example.json`](./config.example.json) is the installation
-template; a local `config.json` is ignored by Git so that machine-specific
-settings stay private. A default build loads
-`/usr/local/etc/netfast/config.json` when `libnetfast.so` is loaded and does not
-search the application's current working directory.
+template; a local `netfast_config.json` is ignored by Git so that machine-specific
+settings stay private. When `libnetfast.so` is loaded, a default build first
+looks for `netfast_config.json` in the process's current working directory and
+falls back to `/usr/local/etc/netfast/netfast_config.json` when it is absent.
 
 Create a local configuration and install it with the library:
 
 ```bash
-cp config.example.json config.json
-editor config.json
+cp config.example.json netfast_config.json
+editor netfast_config.json
 sudo make PROFILE=release install
 ```
 
-The Makefile uses the local `config.json` when it exists, otherwise it installs
-`config.example.json`. Use `CONFIG_FILE=/path/to/config.json` to select another
+The Makefile uses the local `netfast_config.json` when it exists, otherwise it installs
+`config.example.json`. Use `CONFIG_FILE=/path/to/netfast_config.json` to select another
 source file explicitly.
 
 Example configuration:
@@ -210,9 +213,6 @@ Example configuration:
   "open_if": [
     { "name": "ens192", "queues": 2 }
   ],
-  "ipv4_forward": true,
-  "ipv6_forward": true,
-  "toeplitz_rss_key": "6d5a56da255b0ec24167253d43a38fb0d0ca2bcbae7b30b477cb2da38030f20c6a42b73bbeac01fa",
   "logfile": "/tmp/user_stack.log"
 }
 ```
@@ -225,9 +225,6 @@ Example configuration:
 | `open_if` | Yes | Non-empty array of interfaces owned by NetFast. Interface names must be unique. Interfaces omitted from this list do not get AF_XDP sockets. |
 | `open_if[].name` | Yes | Linux interface name, for example `ens192`. Check it with `ip -br link`. Do not select the interface used for SSH or desktop management. |
 | `open_if[].queues` | No | Number of AF_XDP RX/TX queues, from 1 to 32. Missing or `0` means `thread_num`. The NIC must expose all requested queue IDs. |
-| `ipv4_forward` | No | Enables forwarding of non-local IPv4 packets. Defaults to `true`. |
-| `ipv6_forward` | No | Enables forwarding of non-local IPv6 packets. Defaults to `true`. |
-| `toeplitz_rss_key` | No | 40-byte Toeplitz key encoded as 80 hexadecimal characters. If omitted, the compiled-in key is used. The same key drives hardware RSS setup and software worker selection. |
 | `logfile` | Yes | Non-empty log path shorter than 256 bytes. NetFast creates the file if its parent directory exists and permissions allow it. |
 
 `queues` describes hardware queue IDs, not a per-worker queue count. Queue `q`
@@ -241,9 +238,10 @@ ethtool -x ens192
 ```
 
 For a one-queue NIC, set `queues` to `1`; NetFast skips RSS programming. With
-multiple queues it attempts to install a Toeplitz indirection table. An RSS
-ioctl failure is logged and initialization continues, but traffic may not be
-distributed evenly.
+multiple queues it attempts to install a Toeplitz indirection table using the
+compiled-in default key. An RSS ioctl failure is logged and initialization
+continues, but traffic may not be distributed evenly. Forwarding non-local
+IPv4 and IPv6 packets is disabled.
 
 The configuration is parsed once by the shared-library constructor. Invalid
 JSON, a missing required field, an out-of-range value, an unavailable queue, or
@@ -263,7 +261,7 @@ installed configuration with the selected `CONFIG_FILE`.
 - AF_XDP zero-copy availability depends on the NIC driver. Unsupported devices
   fall back to copy mode unless zero-copy is forced.
 
-## Synchronous and Epoll APIs
+## Synchronous API and optional Epoll API
 
 The public header also exposes familiar calls such as:
 
@@ -275,25 +273,15 @@ net_read(fd, response, response_capacity);
 net_close(fd);
 ```
 
-For readiness-driven programs, use `net_epoll_create()`, `net_epoll_ctl()`, and
-`net_epoll_wait()`.
-
-## Testing and Analysis
-
-```bash
-make test
-make static-analysis
-```
-
-The test target covers the base library, Netlink behavior, TCP/UDP loopback,
-epoll-related protocol paths, and asynchronous CQ concurrency. Static-analysis
-reports are stored under `build/test/static-analysis/`.
+The custom epoll implementation is excluded by default. Build with
+`make TEST_EPOLL=1 …` to enable `net_epoll_create()`, `net_epoll_ctl()`, and
+`net_epoll_wait()`; without it, those calls fail with `ENOTSUP`.
 
 ## Repository Layout
 
 ```text
 lib/       AF_XDP, queues, RSS, frame cache, and base utilities
-main/      TCP/IP stack, sockets, workers, epoll, and async requests
+main/      TCP/IP stack, sockets, workers, optional epoll, and async requests
 docs/      protocol design notes
 example/   example programs and test resources
 test/      unit, integration, stress, and analysis tooling

@@ -427,6 +427,7 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
     }
     r->type = type;
     r->async.entry = entry;
+    r->async_fd = fd;
 
     bool valid = true;
     switch (type) {
@@ -588,26 +589,17 @@ void net_async_req_destroy(req* r)
     async_req_free(r);
 }
 
-int net_async_req_result(const req* r, int* saved_errno)
+int net_async_req_result(const req* r)
 {
-    if (!r) {
-        errno = EINVAL;
-        return -1;
-    }
+    if (!r)
+        return -EINVAL;
 
     req* mutable_r = (req*)r;
     spin_lock(&mutable_r->done_mtx);
-    bool valid = mutable_r->done && !mutable_r->async.cq;
+    bool completed = mutable_r->done && !mutable_r->async.cq;
     int ret = mutable_r->ret;
-    int request_errno = mutable_r->saved_errno;
     spin_unlock(&mutable_r->done_mtx);
-    if (!valid) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (saved_errno)
-        *saved_errno = request_errno;
-    return ret;
+    return completed ? ret : -EINVAL;
 }
 
 /* ---- public fd-based wrappers ---- */

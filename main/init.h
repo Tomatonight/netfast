@@ -7,8 +7,10 @@
 #include "base.h"
 
 #ifndef NETFAST_CONFIG_FILE
-#define NETFAST_CONFIG_FILE "/usr/local/etc/netfast/config.json"
+#define NETFAST_CONFIG_FILE "/usr/local/etc/netfast/netfast_config.json"
 #endif
+
+#define NETFAST_LOCAL_CONFIG_FILE "netfast_config.json"
 
 typedef struct if_cfg {
     char name[IFNAMSIZ];

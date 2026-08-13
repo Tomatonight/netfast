@@ -66,10 +66,9 @@ int submit_writes(int socket_fd, const void *buffers[BATCH],
             continue;
 
         for (int i = 0; i < count; ++i) {
-            int request_errno = 0;
-            int result = net_async_req_result(completed[i], &request_errno);
+            int result = net_async_req_result(completed[i]);
             if (result < 0)
-                errno = request_errno;
+                errno = -result;
             net_async_req_destroy(completed[i]);
         }
         remaining -= (uint32_t)count;
@@ -87,6 +86,9 @@ int submit_writes(int socket_fd, const void *buffers[BATCH],
 4. `net_async_wait()` 把已完成请求的所有权交回调用者。
 5. 读取结果后，调用 `net_async_req_destroy()` 释放请求。
 6. 请求引用的数据缓冲和地址对象必须保持有效，直到请求完成。
+
+异步完成项成功时保存非负结果，失败时保存 `-errno`。同步 `net_*` API
+仍遵循 POSIX 语义：返回 `-1`，并设置 `errno`。
 
 `net_async_wait()` 在整体超时到期时可以返回不足 `min_complete` 的部分批次。
 多个线程可以在同一 CQ 上使用不同的 `min_complete`。
@@ -131,7 +133,7 @@ int submit_writes(int socket_fd, const void *buffers[BATCH],
 ```
 
 脚本会检查或安装构建依赖，避开当前/主默认路由和 SSH 网卡，读取所选
-网卡的当前队列数，生成本机 `config.json`，构建 Release 版并安装到
+网卡的当前队列数，生成本机 `netfast_config.json`，构建 Release 版并安装到
 `/usr/local`。安装过程不会挂载 XDP；第一个以 root 身份加载
 `libnetfast.so` 的进程才会挂载。
 
@@ -169,20 +171,21 @@ sudo make PROFILE=release install
 ## 配置
 
 版本库跟踪的 [`config.example.json`](./config.example.json) 是安装模板；本机
-`config.json` 被 Git 忽略，避免上传网卡名、日志路径等机器专用设置。
-默认构建的 `libnetfast.so` 在被加载时只读取
-`/usr/local/etc/netfast/config.json`，不会搜索应用的当前工作目录。
+`netfast_config.json` 被 Git 忽略，避免上传网卡名、日志路径等机器专用设置。
+默认构建的 `libnetfast.so` 在被加载时优先读取进程当前工作目录下的
+`netfast_config.json`；文件不存在时再读取
+`/usr/local/etc/netfast/netfast_config.json`。
 
 复制模板、按实际环境修改，然后随动态库一起安装：
 
 ```bash
-cp config.example.json config.json
-editor config.json
+cp config.example.json netfast_config.json
+editor netfast_config.json
 sudo make PROFILE=release install
 ```
 
-Makefile 在本地 `config.json` 存在时优先安装它，否则安装
-`config.example.json`。也可用 `CONFIG_FILE=/path/to/config.json` 显式选择
+Makefile 在本地 `netfast_config.json` 存在时优先安装它，否则安装
+`config.example.json`。也可用 `CONFIG_FILE=/path/to/netfast_config.json` 显式选择
 其他源配置。
 
 配置示例：
@@ -193,9 +196,6 @@ Makefile 在本地 `config.json` 存在时优先安装它，否则安装
   "open_if": [
     { "name": "ens192", "queues": 2 }
   ],
-  "ipv4_forward": true,
-  "ipv6_forward": true,
-  "toeplitz_rss_key": "6d5a56da255b0ec24167253d43a38fb0d0ca2bcbae7b30b477cb2da38030f20c6a42b73bbeac01fa",
   "logfile": "/tmp/user_stack.log"
 }
 ```
@@ -208,9 +208,6 @@ Makefile 在本地 `config.json` 存在时优先安装它，否则安装
 | `open_if` | 是 | NetFast 接管的网卡数组，不能为空，网卡名不能重复。未列入的网卡不会创建 AF_XDP socket。 |
 | `open_if[].name` | 是 | Linux 网卡名，例如 `ens192`，可用 `ip -br link` 查看。不要选择承载 SSH 或桌面管理连接的网卡。 |
 | `open_if[].queues` | 否 | AF_XDP RX/TX 队列数，范围为 1～32。省略或填 `0` 时等于 `thread_num`；网卡必须实际提供这些队列 ID。 |
-| `ipv4_forward` | 否 | 是否转发非本机 IPv4 报文，默认为 `true`。 |
-| `ipv6_forward` | 否 | 是否转发非本机 IPv6 报文，默认为 `true`。 |
-| `toeplitz_rss_key` | 否 | 40 字节 Toeplitz key，写成 80 个十六进制字符。省略时使用编译内置值；硬件 RSS 和软件 worker 选择使用同一个 key。 |
 | `logfile` | 是 | 非空日志路径，长度小于 256 字节。父目录存在且权限允许时，NetFast 会创建该文件。 |
 
 `queues` 表示硬件队列 ID 数量，不是每个 worker 的队列数。队列 `q` 分配给
@@ -223,8 +220,9 @@ ethtool -x ens192
 ```
 
 单队列网卡应设置 `"queues": 1`，NetFast 会跳过 RSS 配置。多队列时
-NetFast 会尝试写入 Toeplitz RSS 间接表；RSS ioctl 失败会记录日志并
-继续初始化，但流量可能无法均匀分配。
+NetFast 会使用编译内置的默认 key 写入 Toeplitz RSS 间接表；RSS ioctl
+失败会记录日志并继续初始化，但流量可能无法均匀分配。非本机 IPv4 和
+IPv6 报文转发默认关闭。
 
 配置在动态库构造阶段只解析一次。JSON 格式错误、缺少必填字段、数值
 越界、队列不存在或日志路径不可写都会导致初始化失败。修改安装配置
@@ -239,7 +237,7 @@ NetFast 会尝试写入 Toeplitz RSS 间接表；RSS ioctl 失败会记录日志
 - XDP 重定向后的报文不会出现在内核协议栈的普通 `tcpdump` 抓包中。
 - AF_XDP zero-copy 取决于网卡驱动；不支持时会回退到 copy mode，除非强制要求 zero-copy。
 
-## 同步与 Epoll 接口
+## 同步接口与可选 Epoll 接口
 
 公共头文件同时提供熟悉的 socket 风格调用：
 
@@ -251,23 +249,15 @@ net_read(fd, response, response_capacity);
 net_close(fd);
 ```
 
-就绪驱动程序可以使用 `net_epoll_create()`、`net_epoll_ctl()` 和 `net_epoll_wait()`。
-
-## 测试与静态分析
-
-```bash
-make test
-make static-analysis
-```
-
-测试覆盖基础库、Netlink、TCP/UDP loopback、epoll 相关协议路径和异步 CQ 并发。
-静态分析报告保存在 `build/test/static-analysis/`。
+自定义 epoll 实现默认不参与编译。使用 `make TEST_EPOLL=1 …` 后，才可
+调用 `net_epoll_create()`、`net_epoll_ctl()` 和 `net_epoll_wait()`；未启用时
+这些调用会返回 `ENOTSUP`。
 
 ## 目录结构
 
 ```text
 lib/       AF_XDP、队列、RSS、frame cache 和基础组件
-main/      TCP/IP 协议栈、socket、worker、epoll 和异步请求
+main/      TCP/IP 协议栈、socket、worker、可选 epoll 和异步请求
 docs/      协议设计文档
 example/   示例程序和测试资源
 test/      单元、集成、压力和静态分析工具

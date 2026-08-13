@@ -169,20 +169,9 @@ typedef struct tcp_pcb{
     uint32_t snd_last_time; // 上次发送数据的时间（ms�?
 
     uint32_t ts_recent; // 最近一次收到对端时间戳选项中的 tsval（时间戳值）
-    uint32_t ts_recent_age_ms; 
+    uint32_t ts_recent_age_ms;
     uint32_t ts_last_tsecr; // 最近一次收到对端时间戳选项中的 tsecr（时间戳回显应答�?
     struct {
-        union {
-            struct {
-                uint32_t ack_trigger:1;
-                uint32_t keepalive_trigger:1;
-                uint32_t persist_trigger:1;
-                uint32_t retransmit_trigger:1;
-                uint32_t nagle_trigger:1;
-            };
-            uint8_t triggers;  /* one-shot clear all trigger bits */
-        };
-
         uint32_t recv_rst:1;
         uint32_t recv_fin:1;
         uint32_t send_rst:1;
@@ -190,6 +179,8 @@ typedef struct tcp_pcb{
 
         uint32_t peer_ts_ok:1; // 是否支持时间戳选项
         uint32_t peer_mss_ok:1; // 是否支持 MSS 选项
+        uint32_t wnd_scale_sent:1; // 本端已在 SYN/SYN-ACK 中发送 Window Scale
+        uint32_t peer_wnd_scale_ok:1; // 对端在 SYN/SYN-ACK 中提供 Window Scale
     } tcp_flag;
     struct {
         uint32_t nodelay : 1;      /* TCP_NODELAY */
@@ -205,8 +196,44 @@ typedef struct tcp_pcb{
 
 } tcp_pcb;
 
+static inline bool tcp_window_scale_negotiated(const tcp_pcb* pcb)
+{
+    return pcb->tcp_flag.wnd_scale_sent &&
+           pcb->tcp_flag.peer_wnd_scale_ok;
+}
+
+/* RFC 7323: an active opener may offer Window Scale in its SYN, while a
+ * passive opener may include it in SYN-ACK only when the incoming SYN did. */
+static inline bool tcp_should_send_window_scale(const tcp_pcb* pcb,
+                                                uint8_t flags)
+{
+    if (!(flags & TCP_FLAG_SYN))
+        return false;
+    if (!(flags & TCP_FLAG_ACK))
+        return true;
+    return pcb->tcp_flag.peer_wnd_scale_ok;
+}
+
+/* The Window field in SYN/SYN-ACK is never scaled.  Scaling starts with
+ * packets sent after the handshake, and only when both sides exchanged the
+ * option. */
+static inline uint16_t tcp_encode_window(const tcp_pcb* pcb, uint8_t flags)
+{
+    uint32_t window = pcb->rcv_wnd;
+    if (!(flags & TCP_FLAG_SYN) && tcp_window_scale_negotiated(pcb))
+        window >>= pcb->rcv_wnd_scale;
+    return (uint16_t)(window > 65535u ? 65535u : window);
+}
+
+static inline uint32_t tcp_decode_window(const tcp_pcb* pcb, uint16_t window,
+                                         uint8_t flags)
+{
+    if ((flags & TCP_FLAG_SYN) || !tcp_window_scale_negotiated(pcb))
+        return window;
+    return (uint32_t)window << pcb->snd_wnd_scale;
+}
+
 int tcp_recv(struct skbuff* skb);
-int tcp_output(tcp_pcb*);
 void tcp_snd_cwnd_change(tcp_pcb* pcb, uint32_t new_cwnd);
 
 void tcp_congestion_init(tcp_pcb* pcb);

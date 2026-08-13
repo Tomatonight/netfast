@@ -9,7 +9,7 @@
 #define TOEPLITZ_RSS_KEY_LEN 40
 
 
-extern uint8_t TOEPLITZ_RSS_DEFAULT_KEY[TOEPLITZ_RSS_KEY_LEN];
+extern const uint8_t TOEPLITZ_RSS_DEFAULT_KEY[TOEPLITZ_RSS_KEY_LEN];
 
 const uint8_t* toeplitz_rss_get_key(uint32_t* out_len);
 

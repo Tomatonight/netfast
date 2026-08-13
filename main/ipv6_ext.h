@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "ipv6.h"
+#include "hash.h"
 #include "list.h"
 
 typedef struct skbuff skbuff;
@@ -45,10 +46,12 @@ typedef struct ipq6_key {
 /* ── 重组队列 ──────────────────────────────────────────── */
 typedef struct ipq6 {
     ipq6_key key;
+    hash_node hash_node;
     uint32_t total_len;        /* payload total length (excluding all headers) */
     uint32_t received_len;     /* received payload bytes */
     uint32_t last_update_time;
     uint16_t unfrag_len;
+    uint16_t previous_nh_offset;
     uint8_t next_header;
     struct {
         uint32_t last_recved  : 1;

@@ -13,6 +13,7 @@
 #include "base.h"
 #include "loopback.h"
 #include "netfast.h"
+#include "ipv6_ext.h"
 #include "route_arp_ndp.h"
 #include "skbuff.h"
 #include "socket.h"
@@ -169,6 +170,131 @@ static int test_skb_multisegment_clone_copy(void)
     return 0;
 }
 
+static skbuff *make_ipv6_packet(uint32_t payload_len, uint8_t next_header,
+                                uint32_t segment_len)
+{
+    uint8_t *packet = calloc(1, IPV6_HDR_LEN + payload_len);
+    if (!packet)
+        return NULL;
+
+    ipv6_hdr *ip6 = (ipv6_hdr *)packet;
+    ip6->vtf = ipv6_make_vtf(0, 0);
+    ip6->payload_len = htons((uint16_t)payload_len);
+    ip6->next_hdr = next_header;
+    ip6->hop_limit = 64;
+    ip6->saddr[15] = 1;
+    ip6->daddr[15] = 2;
+    for (uint32_t i = 0; i < payload_len; ++i)
+        packet[IPV6_HDR_LEN + i] = (uint8_t)(i * 17u + 3u);
+
+    skbuff *skb = skb_alloc(128);
+    if (!skb || !skb_data_append(skb, packet, IPV6_HDR_LEN + payload_len,
+                                 0, segment_len)) {
+        PUT_REF(skb);
+        skb = NULL;
+    }
+    free(packet);
+    if (skb)
+        skb->ipv6_hdr = (ipv6_hdr *)skb_start(skb);
+    return skb;
+}
+
+static int test_ipv6_extension_fragmentation(void)
+{
+    worker allocation_worker = {0};
+    allocation_worker.master = create_thread();
+    TEST_ASSERT(allocation_worker.master);
+    set_current_worker(&allocation_worker);
+    allocation_worker.stack.ipq6_hash = hash_create(32,
+        HASH_KEY_OFFSET(ipq6, hash_node, key), sizeof(ipq6_key));
+    TEST_ASSERT(allocation_worker.stack.ipq6_hash);
+
+    skbuff *plain = make_ipv6_packet(32, IPPROTO_UDP, 32);
+    TEST_ASSERT(plain && !ipv6_has_frag(plain));
+    PUT_REF(plain);
+
+    skbuff *skb = make_ipv6_packet(4000, IPPROTO_UDP, 512);
+    TEST_ASSERT(skb);
+    if_info iface = {.mtu = 1280};
+    route_info *route = calloc(1, sizeof(*route));
+    TEST_ASSERT(route);
+    INIT_REF(route, NULL);
+    route->if_info = &iface;
+    skb->route = route;
+    TEST_ASSERT(ipv6_frag(skb));
+    TEST_ASSERT(ipv6_has_frag(skb));
+
+    skbuff *fragments[8] = {0};
+    uint32_t count = 0;
+    skbuff *fragment;
+    list_node *next;
+    FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, fragment, next,
+                              skbuff, frag_list) {
+        TEST_ASSERT(count < 8);
+        remove_list_node(&fragment->frag_list);
+        fragments[count++] = fragment;
+    }
+    TEST_ASSERT(count >= 2);
+
+    skbuff *reassembled = NULL;
+    for (uint32_t i = count; i > 0; --i) {
+        TEST_ASSERT(ipv6_has_frag(fragments[i - 1]));
+        skbuff *result = ipv6_defrag(fragments[i - 1]);
+        if (result)
+            reassembled = result;
+        PUT_REF(fragments[i - 1]);
+    }
+    skbuff *result = ipv6_defrag(skb);
+    if (result)
+        reassembled = result;
+    PUT_REF(skb);
+
+    TEST_ASSERT(reassembled);
+    TEST_ASSERT(reassembled->flag.is_defrag);
+    TEST_ASSERT(!ipv6_has_frag(reassembled));
+    TEST_ASSERT(reassembled->protocol == IPPROTO_UDP);
+    TEST_ASSERT(skb_data_len(reassembled) == IPV6_HDR_LEN + 4000);
+    uint8_t data[64];
+    TEST_ASSERT(skb_copy_bits(reassembled, IPV6_HDR_LEN, data, sizeof(data)));
+    for (uint32_t i = 0; i < sizeof(data); ++i)
+        TEST_ASSERT(data[i] == (uint8_t)(i * 17u + 3u));
+    PUT_REF(reassembled);
+
+    skbuff *pending = make_ipv6_packet(2000, IPPROTO_UDP, 512);
+    TEST_ASSERT(pending);
+    route_info *pending_route = calloc(1, sizeof(*pending_route));
+    TEST_ASSERT(pending_route);
+    INIT_REF(pending_route, NULL);
+    pending_route->if_info = &iface;
+    pending->route = pending_route;
+    TEST_ASSERT(ipv6_frag(pending));
+    skbuff *queued = (skbuff *)((uint8_t *)pending->frag_list.next -
+                                offsetof(skbuff, frag_list));
+    remove_list_node(&queued->frag_list);
+    TEST_ASSERT(ipv6_defrag(queued) == NULL);
+    PUT_REF(queued);
+    while (pending->frag_list.next) {
+        skbuff *rest = (skbuff *)((uint8_t *)pending->frag_list.next -
+                                  offsetof(skbuff, frag_list));
+        remove_list_node(&rest->frag_list);
+        PUT_REF(rest);
+    }
+    PUT_REF(pending);
+    task timer = {
+        .task_type = TASK_TYPE_TIMER,
+        .parent_thread = allocation_worker.master,
+    };
+    current_time_ms += IPQ6_TIMEOUT + 1;
+    ipq6_timer(&timer);
+    TEST_ASSERT(hash_is_empty(allocation_worker.stack.ipq6_hash));
+    unregister_task(&timer);
+
+    hash_destroy(allocation_worker.stack.ipq6_hash);
+    set_current_worker(NULL);
+    destroy_thread(allocation_worker.master);
+    return 0;
+}
+
 static int test_tcp_unit_defaults_and_boundaries(void)
 {
     Socket *socket = create_socket(AF_INET, SOCK_STREAM, 0);
@@ -183,6 +309,26 @@ static int test_tcp_unit_defaults_and_boundaries(void)
     TEST_ASSERT(pcb->connect_timeout == TCP_CONNECT_TIMEOUT_MS_DEFAULT);
     TEST_ASSERT(SEQ_LT(UINT32_MAX, 0) && SEQ_GT(0, UINT32_MAX));
     TEST_ASSERT(SEQ_LEQ(7, 7) && SEQ_GEQ(7, 7));
+
+    pcb->rcv_wnd = 256u * 1024u;
+    pcb->rcv_wnd_scale = TCP_RCV_WND_SCALE_DEFAULT;
+    pcb->snd_wnd_scale = TCP_RCV_WND_SCALE_DEFAULT;
+    TEST_ASSERT(tcp_should_send_window_scale(pcb, TCP_FLAG_SYN));
+    TEST_ASSERT(!tcp_should_send_window_scale(
+        pcb, TCP_FLAG_SYN | TCP_FLAG_ACK));
+    pcb->tcp_flag.wnd_scale_sent = 1;
+    TEST_ASSERT(!tcp_window_scale_negotiated(pcb));
+    TEST_ASSERT(tcp_encode_window(pcb, TCP_FLAG_ACK) == 65535u);
+    TEST_ASSERT(tcp_decode_window(pcb, 4096u, TCP_FLAG_ACK) == 4096u);
+
+    pcb->tcp_flag.peer_wnd_scale_ok = 1;
+    TEST_ASSERT(tcp_should_send_window_scale(
+        pcb, TCP_FLAG_SYN | TCP_FLAG_ACK));
+    TEST_ASSERT(tcp_window_scale_negotiated(pcb));
+    TEST_ASSERT(tcp_encode_window(pcb, TCP_FLAG_SYN) == 65535u);
+    TEST_ASSERT(tcp_encode_window(pcb, TCP_FLAG_ACK) == 4096u);
+    TEST_ASSERT(tcp_decode_window(pcb, 4096u, TCP_FLAG_SYN) == 4096u);
+    TEST_ASSERT(tcp_decode_window(pcb, 4096u, TCP_FLAG_ACK) == 256u * 1024u);
 
     pcb->snd_mss = 100;
     tcp_congestion_init(pcb);
@@ -213,6 +359,91 @@ static int test_udp_unit_defaults(void)
     return 0;
 }
 
+static int test_bind_ephemeral_ports(void)
+{
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = 0,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    uint16_t tcp_ports[2] = {0};
+    uint16_t udp_ports[2] = {0};
+    int tcp_fds[2] = {-1, -1};
+    int udp_fds[2] = {-1, -1};
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        int fd = net_socket(AF_INET, SOCK_STREAM, 0);
+        TEST_ASSERT(fd >= 0);
+        tcp_fds[i] = fd;
+        TEST_ASSERT(net_bind(fd, (struct sockaddr *)&address,
+                             sizeof(address)) == 0);
+        struct sockaddr_in bound = {0};
+        socklen_t bound_len = sizeof(bound);
+        TEST_ASSERT(net_getsockname(fd, (struct sockaddr *)&bound,
+                                    &bound_len) == 0);
+        TEST_ASSERT(bound_len == sizeof(bound));
+        TEST_ASSERT(bound.sin_family == AF_INET);
+        TEST_ASSERT(ntohs(bound.sin_port) >= 1024);
+        tcp_ports[i] = bound.sin_port;
+        TEST_ASSERT(net_listen(fd, 1) == 0);
+    }
+    TEST_ASSERT(tcp_ports[0] != tcp_ports[1]);
+    TEST_ASSERT(net_close(tcp_fds[0]) == 0);
+    TEST_ASSERT(net_close(tcp_fds[1]) == 0);
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        int fd = net_socket(AF_INET, SOCK_DGRAM, 0);
+        TEST_ASSERT(fd >= 0);
+        udp_fds[i] = fd;
+        TEST_ASSERT(net_bind(fd, (struct sockaddr *)&address,
+                             sizeof(address)) == 0);
+        struct sockaddr_in bound = {0};
+        socklen_t bound_len = sizeof(bound);
+        TEST_ASSERT(net_getsockname(fd, (struct sockaddr *)&bound,
+                                    &bound_len) == 0);
+        TEST_ASSERT(bound_len == sizeof(bound));
+        TEST_ASSERT(bound.sin_family == AF_INET);
+        TEST_ASSERT(ntohs(bound.sin_port) >= 1024);
+        udp_ports[i] = bound.sin_port;
+    }
+    TEST_ASSERT(udp_ports[0] != udp_ports[1]);
+    TEST_ASSERT(net_close(udp_fds[0]) == 0);
+    TEST_ASSERT(net_close(udp_fds[1]) == 0);
+
+    struct sockaddr_in6 address6 = {
+        .sin6_family = AF_INET6,
+        .sin6_port = 0,
+        .sin6_addr = IN6ADDR_ANY_INIT,
+    };
+    int tcp6 = net_socket(AF_INET6, SOCK_STREAM, 0);
+    TEST_ASSERT(tcp6 >= 0);
+    TEST_ASSERT(net_bind(tcp6, (struct sockaddr *)&address6,
+                         sizeof(address6)) == 0);
+    struct sockaddr_in6 bound6 = {0};
+    socklen_t bound6_len = sizeof(bound6);
+    TEST_ASSERT(net_getsockname(tcp6, (struct sockaddr *)&bound6,
+                                &bound6_len) == 0);
+    TEST_ASSERT(bound6_len == sizeof(bound6));
+    TEST_ASSERT(bound6.sin6_family == AF_INET6);
+    TEST_ASSERT(ntohs(bound6.sin6_port) >= 1024);
+    TEST_ASSERT(net_listen(tcp6, 1) == 0);
+    TEST_ASSERT(net_close(tcp6) == 0);
+
+    int udp6 = net_socket(AF_INET6, SOCK_DGRAM, 0);
+    TEST_ASSERT(udp6 >= 0);
+    TEST_ASSERT(net_bind(udp6, (struct sockaddr *)&address6,
+                         sizeof(address6)) == 0);
+    memset(&bound6, 0, sizeof(bound6));
+    bound6_len = sizeof(bound6);
+    TEST_ASSERT(net_getsockname(udp6, (struct sockaddr *)&bound6,
+                                &bound6_len) == 0);
+    TEST_ASSERT(bound6_len == sizeof(bound6));
+    TEST_ASSERT(bound6.sin6_family == AF_INET6);
+    TEST_ASSERT(ntohs(bound6.sin6_port) >= 1024);
+    TEST_ASSERT(net_close(udp6) == 0);
+    return 0;
+}
+
 static int test_tcp_loopback(void)
 {
     const char request[] = "netfast tcp loopback";
@@ -239,6 +470,19 @@ static int test_tcp_loopback(void)
                             sizeof(address)) == 0);
     accepted = net_accept(listener, NULL, NULL);
     TEST_ASSERT(accepted >= 0);
+
+    fd_entry *client_entry = hold_fd_entry(client);
+    fd_entry *accepted_entry = hold_fd_entry(accepted);
+    TEST_ASSERT(client_entry && accepted_entry);
+    tcp_pcb *client_pcb = ((Socket *)client_entry->value)->pcb;
+    tcp_pcb *accepted_pcb = ((Socket *)accepted_entry->value)->pcb;
+    TEST_ASSERT(tcp_window_scale_negotiated(client_pcb));
+    TEST_ASSERT(tcp_window_scale_negotiated(accepted_pcb));
+    TEST_ASSERT(client_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
+    TEST_ASSERT(accepted_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
+    PUT_REF(accepted_entry);
+    PUT_REF(client_entry);
+
     TEST_ASSERT(net_fcntl(accepted, F_SETFL, O_NONBLOCK) == 0);
     TEST_ASSERT(net_write(client, request, sizeof(request)) ==
                 (int)sizeof(request));
@@ -254,6 +498,54 @@ static int test_tcp_loopback(void)
     TEST_ASSERT(memcmp(buffer, reply, sizeof(reply)) == 0);
     TEST_ASSERT(net_close(accepted) == 0);
     TEST_ASSERT(net_close(client) == 0);
+    TEST_ASSERT(net_close(listener) == 0);
+    return 0;
+}
+
+static int test_tcp_linger(void)
+{
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(32105),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    int listener = net_socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT(listener >= 0);
+    int reuse = 1;
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                               sizeof(reuse)) == 0);
+    TEST_ASSERT(net_bind(listener, (struct sockaddr*)&address,
+                         sizeof(address)) == 0);
+    TEST_ASSERT(net_listen(listener, 2) == 0);
+
+    int client = net_socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT(client >= 0);
+    TEST_ASSERT(net_connect(client, (struct sockaddr*)&address,
+                            sizeof(address)) == 0);
+    int accepted = net_accept(listener, NULL, NULL);
+    TEST_ASSERT(accepted >= 0);
+
+    struct linger linger = {.l_onoff = 1, .l_linger = 1};
+    TEST_ASSERT(net_setsockopt(client, SOL_SOCKET, SO_LINGER, &linger,
+                               sizeof(linger)) == 0);
+    TEST_ASSERT(net_close(client) == 0); /* FIN ACK or one-second timeout */
+    TEST_ASSERT(net_close(accepted) == 0);
+
+    client = net_socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT(client >= 0);
+    TEST_ASSERT(net_connect(client, (struct sockaddr*)&address,
+                            sizeof(address)) == 0);
+    accepted = net_accept(listener, NULL, NULL);
+    TEST_ASSERT(accepted >= 0);
+
+    linger.l_linger = 0;
+    TEST_ASSERT(net_setsockopt(client, SOL_SOCKET, SO_LINGER, &linger,
+                               sizeof(linger)) == 0);
+    TEST_ASSERT(net_close(client) == 0); /* abortive RST close */
+    char byte;
+    TEST_ASSERT(net_read(accepted, &byte, sizeof(byte)) == -1);
+    TEST_ASSERT(errno == ECONNRESET);
+    TEST_ASSERT(net_close(accepted) == 0);
     TEST_ASSERT(net_close(listener) == 0);
     return 0;
 }
@@ -285,6 +577,41 @@ static int test_udp_loopback(void)
     TEST_ASSERT(peer.sin_family == AF_INET && peer.sin_port != 0);
     TEST_ASSERT(net_close(sender) == 0);
     TEST_ASSERT(net_close(receiver) == 0);
+    return 0;
+}
+
+static int test_request_error_boundary(void)
+{
+    struct sockaddr_in unreachable = {
+        .sin_family = AF_INET,
+        .sin_port = htons(32103),
+        .sin_addr.s_addr = htonl(0xc0000201u), /* 192.0.2.1 */
+    };
+    int socket_fd = net_socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT(socket_fd >= 0);
+
+    errno = 0;
+    TEST_ASSERT(net_connect(socket_fd, (struct sockaddr *)&unreachable,
+                            sizeof(unreachable)) == -1);
+    TEST_ASSERT(errno == EHOSTUNREACH);
+
+    int cq_fd = net_async_create();
+    TEST_ASSERT(cq_fd >= 0);
+    net_async_req *request = net_async_req_create(
+        socket_fd, NET_ASYNC_CONNECT,
+        (struct sockaddr *)&unreachable, (socklen_t)sizeof(unreachable));
+    TEST_ASSERT(request);
+    TEST_ASSERT(net_async_submit(cq_fd, request) == 0);
+
+    net_async_req *completed = NULL;
+    TEST_ASSERT(net_async_wait(cq_fd, &completed, 1, 1, 2000) == 1);
+    TEST_ASSERT(completed == request);
+    TEST_ASSERT(completed->ret == -EHOSTUNREACH);
+    TEST_ASSERT(net_async_req_result(completed) == -EHOSTUNREACH);
+    net_async_req_destroy(completed);
+
+    TEST_ASSERT(net_async_close(cq_fd) == 0);
+    TEST_ASSERT(net_close(socket_fd) == 0);
     return 0;
 }
 
@@ -355,11 +682,12 @@ static int test_async_multi_wait(void)
             TEST_ASSERT(pthread_join(threads[i], NULL) == 0);
             TEST_ASSERT(args[i].ret == (int)batch[i]);
             for (uint32_t j = 0; j < batch[i]; ++j) {
-                int request_errno = 0;
-                int fd = net_async_req_result(args[i].completed[j],
-                                              &request_errno);
-                TEST_ASSERT(fd >= 0 && request_errno == 0);
-                TEST_ASSERT(net_close(fd) == 0);
+                net_async_req* request = args[i].completed[j];
+                TEST_ASSERT(request->async_fd == -1);
+                TEST_ASSERT(request->type == (req_type)NET_ASYNC_SOCKET);
+                TEST_ASSERT(request->ret >= 0);
+                TEST_ASSERT(net_async_req_result(request) == request->ret);
+                TEST_ASSERT(net_close(request->ret) == 0);
                 net_async_req_destroy(args[i].completed[j]);
             }
         }
@@ -405,14 +733,60 @@ static int test_async_multi_wait_close(void)
     return 0;
 }
 
+#ifndef TEST_EPOLL
+static int test_epoll_disabled(void)
+{
+    errno = 0;
+    TEST_ASSERT(net_epoll_create() == -1);
+    TEST_ASSERT(errno == ENOTSUP);
+    return 0;
+}
+#else
+static int test_epoll_enabled(void)
+{
+    int epfd = net_epoll_create();
+    TEST_ASSERT(epfd >= 0);
+    int sockfd = net_socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT(sockfd >= 0);
+    struct epoll_event event = {
+        .events = EPOLLIN | EPOLLOUT,
+        .data.fd = sockfd,
+    };
+    TEST_ASSERT(net_epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &event) == 0);
+    event.events = EPOLLIN;
+    TEST_ASSERT(net_epoll_ctl(epfd, EPOLL_CTL_MOD, sockfd, &event) == 0);
+    TEST_ASSERT(net_epoll_ctl(epfd, EPOLL_CTL_DEL, sockfd, NULL) == 0);
+    TEST_ASSERT(net_close(sockfd) == 0);
+
+    sockfd = net_socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT(sockfd >= 0);
+    event.data.fd = sockfd;
+    TEST_ASSERT(net_epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &event) == 0);
+    /* Closing a registered socket must remove its intrusive hash node. */
+    TEST_ASSERT(net_close(sockfd) == 0);
+    TEST_ASSERT(net_close(epfd) == 0);
+    return 0;
+}
+#endif
+
 int main(void)
 {
     TEST_RUN(test_tcp_unit_defaults_and_boundaries);
     TEST_RUN(test_udp_unit_defaults);
+#ifndef TEST_EPOLL
+    TEST_RUN(test_epoll_disabled);
+#endif
     TEST_ASSERT(setup_loopback_runtime() == 0);
+#ifdef TEST_EPOLL
+    TEST_RUN(test_epoll_enabled);
+#endif
     TEST_RUN(test_skb_multisegment_clone_copy);
+    TEST_RUN(test_ipv6_extension_fragmentation);
+    TEST_RUN(test_bind_ephemeral_ports);
     TEST_RUN(test_tcp_loopback);
+    TEST_RUN(test_tcp_linger);
     TEST_RUN(test_udp_loopback);
+    TEST_RUN(test_request_error_boundary);
     TEST_RUN(test_async_multi_wait);
     TEST_RUN(test_async_multi_wait_close);
 

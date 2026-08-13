@@ -28,15 +28,8 @@
 typedef struct page_info page_info;
 typedef struct frame_slot frame_slot;
 
-typedef struct frame_cache_entry {
-    page_info* page;
-    uint32_t generation;
-    uint16_t slot_index;
-} frame_cache_entry;
-
 typedef struct frame_cache {
-    frame_cache_entry entries[FRAME_SLOT_CLASS_COUNT]
-                             [THREAD_FRAME_CACHE_LIMIT];
+    frame_slot* entries[FRAME_SLOT_CLASS_COUNT][THREAD_FRAME_CACHE_LIMIT];
     uint16_t count[FRAME_SLOT_CLASS_COUNT];
 } frame_cache;
 
@@ -45,24 +38,22 @@ typedef struct frame_cache {
  * slot returns the raw frame. */
 struct page_info {
     ref_info ref;
-    frame_slot* free_slot_list;
-    atomic_uint used_number;
-    atomic_uint generation;
-    uint32_t slot_stride;
-    uint16_t slot_size;
-    uint16_t slot_count;
-    uint16_t first_slot_offset;
 };
 
 struct frame_slot {
     ref_info ref;
     page_info* page;
-    frame_slot* next_free;
     uint8_t* data;
-    uint32_t generation;
     uint16_t slot_size;
-    uint16_t index;
 };
+
+/* FQ entries always own a complete-frame slot at the fixed first-slot
+ * offset. */
+static inline frame_slot* frame_slot_from_rx_frame(void* frame)
+{
+    return (frame_slot*)((uint8_t*)frame +
+                         FRAME_ALIGN16(sizeof(page_info)));
+}
 
 /* The final size class consumes one complete UMEM frame.  Metadata remains
  * at the front, so slot_size is the frame's usable data capacity. */
@@ -90,14 +81,11 @@ uint32_t frame_slot_alloc_batch(frame_slot** out, uint32_t max,
                                 uint32_t min_data_len);
 frame_slot* frame_slot_init_rx(void* frame, uint8_t* data,
                                uint32_t data_len);
-frame_slot* frame_slot_from_addr(void* frame, const uint8_t* addr);
 uint32_t frame_rx_headroom(void);
 
 void frame_global_cache_init(void);
 void frame_cache_init(frame_cache* cache);
 void frame_cache_reset(frame_cache* cache);
 void frame_global_cache_reset(void);
-
-page_info* create_page_info(void);
 
 #endif

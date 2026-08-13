@@ -10,6 +10,8 @@
 #include "base.h"
 #include "fd_entry.h"
 
+#ifdef TEST_EPOLL
+
 typedef struct Socket Socket;
 typedef struct req req;
 
@@ -18,6 +20,7 @@ typedef struct net_epoll net_epoll;
 
 typedef struct net_epoll_item{
     ref_info ref;
+    hash_node hash_node;
     pending_node node;
     list_node ready_list;        /* on ep->ready_items, protected by ep->ready_lock */
     epoll_event ready_events;    /* protected by ep->ready_lock */
@@ -50,5 +53,7 @@ int req_epoll_close(fd_entry* entry);
 
 /* worker-side handler for REQ_EPOLL_CTL */
 void _epoll_ctl(req* r);
+
+#endif /* TEST_EPOLL */
 
 #endif

@@ -341,8 +341,6 @@ int xdp_frame_pool_init(void)
     for (uint64_t i = 0; i < g_xdp_frame_pool.ring_size; ++i) {
         g_xdp_frame_pool.slots[i].frame_idx = (uint32_t)i;
         atomic_init(&g_xdp_frame_pool.slots[i].sequence, i + 1U);
-        page_info* page = idx_to_ptr((uint32_t)i);
-        atomic_init(&page->generation, 0U);
     }
 
     frame_global_cache_init();
@@ -451,8 +449,31 @@ int xdp_init(void)
 
 static inline uint64_t umem_frame_addr(uint64_t addr)
 {
-    uint64_t raw = xsk_umem__extract_addr(addr);
-    return raw - raw % g_xdp_frame_pool.frame_size;
+    uint64_t data = xsk_umem__add_offset_to_addr(addr);
+    return data & ~((uint64_t)XDP_UMEM_FRAME_SIZE - 1U);
+}
+
+static inline uint64_t umem_tx_addr(const frame_slot* slot,
+                                    const uint8_t* data)
+{
+    uint64_t slot_addr = (uint64_t)((const uint8_t*)slot -
+                                    (const uint8_t*)g_xdp_frame_pool.buffer);
+    uint64_t data_offset = (uint64_t)(data - (const uint8_t*)slot);
+    assert(slot_addr <= XSK_UNALIGNED_BUF_ADDR_MASK);
+    assert(data_offset < (UINT64_C(1) <<
+                          (64U - XSK_UNALIGNED_BUF_OFFSET_SHIFT)));
+    return slot_addr | (data_offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
+}
+
+static inline frame_slot* tx_slot_from_addr(uint64_t addr)
+{
+    frame_slot* slot = xsk_umem__get_data(
+        g_xdp_frame_pool.buffer, xsk_umem__extract_addr(addr));
+    uint8_t* data = xsk_umem__get_data(
+        g_xdp_frame_pool.buffer, xsk_umem__add_offset_to_addr(addr));
+    assert(data >= slot->data && data < slot->data + slot->slot_size);
+    (void)data;
+    return slot;
 }
 
 static inline void umem_release_addr(uint64_t addr)
@@ -482,14 +503,8 @@ static void xdp_drain_ring_pending(if_xdp* ix)
 	for (__u32 i = tx_cons; i != tx_prod; ++i) {
 		struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, i);
 		if (!d) continue;
-		uint64_t raw = xsk_umem__extract_addr(d->addr);
-		uint64_t fa = umem_frame_addr(d->addr);
-		void* frame  = xsk_umem__get_data(g_xdp_frame_pool.buffer, fa);
-		if (frame) {
-				uint8_t* data = xsk_umem__get_data(g_xdp_frame_pool.buffer, raw);
-				frame_slot* slot = frame_slot_from_addr(frame, data);
-				PUT_REF(slot);
-		}
+		frame_slot* slot = tx_slot_from_addr(d->addr);
+		PUT_REF(slot);
 	}
 
 	/* ── FQ ring: return un-consumed frames to pool ── */
@@ -533,21 +548,16 @@ static void umem_refill_fq(if_xdp* ix, struct xsk_ring_prod *fq)
     }
 }
 
-static void umem_complete_tx(struct xsk_ring_cons* cq)
+static void umem_complete_tx(if_xdp* ix)
 {
+    struct xsk_ring_cons* cq = &ix->cq;
     uint32_t idx = 0;
     uint32_t n   = xsk_ring_cons__peek(cq, XDP_COMP_QUEUE_SIZE, &idx);
 
     for (uint32_t i = 0; i < n; ++i) {
         uint64_t addr = *xsk_ring_cons__comp_addr(cq, idx + i);
-        uint64_t raw  = xsk_umem__extract_addr(addr);
-        uint64_t frame_addr = umem_frame_addr(addr);
-        void* frame = xsk_umem__get_data(g_xdp_frame_pool.buffer, frame_addr);
-        if (frame) {
-            uint8_t* data = xsk_umem__get_data(g_xdp_frame_pool.buffer, raw);
-            frame_slot* slot = frame_slot_from_addr(frame, data);
-            PUT_REF(slot);
-        }
+        frame_slot* slot = tx_slot_from_addr(addr);
+        PUT_REF(slot);
     }
 
     xsk_ring_cons__release(cq, n);
@@ -594,7 +604,7 @@ static void xdp_tx_kick_loop(task* tk)
 {
     if_xdp* ix = (if_xdp*)tk->argv;
 
-    umem_complete_tx(&ix->cq);
+    umem_complete_tx(ix);
     xdp_tx_flush(ix);
 }
 
@@ -607,7 +617,7 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
 
     uint32_t tx_idx = 0;
     umem_refill_fq(ix, &ix->fq);
-    umem_complete_tx(&ix->cq);
+    umem_complete_tx(ix);
 
     uint32_t reserved = xsk_ring_prod__reserve(&ix->tx, frames, &tx_idx);
     if (reserved != frames) {
@@ -631,8 +641,7 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
     for (uint32_t i = 0; i < frames; ++i, di = di->next) {
         frame_slot* slot = di->slot;
         struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
-        d->addr = (uint64_t)(di->start -
-                             (uint8_t*)g_xdp_frame_pool.buffer);
+        d->addr = umem_tx_addr(slot, di->start);
         d->len = di->end - di->start;
         d->options = 0;
         if (i == 0 && meta->flags)
@@ -664,7 +673,7 @@ static void xdp_tx_drain_pending(if_xdp* ix)
     if (!ix->pending_tx_queue.element_number)
         return;
 
-    umem_complete_tx(&ix->cq);
+    umem_complete_tx(ix);
     while (ix->pending_tx_queue.element_number) {
         skbuff* skb = SKB_FROM_TX_NODE(get_queue_first(&ix->pending_tx_queue));
         if (!skb)
@@ -672,7 +681,7 @@ static void xdp_tx_drain_pending(if_xdp* ix)
 
         int ret = xdp_tx_submit(ix, skb);
         if (ret == -EAGAIN) {
-            umem_complete_tx(&ix->cq);
+            umem_complete_tx(ix);
             ret = xdp_tx_submit(ix, skb);
         }
         if (ret == -EAGAIN)
@@ -1330,7 +1339,7 @@ int xdp_if_stop(if_info *info)
 			ix->tk = NULL;
 		}
         xdp_tx_drop_pending(ix);
-        umem_complete_tx(&ix->cq);
+        umem_complete_tx(ix);
 
 		if_xdp_release_redirect_prog(ix);
         if_xdp_unbind_socket(ix);
@@ -1474,7 +1483,7 @@ void xdp_if_read(task *tk)
 
             uint32_t chunk = d->len;
 
-            frame_slot* slot = frame_slot_from_addr(frame, payload);
+            frame_slot* slot = frame_slot_from_rx_frame(frame);
             if (!slot) {
                 umem_release_addr(frame_addr);
 				packet_bad = true;
@@ -1545,7 +1554,7 @@ void xdp_if_read(task *tk)
 
     xsk_ring_cons__release(rx, n);
     umem_refill_fq(ix, &ix->fq);
-    umem_complete_tx(&ix->cq);
+    umem_complete_tx(ix);
     drained += n;
 	}
 }

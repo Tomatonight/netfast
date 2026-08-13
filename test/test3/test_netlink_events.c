@@ -7,10 +7,13 @@
 #include <string.h>
 
 #include "base.h"
+#include "ether.h"
 #include "if.h"
 #include "init.h"
+#include "ip.h"
 #include "netlink.h"
 #include "route_arp_ndp.h"
+#include "skbuff.h"
 
 #include "test_common.h"
 
@@ -181,23 +184,66 @@ static int test_neighbor_events(int ifindex)
     struct nlmsghdr *nlh = (struct nlmsghdr *)buffer;
     uint32_t ip = inet_addr("198.51.100.1");
     uint8_t mac[] = {0x02, 0, 0, 0, 0, 1};
-    init_neighbor_message(nlh, RTM_NEWNEIGH, ifindex);
-    TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_DST, &ip, sizeof(ip)) == 0);
-    TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_LLADDR, mac, sizeof(mac)) == 0);
-    TEST_ASSERT(parse_neighbor_event(nlh) == 0);
-
     ndp_key key = {.ip_family = AF_INET, .ifindex = (uint32_t)ifindex};
     memcpy(key.neigh_ip, &ip, sizeof(ip));
-    ndp_info *entry = search_ndp_table(&key);
-    TEST_ASSERT(entry && memcmp(entry->mac, mac, sizeof(mac)) == 0 &&
-                entry->state == NUD_REACHABLE);
-    PUT_REF(entry);
+
+    static const uint16_t usable_states[] = {
+        NUD_REACHABLE, NUD_STALE, NUD_DELAY, NUD_PROBE,
+        NUD_PERMANENT, NUD_NOARP,
+    };
+    for (size_t i = 0; i < sizeof(usable_states) / sizeof(usable_states[0]); ++i) {
+        init_neighbor_message(nlh, RTM_NEWNEIGH, ifindex);
+        ((struct ndmsg *)NLMSG_DATA(nlh))->ndm_state = usable_states[i];
+        TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_DST, &ip,
+                             sizeof(ip)) == 0);
+        TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_LLADDR, mac,
+                             sizeof(mac)) == 0);
+        TEST_ASSERT(parse_neighbor_event(nlh) == 0);
+
+        ndp_info *entry = NULL;
+        TEST_ASSERT(resolve_neighbor_entry(&key, &entry) == 0);
+        TEST_ASSERT(entry && memcmp(entry->mac, mac, sizeof(mac)) == 0 &&
+                    entry->state == usable_states[i]);
+        PUT_REF(entry);
+    }
+
+    init_neighbor_message(nlh, RTM_NEWNEIGH, ifindex);
+    ((struct ndmsg *)NLMSG_DATA(nlh))->ndm_state = NUD_INCOMPLETE;
+    TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_DST, &ip, sizeof(ip)) == 0);
+    TEST_ASSERT(parse_neighbor_event(nlh) == 0);
+    ndp_key no_probe_key = key;
+    no_probe_key.ifindex = 0;
+    ndp_info *entry = NULL;
+    TEST_ASSERT(resolve_neighbor_entry(&no_probe_key, &entry) ==
+                -EINPROGRESS);
+    TEST_ASSERT(entry == NULL);
+
+    if_info test_if = {.ifindex = 0};
+    route_info test_route = {.ip_family = AF_INET};
+    ipv4_hdr test_ip = {.daddr = ip};
+    skbuff test_skb = {
+        .family = AF_INET,
+        .ipv4_hdr = &test_ip,
+        .route = &test_route,
+    };
+    TEST_ASSERT(ether_send(&test_if, &test_skb) == 0);
+
+    init_neighbor_message(nlh, RTM_NEWNEIGH, ifindex);
+    ((struct ndmsg *)NLMSG_DATA(nlh))->ndm_state = NUD_FAILED;
+    TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_DST, &ip, sizeof(ip)) == 0);
+    TEST_ASSERT(parse_neighbor_event(nlh) == 0);
+    TEST_ASSERT(resolve_neighbor_entry(&key, &entry) ==
+                -EHOSTUNREACH);
+    TEST_ASSERT(entry == NULL);
+    TEST_ASSERT(ether_send(&test_if, &test_skb) == -EHOSTUNREACH);
 
     init_neighbor_message(nlh, RTM_DELNEIGH, ifindex);
     TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_DST, &ip, sizeof(ip)) == 0);
     TEST_ASSERT(add_attr(nlh, sizeof(buffer), NDA_LLADDR, mac, sizeof(mac)) == 0);
     TEST_ASSERT(parse_neighbor_event(nlh) == 0);
     TEST_ASSERT(search_ndp_table(&key) == NULL);
+    TEST_ASSERT(resolve_neighbor_entry(&no_probe_key, &entry) ==
+                -EINPROGRESS);
     return 0;
 }
 

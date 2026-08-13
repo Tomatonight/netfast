@@ -47,11 +47,13 @@ typedef struct fd_entry_ops {
                       void *optval, socklen_t *optlen);
     int (*fcntl)(fd_entry* entry, int cmd, int arg);
 
+#ifdef TEST_EPOLL
     int (*epoll_create)(void);
     int (*epoll_ctl)(fd_entry* entry, int op, int sockfd,
                      struct epoll_event *event);
     int (*epoll_wait)(fd_entry* entry, struct epoll_event *events,
                       int maxevents, int timeout_ms);
+#endif
 
     int (*close)(fd_entry* entry);
     int (*shutdown)(fd_entry* entry, int how);

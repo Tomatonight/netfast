@@ -10,178 +10,155 @@
 
 #include <string.h>
 
-/* ── 获取当前 worker 的 IPv6 重组 hash ──────────────────── */
 static inline hash* get_ipq6_hash(void)
 {
     return get_current_worker()->stack.ipq6_hash;
 }
 
-/* ── 创建 / 销毁 / 查找 ipq6 ────────────────────────────── */
-
-static ipq6* create_ipq6(uint32_t id, const uint8_t* src, const uint8_t* dst)
+static ipq6_key make_ipq6_key(uint32_t id, const uint8_t* src,
+                              const uint8_t* dst)
 {
-    hash* h = get_ipq6_hash();
+    ipq6_key key = {.id = id};
+    memcpy(key.src_ip, src, sizeof(key.src_ip));
+    memcpy(key.dst_ip, dst, sizeof(key.dst_ip));
+    return key;
+}
+
+static ipq6* create_ipq6(const ipq6_key* key)
+{
     ipq6* q = calloc(1, sizeof(*q));
     if (!q)
         return NULL;
 
-    q->key.id = id;
-    memcpy(q->key.src_ip, src, 16);
-    memcpy(q->key.dst_ip, dst, 16);
+    q->key = *key;
     q->last_update_time = (uint32_t)get_current_time_ms();
-    if (!hash_add(h, (const uint8_t*)&q->key, sizeof(q->key), (uint64_t)q)) {
+    if (!hash_add_node(get_ipq6_hash(), &q->hash_node)) {
         free(q);
         return NULL;
     }
     return q;
 }
 
+static void free_ipq6_frag(ipq6_frag* frag)
+{
+    PUT_REF(frag->skb);
+    free(frag);
+}
+
 static void destroy_ipq6(ipq6* q)
 {
-    hash* h = get_ipq6_hash();
-    hash_del(h, (uint8_t*)&q->key, sizeof(q->key));
+    hash_del_node(get_ipq6_hash(), &q->hash_node);
 
-    list_node *node, *tmp;
-    FOR_EACH_LIST_SAFE(&q->frag_head, node, tmp) {
-        ipq6_frag* frag = (ipq6_frag*)node->element;
-        remove_list_node(node);
-        PUT_REF(frag->skb);
-        free(frag);
+    ipq6_frag* frag;
+    list_node* next;
+    FOR_EACH_LIST_SAFE_OFFSET(&q->frag_head, frag, next, ipq6_frag, node) {
+        remove_list_node(&frag->node);
+        free_ipq6_frag(frag);
     }
     free(q);
 }
 
-static ipq6* search_ipq6(uint32_t id, const uint8_t* src, const uint8_t* dst)
+static ipq6* search_ipq6(const ipq6_key* key)
 {
-    hash* h = get_ipq6_hash();
-    ipq6_key key;
-    key.id = id;
-    memcpy(key.src_ip, src, 16);
-    memcpy(key.dst_ip, dst, 16);
-    uint64_t elem = hash_get_element(h, (uint8_t*)&key, sizeof(key));
-    return elem ? (ipq6*)elem : NULL;
-}
-
-/* ── 超时清理 ──────────────────────────────────────────── */
-
-static void ipq6_walk_cb(uint64_t element)
-{
-    ipq6* q = (ipq6*)element;
-    if ((uint32_t)(get_current_time_ms() - q->last_update_time) > IPQ6_TIMEOUT)
-        destroy_ipq6(q);
+    hash_node* node = hash_find_node(get_ipq6_hash(), key);
+    return node ? HASH_CONTAINER_OF(node, ipq6, hash_node) : NULL;
 }
 
 void ipq6_timer(task* tk)
 {
     hash* h = get_ipq6_hash();
-    HASH_ELEMENT_WALK(h, ipq6_walk_cb);
-    update_task_timer(tk, get_current_time_ms() + IPQ6_TIMER_INTERVAL);
+    uint32_t now = (uint32_t)get_current_time_ms();
+    for (uint32_t i = 0; i < h->size; i++) {
+        hash_node* node = h->buckets[i];
+        while (node) {
+            hash_node* next = node->next;
+            ipq6* queue = HASH_CONTAINER_OF(node, ipq6, hash_node);
+            if (now - queue->last_update_time > IPQ6_TIMEOUT)
+                destroy_ipq6(queue);
+            node = next;
+        }
+    }
+    update_task_timer(tk, now + IPQ6_TIMER_INTERVAL);
 }
-
-/* ── 排序比较：按 fragment offset 升序 ─────────────────── */
 
 static int frag6_offset_cmp(list_node* a, list_node* b)
 {
-    ipq6_frag* fa = (ipq6_frag*)((uint8_t*)a - offsetof(ipq6_frag, node));
-    ipq6_frag* fb = (ipq6_frag*)((uint8_t*)b - offsetof(ipq6_frag, node));
-    if (fa->offset < fb->offset) return -1;
+    ipq6_frag* fa = HASH_CONTAINER_OF(a, ipq6_frag, node);
+    ipq6_frag* fb = HASH_CONTAINER_OF(b, ipq6_frag, node);
+    if (fa->offset < fb->offset)
+        return -1;
     return fa->offset > fb->offset;
 }
 
-/* ── 检测扩展头链中是否有 Fragment EH ──────────────────── */
-
-bool ipv6_has_frag(const skbuff* skb)
+static bool is_variable_ext_header(uint8_t next_header)
 {
-    if (!skb->ipv6_hdr)
+    return next_header == IPV6_NEXTHDR_HOPOPT ||
+           next_header == IPV6_NEXTHDR_DSTOPTS ||
+           next_header == IPV6_NEXTHDR_ROUTING;
+}
+
+typedef struct ipv6_frag_info {
+    ipv6_frag_hdr header;
+    uint32_t offset;
+    uint32_t previous_nh_offset;
+} ipv6_frag_info;
+
+static bool find_frag_header(const skbuff* skb, ipv6_frag_info* info)
+{
+    if (!skb->ipv6_hdr || skb_data_len(skb) < IPV6_HDR_LEN)
         return false;
 
-    /* Keep this helper safe when called before the fixed-header validator. */
-    if (skb_data_len(skb) < IPV6_HDR_LEN)
-        return false;
-
-    uint8_t nh = skb->ipv6_hdr->next_hdr;
+    uint8_t next_header = skb->ipv6_hdr->next_hdr;
     uint32_t offset = IPV6_HDR_LEN;
-    uint32_t remaining = skb_data_len(skb) - IPV6_HDR_LEN;
+    uint32_t previous_nh_offset = offsetof(ipv6_hdr, next_hdr);
+    uint32_t total_len = skb_data_len(skb);
 
-    for (int i = 0; i < 8 && remaining > 0; i++) {
-        if (nh == IPV6_NEXTHDR_FRAG)
-            return true;
-
-        switch (nh) {
-        case IPV6_NEXTHDR_HOPOPT:  /* 0 */
-        case IPV6_NEXTHDR_DSTOPTS: /* 60 */
-        case IPV6_NEXTHDR_ROUTING: /* 43 */
-            uint8_t ext[2];
-            if (remaining < sizeof(ext) ||
-                !skb_copy_bits(skb, offset, ext, sizeof(ext)))
+    for (uint32_t i = 0; i < 8; i++) {
+        if (next_header == IPV6_NEXTHDR_FRAG) {
+            ipv6_frag_hdr header;
+            if (!skb_copy_bits(skb, offset, &header, sizeof(header)))
                 return false;
-            {
-                uint8_t ext_len = ext[1];
-                uint32_t hdr_len = (uint32_t)(ext_len + 1u) * 8u;
-                if (hdr_len < 8 || remaining < hdr_len)
-                    return false;
-                nh = ext[0];
-                offset += hdr_len;
-                remaining -= hdr_len;
+            if (info) {
+                info->header = header;
+                info->offset = offset;
+                info->previous_nh_offset = previous_nh_offset;
             }
-            break;
-        default:
-            return false;  /* No Next Header or L4 reached; no Fragment EH. */
+            return true;
         }
+
+        if (!is_variable_ext_header(next_header))
+            return false;
+
+        uint8_t ext[2];
+        if (!skb_copy_bits(skb, offset, ext, sizeof(ext)))
+            return false;
+        uint32_t header_len = (uint32_t)(ext[1] + 1u) * 8u;
+        if (header_len > total_len - offset)
+            return false;
+        next_header = ext[0];
+        previous_nh_offset = offset;
+        offset += header_len;
     }
     return false;
 }
 
-/* ── IPv6 分片重组 ─────────────────────────────────────── */
+bool ipv6_has_frag(const skbuff* skb)
+{
+    return find_frag_header(skb, NULL);
+}
 
 skbuff* ipv6_defrag(skbuff* skb)
 {
     ipv6_hdr* ip6 = skb->ipv6_hdr;
-
-    /* 遍历扩展头，定位 Fragment EH */
-    uint8_t nh = ip6->next_hdr;
-    uint32_t ext_offset = IPV6_HDR_LEN;
-    ipv6_frag_hdr fh_storage;
-    ipv6_frag_hdr* fh = NULL;
-
-    for (int i = 0; i < 8; i++) {
-        if (nh == IPV6_NEXTHDR_FRAG) {
-            if (!skb_copy_bits(skb, ext_offset, &fh_storage,
-                               sizeof(fh_storage)))
-                return NULL;
-            fh = &fh_storage;
-            break;
-        }
-
-        switch (nh) {
-        case IPV6_NEXTHDR_HOPOPT:
-        case IPV6_NEXTHDR_DSTOPTS:
-        case IPV6_NEXTHDR_ROUTING:
-            uint8_t ext[2];
-            if (!skb_copy_bits(skb, ext_offset, ext, sizeof(ext)))
-                return NULL;
-            {
-                uint8_t ext_len = ext[1];
-                uint32_t hdr_len = (uint32_t)(ext_len + 1u) * 8u;
-                if (hdr_len < 8 || ext_offset + hdr_len > skb_data_len(skb))
-                    return NULL;
-                nh = ext[0];
-                ext_offset += hdr_len;
-            }
-            break;
-        default:
-            return NULL;  /* no Fragment EH found */
-        }
-    }
-
-    if (!fh)
+    ipv6_frag_info info;
+    if (!find_frag_header(skb, &info))
         return NULL;
 
-    uint16_t frag_off_host = ntohs(fh->frag_off);
+    uint16_t frag_off_host = ntohs(info.header.frag_off);
     /* RFC 8200 reserves bits 1..2 in Fragment Offset/Flags and the
      * immediately following byte.  Silently accepting either value makes
      * malformed fragments share a reassembly queue with valid traffic. */
-    if ((frag_off_host & 0x0006u) != 0 || fh->reserved != 0)
+    if ((frag_off_host & 0x0006u) != 0 || info.header.reserved != 0)
         return NULL;
     uint16_t offset8 = (frag_off_host & IPV6_FRAG_OFFSET_MASK) >> 3;
     bool mf = (frag_off_host & IPV6_FRAG_MF_MASK) != 0;
@@ -191,9 +168,7 @@ skbuff* ipv6_defrag(skbuff* skb)
         return skb;  /* 不是分片，直接返回 */
 
     /* payload = 所有非固定头 + 扩展头之后的数据 */
-    uint32_t frag_hdr_end = ext_offset + sizeof(*fh);
-    if (frag_hdr_end > skb_data_len(skb))
-        return NULL;
+    uint32_t frag_hdr_end = info.offset + sizeof(info.header);
     uint32_t frag_payload_len = skb_data_len(skb) - frag_hdr_end;
 
     /* Fragment offsets are measured in 8-byte units and the IPv6 payload
@@ -212,35 +187,34 @@ skbuff* ipv6_defrag(skbuff* skb)
     if (mf && (frag_payload_len & 7u))
         return NULL;
 
-    bool created_q = false;
-    ipq6* q = search_ipq6(fh->id, ip6->saddr, ip6->daddr);
+    ipq6_frag* frag = calloc(1, sizeof(*frag));
+    if (!frag)
+        return NULL;
+    frag->skb = skb;
+    frag->offset = offset8;
+    frag->len = frag_payload_len;
+    INC_REF(skb);
+
+    ipq6_key key = make_ipq6_key(info.header.id, ip6->saddr, ip6->daddr);
+    ipq6* q = search_ipq6(&key);
     if (!q) {
-        q = create_ipq6(fh->id, ip6->saddr, ip6->daddr);
+        q = create_ipq6(&key);
         if (!q) {
+            free_ipq6_frag(frag);
             WARN_LOG("Failed to create IPv6 reassembly queue");
             return NULL;
         }
-        created_q = true;
-        q->unfrag_len = (uint16_t)ext_offset;
-        q->next_header = fh->next_hdr;
-    } else if (q->unfrag_len != ext_offset ||
-               q->next_header != fh->next_hdr) {
+        q->unfrag_len = (uint16_t)info.offset;
+        q->previous_nh_offset = (uint16_t)info.previous_nh_offset;
+        q->next_header = info.header.next_hdr;
+    } else if (q->unfrag_len != info.offset ||
+               q->previous_nh_offset != info.previous_nh_offset ||
+               q->next_header != info.header.next_hdr) {
+        free_ipq6_frag(frag);
         destroy_ipq6(q);
         return NULL;
     }
     q->last_update_time = (uint32_t)get_current_time_ms();
-
-    /* 创建分片节点 */
-    ipq6_frag* frag = calloc(1, sizeof(*frag));
-    if (!frag) {
-        if (created_q)
-            destroy_ipq6(q);
-        return NULL;
-    }
-    frag->skb = skb;
-    frag->offset = offset8;
-    frag->len = frag_payload_len;
-    INC_REF(skb);  /* 重组队列持有引用 */
 
     /* Do not accept overlapping ranges.  Counting overlapping bytes would
      * otherwise make received_len inconsistent and can produce ambiguous
@@ -254,29 +228,22 @@ skbuff* ipv6_defrag(skbuff* skb)
         if (!mf && existing_end > frag_end)
             inconsistent_end = true;
         if (frag_offset_bytes < existing_end && existing_start < frag_end) {
-            PUT_REF(skb);
-            free(frag);
+            free_ipq6_frag(frag);
             DEBUG_LOG("Overlapping IPv6 fragment offset=%u len=%u",
                      frag_offset_bytes, frag_payload_len);
-            if (created_q)
-                destroy_ipq6(q);
             return NULL;
         }
     }
 
     if (inconsistent_end ||
         (!mf && q->flag.last_recved && q->total_len != frag_end)) {
-        PUT_REF(skb);
-        free(frag);
+        free_ipq6_frag(frag);
         destroy_ipq6(q);
         return NULL;
     }
 
     if (add_list_node_compare(&q->frag_head, &frag->node, frag6_offset_cmp) < 0) {
-        PUT_REF(skb);
-        free(frag);
-        if (created_q)
-            destroy_ipq6(q);
+        free_ipq6_frag(frag);
         return NULL;
     }
 
@@ -308,7 +275,7 @@ skbuff* ipv6_defrag(skbuff* skb)
      * pulling headers from the first skb; this also handles headers split over
      * multiple UMEM frames. */
     uint32_t unfrag_len = q->unfrag_len;
-    uint32_t strip_all = unfrag_len + sizeof(*fh);
+    uint32_t strip_all = unfrag_len + sizeof(info.header);
     uint8_t unfrag[IPV6_HDR_LEN + 255u * 8u];
     ipq6_frag *first_frag = q->frag_head.next
         ? (ipq6_frag *)((uint8_t *)q->frag_head.next - offsetof(ipq6_frag, node))
@@ -321,22 +288,7 @@ skbuff* ipv6_defrag(skbuff* skb)
     }
 
     uint8_t next_header = q->next_header;
-    uint32_t previous_nh_offset = offsetof(ipv6_hdr, next_hdr);
-    uint32_t walk = IPV6_HDR_LEN;
-    while (walk < unfrag_len) {
-        if (walk + 2u > unfrag_len) {
-            destroy_ipq6(q);
-            return NULL;
-        }
-        previous_nh_offset = walk;
-        uint8_t ext_len = unfrag[walk + 1u];
-        uint32_t hdr_len = (uint32_t)(ext_len + 1u) * 8u;
-        if (hdr_len < 8u || walk + hdr_len > unfrag_len) {
-            destroy_ipq6(q);
-            return NULL;
-        }
-        walk += hdr_len;
-    }
+    uint32_t previous_nh_offset = q->previous_nh_offset;
 
     ipq6_frag *f;
     list_node *tmp;
@@ -370,7 +322,6 @@ skbuff* ipv6_defrag(skbuff* skb)
                 destroy_ipq6(q);
                 return NULL;
             }
-			PUT_REF(f->skb);
         }
 
         expect_byte += f->len;
@@ -389,15 +340,15 @@ skbuff* ipv6_defrag(skbuff* skb)
         return NULL;
     }
 
-    uint8_t* header = skb_data_push(reassembled, unfrag_len);
-    if (!header) {
+    uint8_t* unfrag_header = skb_data_push(reassembled, unfrag_len);
+    if (!unfrag_header) {
         PUT_REF(reassembled);
         destroy_ipq6(q);
         return NULL;
     }
-    memcpy(header, unfrag, unfrag_len);
+    memcpy(unfrag_header, unfrag, unfrag_len);
 
-    ipv6_hdr* new_ip6 = (ipv6_hdr*)header;
+    ipv6_hdr* new_ip6 = (ipv6_hdr*)unfrag_header;
     reassembled->ipv6_hdr = new_ip6;
     *((uint8_t*)new_ip6 + previous_nh_offset) = next_header;
     new_ip6->payload_len = htons((uint16_t)payload_len);
@@ -409,62 +360,77 @@ skbuff* ipv6_defrag(skbuff* skb)
     return reassembled;
 }
 
-/* ── IPv6 分片输出（仅源端执行）────────────────────────── */
+static bool push_frag_headers(skbuff* skb, const uint8_t fixed_header[],
+                              uint8_t next_header, uint32_t id,
+                              uint16_t offset8, bool more,
+                              uint32_t payload_len)
+{
+    uint8_t* headers = skb_data_push(
+        skb, IPV6_HDR_LEN + sizeof(ipv6_frag_hdr));
+    if (!headers)
+        return false;
+
+    ipv6_hdr* ip6 = (ipv6_hdr*)headers;
+    memcpy(ip6, fixed_header, IPV6_HDR_LEN);
+
+    ipv6_frag_hdr* frag = (ipv6_frag_hdr*)(ip6 + 1);
+    frag->next_hdr = next_header;
+    frag->reserved = 0;
+    frag->id = id;
+    ipv6_frag_set(frag, offset8, more);
+
+    ip6->next_hdr = IPV6_NEXTHDR_FRAG;
+    ip6->payload_len = htons((uint16_t)(sizeof(*frag) + payload_len));
+    skb->ipv6_hdr = ip6;
+    return true;
+}
+
+static void free_frag_list(skbuff* skb)
+{
+    skbuff* frag;
+    list_node* next;
+    FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, next,
+                              skbuff, frag_list) {
+        remove_list_node(&frag->frag_list);
+        PUT_REF(frag);
+    }
+}
 
 bool ipv6_frag(skbuff* skb)
 {
-    if_info* info = skb->route->if_info;
-
     ipv6_hdr* ip6 = skb->ipv6_hdr;
-    uint32_t mtu = info->mtu;
-    uint32_t hdr_total = IPV6_HDR_LEN + sizeof(ipv6_frag_hdr);
+    uint32_t mtu = skb->route->if_info->mtu;
     uint32_t tot_len = skb_data_len(skb);
 
     if (mtu < 1280 || tot_len <= IPV6_HDR_LEN)
         return false;
     if (tot_len <= mtu)
-        return true;  /* 无需分片 */
+        return true;
 
-    uint32_t mtu_payload = mtu - hdr_total;
-    uint32_t frag_payload = mtu_payload & ~7u;  /* 8 字节对齐 */
+    uint32_t header_len = IPV6_HDR_LEN + sizeof(ipv6_frag_hdr);
+    uint32_t frag_payload = (mtu - header_len) & ~7u;
 
-    uint8_t hdr_copy[IPV6_HDR_LEN];
-    memcpy(hdr_copy, ip6, IPV6_HDR_LEN);
+    uint8_t fixed_header[IPV6_HDR_LEN];
+    memcpy(fixed_header, ip6, sizeof(fixed_header));
     uint8_t orig_next_hdr = ip6->next_hdr;
 
-    /* Remove the fixed header, split only fragmentable payload, then prepend
-     * fixed + Fragment headers to each fragment. */
     if (skb_consume(skb, IPV6_HDR_LEN, true) != IPV6_HDR_LEN)
         return false;
-    uint32_t first_payload = frag_payload;
-    skbuff* cur = skb_split(skb, first_payload);
+    skbuff* cur = skb_split(skb, frag_payload);
     if (!cur)
         return false;
 
-    uint8_t* first_headers = skb_data_push(skb, hdr_total);
-    if (!first_headers) {
+    static _Atomic(uint32_t) next_frag_id = 1;
+    uint32_t id = htonl(atomic_fetch_add_explicit(
+        &next_frag_id, 1, memory_order_relaxed));
+    if (!push_frag_headers(skb, fixed_header, orig_next_hdr, id, 0, true,
+                           frag_payload)) {
         PUT_REF(cur);
         return false;
     }
-    memcpy(first_headers, hdr_copy, IPV6_HDR_LEN);
-    ip6 = (ipv6_hdr*)first_headers;
-    ipv6_frag_hdr* fh_first = (ipv6_frag_hdr*)(first_headers + IPV6_HDR_LEN);
-    fh_first->next_hdr = orig_next_hdr;
-    fh_first->reserved = 0;
-    ipv6_frag_set(fh_first, 0, true);
-    static _Atomic(uint32_t) frag_id = 1;
-    fh_first->id = htonl(atomic_fetch_add_explicit(&frag_id, 1,
-                                                   memory_order_relaxed));
-
-    /* 更新第一个分片的 IPv6 头 */
-    ip6->next_hdr = IPV6_NEXTHDR_FRAG;
-    ip6->payload_len = htons((uint16_t)(skb_data_len(skb) - IPV6_HDR_LEN));
-    skb->ipv6_hdr = ip6;
-
-    uint32_t offset_bytes = first_payload;
+    uint32_t offset_bytes = frag_payload;
     list_node* list_tail = &skb->frag_list;
 
-    /* 后续分片 */
     while (cur) {
         uint32_t cur_payload = skb_data_len(cur);
         skbuff* next = NULL;
@@ -475,27 +441,12 @@ bool ipv6_frag(skbuff* skb)
             cur_payload = frag_payload;
         }
 
-        /* 推入 IPv6 头 + Fragment EH */
-        ipv6_frag_hdr* fh = (ipv6_frag_hdr*)
-            skb_data_push(cur, IPV6_HDR_LEN + sizeof(*fh));
-        if (!fh) {
+        if (!push_frag_headers(cur, fixed_header, orig_next_hdr, id,
+                               (uint16_t)(offset_bytes / 8u), next != NULL,
+                               cur_payload)) {
             PUT_REF(next);
             goto fail;
         }
-        ipv6_hdr* frag_ip6 = (ipv6_hdr*)fh;
-        memcpy(frag_ip6, hdr_copy, IPV6_HDR_LEN);
-        fh = (ipv6_frag_hdr*)(frag_ip6 + 1);
-
-        fh->next_hdr = orig_next_hdr;
-        fh->reserved = 0;
-        bool is_last = (next == NULL);
-        ipv6_frag_set(fh, (uint16_t)(offset_bytes / 8u), !is_last);
-        fh->id = fh_first->id;  /* 同一包的所有分片共享 ID */
-
-        frag_ip6->next_hdr = IPV6_NEXTHDR_FRAG;
-        frag_ip6->payload_len = htons((uint16_t)(sizeof(*fh) + cur_payload));
-        cur->ipv6_hdr = frag_ip6;
-        cur->frag_list.element = (uint64_t)cur;
         add_list_node(list_tail, &cur->frag_list);
         list_tail = &cur->frag_list;
 
@@ -511,13 +462,6 @@ bool ipv6_frag(skbuff* skb)
 
 fail:
     PUT_REF(cur);
-    {
-        skbuff* frag;
-        list_node* tnode;
-        FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, tnode, skbuff, frag_list) {
-            remove_list_node(&frag->frag_list);
-            PUT_REF(frag);
-        }
-    }
+    free_frag_list(skb);
     return false;
 }

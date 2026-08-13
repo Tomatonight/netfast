@@ -375,6 +375,7 @@ static void* skb_rebase_data_ptr(const skbuff* old_skb, const skbuff* new_skb, c
 	}
 	return NULL;
 }
+
 skbuff* skb_alloc(uint32_t size)
 {
 	CREATE_REF(skbuff, skb, skb_destroy);

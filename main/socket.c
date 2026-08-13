@@ -10,8 +10,11 @@
 #include "queue.h"
 #include "tcp.h"
 #include "ip.h"
+#include "if.h"
 #include "fd_entry.h"
+#ifdef TEST_EPOLL
 #include "req_epoll.h"
+#endif
 #include "req_socket.h"
 #include "worker.h"
 
@@ -28,9 +31,88 @@
 #define EPHEMERAL_PORT_FIRST 1024u
 #define EPHEMERAL_PORT_COUNT (65536u - EPHEMERAL_PORT_FIRST)
 
+typedef struct tuple_key4 {
+    uint32_t saddr;
+    uint32_t daddr;
+    uint16_t sport;
+    uint16_t dport;
+} tuple_key4;
 
-_Static_assert(sizeof(addr_tuple) <= DEFAULT_HASH_KEY_SIZE,
-               "socket tuple must fit in a hash key");
+typedef struct tuple_key6 {
+    uint8_t saddr[16];
+    uint8_t daddr[16];
+    uint16_t sport;
+    uint16_t dport;
+} tuple_key6;
+
+typedef union tuple_key {
+    tuple_key4 key4;
+    tuple_key6 key6;
+} tuple_key;
+
+struct tuple_entry {
+    hash_node hash_node;
+    list_node* sockets;
+    tuple_key key;
+};
+
+_Static_assert(sizeof(tuple_key4) == 12, "IPv4 tuple key must stay compact");
+_Static_assert(sizeof(tuple_key6) == 36,
+               "IPv6 tuple key must stay compact");
+
+static uint32_t tuple_hash_value(const void* key, uint32_t key_len)
+{
+    const uint8_t* bytes = key;
+    uint32_t hash = 0x9747b28cu ^ key_len;
+
+    for (uint32_t offset = 0; offset < key_len; offset += sizeof(uint32_t)) {
+        uint32_t word;
+        memcpy(&word, bytes + offset, sizeof(word));
+        word *= 0xcc9e2d51u;
+        word = (word << 15) | (word >> 17);
+        word *= 0x1b873593u;
+        hash ^= word;
+        hash = (hash << 13) | (hash >> 19);
+        hash = hash * 5u + 0xe6546b64u;
+    }
+
+    hash ^= key_len;
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6bu;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35u;
+    hash ^= hash >> 16;
+    return hash;
+}
+
+hash* tuple_hash_create(uint32_t size, int family)
+{
+    if (family != AF_INET && family != AF_INET6)
+        return NULL;
+    uint32_t key_len = family == AF_INET ? sizeof(tuple_key4)
+                                         : sizeof(tuple_key6);
+    return hash_create_safe(size,
+        HASH_KEY_OFFSET(tuple_entry, hash_node, key), key_len);
+}
+
+static uint32_t tuple_key_from_socket(const Socket* sock, tuple_key* key)
+{
+    if (sock->family == AF_INET6) {
+        tuple_key6* key6 = &key->key6;
+        memcpy(key6->saddr, sock->sip6, sizeof(key6->saddr));
+        memcpy(key6->daddr, sock->dip6, sizeof(key6->daddr));
+        key6->sport = sock->sport;
+        key6->dport = sock->dport;
+        return sizeof(*key6);
+    }
+
+    tuple_key4* key4 = &key->key4;
+    key4->saddr = sock->sip;
+    key4->daddr = sock->dip;
+    key4->sport = sock->sport;
+    key4->dport = sock->dport;
+    return sizeof(*key4);
+}
 
 struct bind_slot {
     addr_key key;
@@ -222,8 +304,7 @@ static inet_ops supported_inet_ops[] = {
 
 static void req_fail(req *r, int error)
 {
-    r->saved_errno = error;
-    req_notify(r, -1);
+    req_notify(r, -error);
 }
 
 static protocol_ops* find_inet_ops(int family, int type, int *protocol){
@@ -295,7 +376,7 @@ Socket* create_socket(int family, int type, int protocol){
         DEBUG_LOG("_socket: unsupported Socket type: family=%d, type=%d, protocol=%d", family, type, protocol);
         return NULL;
     }
-    Socket* sock=calloc(1,sizeof(Socket));
+    Socket* sock = calloc(1, sizeof(*sock));
     if(!sock){
         ERR_LOG("_socket: failed to allocate Socket");
         return NULL;
@@ -329,7 +410,7 @@ void _socket(req* r)
     protocol_ops* ops = find_inet_ops(family, type, &protocol);
     if(!ops){
         DEBUG_LOG("_socket: unsupported Socket type: family=%d, type=%d, protocol=%d", family, type, protocol);
-        req_notify(r, REQ_UNSUPPORTED);
+        req_fail(r, EAFNOSUPPORT);
         return;
     }
     sock=create_socket(family, type, protocol);
@@ -681,6 +762,10 @@ void _close(req* r)
 {
     fd_entry* entry = r->argv.close.entry;
     Socket* sock = (Socket*)entry->value;
+    bool linger_retry = r->status == REQ_WAITING_CLOSE;
+
+    if (!sock && linger_retry)
+        sock = r->wait_sock;
     if(!sock){
         req_fail(r, EBADF);
         return;
@@ -691,8 +776,10 @@ void _close(req* r)
         return;
     }
 
-    socket_detach_with_fd_entry(sock);
-    PUT_REF(entry); /* release the fd table's ownership */
+    if (!linger_retry) {
+        socket_detach_with_fd_entry(sock);
+        PUT_REF(entry); /* release the fd table's ownership */
+    }
     int ret = sock->protocol_ops->release(sock, r);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
@@ -819,46 +906,28 @@ void _poll(req* r)
     req_notify(r, (int)mask);
 }
 
-bool install_tuple(Socket* sock, hash* tuple_hash)
+bool install_tuple(Socket* sock, hash* table)
 {
-
     if (sock->flag.is_hash) {
-        if (!uninstall_tuple(sock, tuple_hash)) {
+        if (!uninstall_tuple(sock, table)) {
             ERR_LOG("install_tuple: failed to remove existing tuple for sock %p", sock);
             return false;
         }
     }
 
-    addr_tuple tuple = {0};
-    if (sock->family == AF_INET6) {
-        memcpy(tuple.s_key.addr6, sock->sip6, 16);
-        memcpy(tuple.d_key.addr6, sock->dip6, 16);
-        tuple.s_key.family = AF_INET6;
-        tuple.d_key.family = AF_INET6;
-    } else {
-        tuple.s_key.addr = sock->sip;
-        tuple.d_key.addr = sock->dip;
-        tuple.s_key.family = AF_INET;
-        tuple.d_key.family = AF_INET;
-    }
-    tuple.s_key.port = sock->sport;
-    tuple.d_key.port = sock->dport;
+    tuple_key key = {0};
+    uint32_t key_len = tuple_key_from_socket(sock, &key);
+    if (!table || table->key_len != key_len)
+        return false;
 
-    const uint32_t key_len = sizeof(addr_tuple);
+    uint32_t value = tuple_hash_value(&key, key_len);
+    uint32_t index = hash_bucket_index(table, value);
+    HASH_BUCKET_WRLOCK(table, index);
 
-    uint32_t idx = general_hash_algorithm((uint8_t*)&tuple, key_len) % tuple_hash->size;
-    HASH_BUCKET_WRLOCK(tuple_hash, idx);
-
-    /* 1) 在写锁内查找 key 对应的链表头 */
-    hash_data* data;
-    list_node* tmp;
-    list_node* head = NULL;
-    FOR_EACH_LIST_SAFE_OFFSET(tuple_hash->hash_lists[idx], data, tmp, hash_data, node) {
-        if (data->key_len == key_len && memcmp(data->key, (uint8_t*)&tuple, key_len) == 0) {
-            head = (list_node*)data->element;
-            break;
-        }
-    }
+    hash_node* node = hash_find_node_locked(table, index, &key, value);
+    tuple_entry* entry = node
+        ? HASH_CONTAINER_OF(node, tuple_entry, hash_node) : NULL;
+    list_node* head = entry ? entry->sockets : NULL;
 
     if (head) {
         static const uint8_t zero6[16];
@@ -866,7 +935,7 @@ bool install_tuple(Socket* sock, hash* tuple_hash)
             ? memcmp(sock->dip6, zero6, sizeof(zero6)) != 0
             : sock->dip != 0;
         if (has_peer) {
-            HASH_BUCKET_UNLOCK(tuple_hash, idx);
+            HASH_BUCKET_UNLOCK(table, index);
             return false;
         }
 
@@ -874,86 +943,63 @@ bool install_tuple(Socket* sock, hash* tuple_hash)
          * group only when every member explicitly opted into REUSEPORT.
          * REUSEADDR affects the bind reservation, not packet demultiplexing. */
         if (!sock->options.reuseport) {
-            HASH_BUCKET_UNLOCK(tuple_hash, idx);
+            HASH_BUCKET_UNLOCK(table, index);
             return false;
         }
 
         for (list_node* n = head; n; n = n->next) {
             Socket* member = (Socket*)((uint8_t*)n - offsetof(Socket, tuple_node));
             if (!member->options.reuseport) {
-                HASH_BUCKET_UNLOCK(tuple_hash, idx);
+                HASH_BUCKET_UNLOCK(table, index);
                 return false;
             }
             if (n == &sock->tuple_node) {
                 /* 已经在链上：视为成功 */
-                HASH_BUCKET_UNLOCK(tuple_hash, idx);
+                sock->tuple_entry = entry;
                 sock->flag.is_hash = 1;
+                HASH_BUCKET_UNLOCK(table, index);
                 return true;
             }
         }
 
         add_list_node(head, &sock->tuple_node);
-        HASH_BUCKET_UNLOCK(tuple_hash, idx);
+        sock->tuple_entry = entry;
         sock->flag.is_hash = 1;
+        HASH_BUCKET_UNLOCK(table, index);
         return true;
     }
 
-    /* 3) key 不存在：插入 hash_data，element 指向 socket 链表的 tuple_node */
-    hash_data* nd = calloc(1, sizeof(hash_data));
-    if (!nd) {
-        HASH_BUCKET_UNLOCK(tuple_hash, idx);
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        HASH_BUCKET_UNLOCK(table, index);
         return false;
     }
-    nd->node.element = (uint64_t)&nd->node;
-    nd->key_len = key_len;
-    memcpy(nd->key, (uint8_t*)&tuple, key_len);
-    nd->element = (uint64_t)&sock->tuple_node;
-    add_list_node(tuple_hash->hash_lists[idx], &nd->node);
-
-    HASH_BUCKET_UNLOCK(tuple_hash, idx);
+    memcpy(&entry->key, &key, key_len);
+    entry->sockets = &sock->tuple_node;
+    hash_link_node_locked(table, index, &entry->hash_node, value);
+    sock->tuple_entry = entry;
     sock->flag.is_hash = 1;
+    HASH_BUCKET_UNLOCK(table, index);
     return true;
 }
 
-bool uninstall_tuple(Socket* sock, hash* tuple_hash)
+bool uninstall_tuple(Socket* sock, hash* table)
 {
-    if (!sock->flag.is_hash) return true;
-    addr_tuple tuple = {0};
-    if (sock->family == AF_INET6) {
-        memcpy(tuple.s_key.addr6, sock->sip6, 16);
-        memcpy(tuple.d_key.addr6, sock->dip6, 16);
-        tuple.s_key.family = AF_INET6;
-        tuple.d_key.family = AF_INET6;
-    } else {
-        tuple.s_key.addr = sock->sip;
-        tuple.d_key.addr = sock->dip;
-        tuple.s_key.family = AF_INET;
-        tuple.d_key.family = AF_INET;
-    }
-    tuple.s_key.port = sock->sport;
-    tuple.d_key.port = sock->dport;
-
-    const uint32_t key_len = sizeof(addr_tuple);
-
-    uint32_t idx = general_hash_algorithm((uint8_t*)&tuple, key_len) % tuple_hash->size;
-    HASH_BUCKET_WRLOCK(tuple_hash, idx);
-
-    /* 1) 在写锁内定位 hash_data 以及链表头 head */
-    hash_data* data;
-    list_node* tmp;
-    hash_data* found = NULL;
-    list_node* head = NULL;
-    FOR_EACH_LIST_SAFE_OFFSET(tuple_hash->hash_lists[idx], data, tmp, hash_data, node) {
-        if (data->key_len == key_len && memcmp(data->key, (uint8_t*)&tuple, key_len) == 0) {
-            found = data;
-            head = (list_node*)data->element;
-            break;
-        }
-    }
-
-    if (!found || !head) {
+    if (!sock->flag.is_hash)
+        return true;
+    tuple_entry* entry = sock->tuple_entry;
+    if (!table || !entry) {
         ERR_LOG("uninstall_tuple: not found");
-        HASH_BUCKET_UNLOCK(tuple_hash, idx);
+        return false;
+    }
+
+    uint32_t index = hash_bucket_index(table, entry->hash_node.hash);
+    HASH_BUCKET_WRLOCK(table, index);
+
+    list_node* head = entry->sockets;
+    if (!entry->hash_node.pprev || !head) {
+        ERR_LOG("uninstall_tuple: entry is not in the tuple table");
+        HASH_BUCKET_UNLOCK(table, index);
         return false;
     }
 
@@ -966,32 +1012,43 @@ bool uninstall_tuple(Socket* sock, hash* tuple_hash)
     }
     if (!node_found) {
         ERR_LOG("uninstall_tuple: socket node is not in the tuple group");
-        HASH_BUCKET_UNLOCK(tuple_hash, idx);
+        HASH_BUCKET_UNLOCK(table, index);
         return false;
     }
 
-    /* 2) 从 reuseport 链表中删除 sock->tuple_node */
+    bool free_entry = false;
     if (head == &sock->tuple_node) {
         if (sock->tuple_node.next) {
-            /* 更新 hash 头为 next，然后摘除自身 */
-            found->element = (uint64_t)sock->tuple_node.next;
+            entry->sockets = sock->tuple_node.next;
             remove_list_node(&sock->tuple_node);
         } else {
-            /* 只有一个：删除该 key 的 hash_data */
-            remove_list_node(&found->node);
-            free(found);
+            hash_unlink_node_locked(&entry->hash_node);
+            free_entry = true;
         }
     } else {
-        /* 非头：直接摘除（假设 tuple_node 已在该链上） */
         remove_list_node(&sock->tuple_node);
     }
 
-    HASH_BUCKET_UNLOCK(tuple_hash, idx);
-
+    sock->tuple_entry = NULL;
     sock->flag.is_hash = 0;
+    HASH_BUCKET_UNLOCK(table, index);
+    if (free_entry)
+        free(entry);
     return true;
 }
 
+static void socket_set_bind_reservation(Socket* sock, const addr_key* key,
+                                        bind_slot* reservation)
+{
+    if (key->family == AF_INET6)
+        memcpy(sock->sip6, key->addr6, 16);
+    else
+        sock->sip = key->addr;
+    sock->sport = key->port;
+    sock->sip6_scope_id = key->family == AF_INET6 ? key->scope_id : 0;
+    sock->bind_reservation = reservation;
+    sock->flag.is_bound = 1;
+}
 
 bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table)
 {
@@ -1003,16 +1060,56 @@ bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table)
     if (!reservation)
         return false;
 
-    if (key->family == AF_INET6)
-        memcpy(sock->sip6, key->addr6, 16);
-    else
-        sock->sip = key->addr;
-    sock->sport = key->port;
-    sock->sip6_scope_id = key->family == AF_INET6 ? key->scope_id : 0;
-    sock->bind_reservation = reservation;
-    sock->flag.is_bound = 1;
+    socket_set_bind_reservation(sock, key, reservation);
     return true;
 }
+
+int socket_bind_local(Socket* sock, const struct sockaddr_in* addr,
+                      socklen_t addrlen, bind_table* bound_table)
+{
+    if (!addr)
+        return -EFAULT;
+    if (sock->flag.is_bound)
+        return -EINVAL;
+
+    bool is_v6 = sock->family == AF_INET6;
+    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
+    if (addrlen < (is_v6 ? sizeof(*addr6) : sizeof(*addr)))
+        return -EINVAL;
+    if (addr->sin_family != sock->family)
+        return -EAFNOSUPPORT;
+
+    const uint8_t* ip = is_v6 ? (const uint8_t*)&addr6->sin6_addr
+                              : (const uint8_t*)&addr->sin_addr.s_addr;
+    uint32_t scope_id = is_v6 ? addr6->sin6_scope_id : 0;
+    if (is_v6 && IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr) && !scope_id) {
+        DEBUG_LOG("IPv6 link-local bind requires a scope ID (e.g. fe80::1%%eth0)");
+        return -EINVAL;
+    }
+
+    static const uint8_t zero6[16];
+    bool any = is_v6 ? memcmp(ip, zero6, sizeof(zero6)) == 0
+                     : addr->sin_addr.s_addr == INADDR_ANY;
+    if (!any && !search_addr_exist(sock->family, ip, scope_id)) {
+        DEBUG_LOG("Bind address is not available for family=%d", sock->family);
+        return -EADDRNOTAVAIL;
+    }
+
+    addr_key key = {
+        .port = is_v6 ? addr6->sin6_port : addr->sin_port,
+        .family = sock->family,
+        .scope_id = scope_id,
+    };
+    if (is_v6)
+        memcpy(key.addr6, ip, sizeof(key.addr6));
+    else
+        memcpy(&key.addr, ip, sizeof(key.addr));
+
+    if (!key.port)
+        return socket_auto_bind(sock, bound_table, &key, NULL, 0, 0);
+    return bind_saddr(sock, &key, bound_table) ? 0 : -EADDRINUSE;
+}
+
 bool bind_exist(const addr_key* key, const bind_table* bound_table)
 {
     bind_slot* slot = bind_find(bound_table, key);
@@ -1033,75 +1130,59 @@ bool unbind_saddr(Socket* sock, bind_table* bound_table)
     return true;
 }
 
-Socket* search_socket_by_tuple(uint32_t saddr,uint16_t sport,uint32_t daddr,uint16_t dport,hash* hash, worker** socket_worker){
+Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport,
+                               uint32_t daddr, uint16_t dport,
+                               hash* table, worker** socket_worker)
+{
+    tuple_key4 key = {
+        .saddr = saddr,
+        .daddr = daddr,
+        .sport = sport,
+        .dport = dport,
+    };
+    uint32_t value = tuple_hash_value(&key, sizeof(key));
+    uint32_t index = hash_bucket_index(table, value);
+    HASH_BUCKET_RDLOCK(table, index);
 
-    addr_tuple tuple={0};
-    tuple.s_key.addr=saddr;
-    tuple.s_key.port=sport;
-    tuple.s_key.family=AF_INET;
-    tuple.d_key.addr=daddr;
-    tuple.d_key.port=dport;
-    tuple.d_key.family=AF_INET;
+    hash_node* hash_entry = hash_find_node_locked(table, index, &key, value);
+    tuple_entry* entry = hash_entry
+        ? HASH_CONTAINER_OF(hash_entry, tuple_entry, hash_node) : NULL;
+    list_node* socket_node = entry ? entry->sockets : NULL;
+    Socket* sock = socket_node
+        ? (Socket*)((uint8_t*)socket_node - offsetof(Socket, tuple_node)) : NULL;
+    if (socket_worker)
+        *socket_worker = sock ? sock->owner : NULL;
 
-    const uint32_t key_len = sizeof(addr_tuple);
-
-    uint32_t idx = general_hash_algorithm((uint8_t*)&tuple, key_len) % hash->size;
-    HASH_BUCKET_RDLOCK(hash, idx);
-
-    hash_data* data;
-    list_node* tmp;
-    FOR_EACH_LIST_SAFE_OFFSET(hash->hash_lists[idx], data, tmp, hash_data, node) {
-        if (data->key_len == key_len && memcmp(data->key, (uint8_t*)&tuple, key_len) == 0) {
-            list_node* node = (list_node*)data->element;
-            Socket* sock = node ? (Socket*)((uint8_t*)node - offsetof(Socket, tuple_node)) : NULL;
-            if (socket_worker) {
-                *socket_worker = sock ? sock->owner : NULL;
-            }
-            HASH_BUCKET_UNLOCK(hash, idx);
-            return sock;
-        }
-    }
-
-    HASH_BUCKET_UNLOCK(hash, idx);
-    if (socket_worker) {
-        *socket_worker = NULL;
-    }
-    return NULL;
+    HASH_BUCKET_UNLOCK(table, index);
+    return sock;
 }
 
 Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
                                 const uint8_t daddr[16], uint16_t dport,
-                                hash* hash, worker** socket_worker)
+                                hash* table, worker** socket_worker)
 {
-    addr_tuple tuple = {0};
-    memcpy(tuple.s_key.addr6, saddr, 16);
-    memcpy(tuple.d_key.addr6, daddr, 16);
-    tuple.s_key.port = sport;
-    tuple.d_key.port = dport;
-    tuple.s_key.family = AF_INET6;
-    tuple.d_key.family = AF_INET6;
+    tuple_key6 key = {
+        .sport = sport,
+        .dport = dport,
+    };
+    memcpy(key.saddr, saddr, sizeof(key.saddr));
+    memcpy(key.daddr, daddr, sizeof(key.daddr));
 
-    const uint32_t key_len = sizeof(tuple);
-    uint32_t idx = general_hash_algorithm((uint8_t*)&tuple, key_len) % hash->size;
-    HASH_BUCKET_RDLOCK(hash, idx);
+    uint32_t value = tuple_hash_value(&key, sizeof(key));
+    uint32_t index = hash_bucket_index(table, value);
+    HASH_BUCKET_RDLOCK(table, index);
 
-    hash_data* data;
-    list_node* tmp;
-    FOR_EACH_LIST_SAFE_OFFSET(hash->hash_lists[idx], data, tmp, hash_data, node) {
-        if (data->key_len == key_len &&
-            memcmp(data->key, &tuple, key_len) == 0) {
-            list_node* node = (list_node*)data->element;
-            Socket* sock = (Socket*)((uint8_t*)node - offsetof(Socket, tuple_node));
-            if (socket_worker)
-                *socket_worker = sock->owner;
-            HASH_BUCKET_UNLOCK(hash, idx);
-            return sock;
-        }
-    }
-    HASH_BUCKET_UNLOCK(hash, idx);
+    hash_node* hash_entry = hash_find_node_locked(table, index, &key, value);
+    tuple_entry* entry = hash_entry
+        ? HASH_CONTAINER_OF(hash_entry, tuple_entry, hash_node) : NULL;
+    list_node* socket_node = entry ? entry->sockets : NULL;
+    Socket* sock = socket_node
+        ? (Socket*)((uint8_t*)socket_node - offsetof(Socket, tuple_node)) : NULL;
     if (socket_worker)
-        *socket_worker = NULL;
-    return NULL;
+        *socket_worker = sock ? sock->owner : NULL;
+
+    HASH_BUCKET_UNLOCK(table, index);
+    return sock;
 }
 
 int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id)
@@ -1139,98 +1220,102 @@ static bool valid_timeval(const struct timeval* tv)
 int socket_setsockopt(struct Socket* sock, int level, int optname, const void* optval, socklen_t optlen){
     const int *ival = (const int *)optval;
     if(level!=SOL_SOCKET)
-        return -1;
+        return -ENOPROTOOPT;
     switch(optname){
         case SO_REUSEADDR: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             sock->options.reuseaddr = (*ival != 0);
             return 0;
         }
         case SO_REUSEPORT: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             sock->options.reuseport = (*ival != 0);
             return 0;
         }
         case SO_BROADCAST: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             sock->options.broadcast = (*ival != 0);
             return 0;
         }
         case SO_RCVBUF: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             int v = *ival;
             if (v < 0)
-                return -1;
+                return -EINVAL;
             sock->recv_buffer_len_max = (uint32_t)v;
             return 0;
         }
         case SO_SNDBUF: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             int v = *ival;
             if (v < 0)
-                return -1;
+                return -EINVAL;
             sock->send_buffer_len_max = (uint32_t)v;
             return 0;
         }
         case SO_RCVTIMEO: {
             if (optlen < (socklen_t)sizeof(struct timeval))
-                return -1;
+                return -EINVAL;
             const struct timeval* tv = optval;
             if (!valid_timeval(tv))
-                return -1;
+                return -EINVAL;
             sock->recv_timeout = *tv;
             sock->options.recv_timeout = tv->tv_sec != 0 || tv->tv_usec != 0;
             return 0;
         }
         case SO_SNDTIMEO: {
             if (optlen < (socklen_t)sizeof(struct timeval))
-                return -1;
+                return -EINVAL;
             const struct timeval* tv = optval;
             if (!valid_timeval(tv))
-                return -1;
+                return -EINVAL;
             sock->send_timeout = *tv;
             sock->options.send_timeout = tv->tv_sec != 0 || tv->tv_usec != 0;
             return 0;
         }
         case SO_KEEPALIVE: {
             if (optlen < (socklen_t)sizeof(int))
-                return -1;
+                return -EINVAL;
             sock->options.keepalive = (*ival != 0);
             return 0;
         }
         case SO_LINGER: {
            
             if (optlen < (socklen_t)sizeof(struct linger))
-                return -1;
+                return -EINVAL;
             const struct linger* linger = optval;
             if (linger->l_linger < 0)
-                return -1;
+                return -EINVAL;
             sock->options.linger = linger->l_onoff != 0;
             sock->linger_seconds = linger->l_linger;
             return 0;
         }
         default:
-            return -1;
+            return -ENOPROTOOPT;
     }  
 }
 
-/* SOL_SOCKET getsockopt helper: return 0 on success, -1 on failure.
+/* SOL_SOCKET getsockopt helper: return 0 on success, negative errno on failure.
  * Caller must pass in/out optlen like standard getsockopt.
  */
 int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval, socklen_t* optlen)
 {
-    if (!sock || level != SOL_SOCKET || !optval || !optlen || *optlen == 0)
-        return -1;
+    if (!sock || !optval || !optlen)
+        return -EFAULT;
+    if (level != SOL_SOCKET)
+        return -ENOPROTOOPT;
+    if (*optlen == 0)
+        return -EINVAL;
 
     socklen_t len = *optlen;
     switch (optname) {
     case SO_ERROR: {
-        if (len < (socklen_t)sizeof(int)) return -1;
+        if (len < (socklen_t)sizeof(int)) return -EINVAL;
         int err = sock->error;
         sock->error = 0; /* consume */
         memcpy(optval, &err, sizeof(int));
@@ -1241,7 +1326,7 @@ int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval,
     case SO_REUSEPORT:
     case SO_BROADCAST:
     case SO_KEEPALIVE: {
-        if (len < (socklen_t)sizeof(int)) return -1;
+        if (len < (socklen_t)sizeof(int)) return -EINVAL;
         int v = 0;
         if (optname == SO_REUSEADDR) v = sock->options.reuseaddr;
         else if (optname == SO_REUSEPORT) v = sock->options.reuseport;
@@ -1252,33 +1337,33 @@ int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval,
         return 0;
     }
     case SO_RCVBUF: {
-        if (len < (socklen_t)sizeof(int)) return -1;
+        if (len < (socklen_t)sizeof(int)) return -EINVAL;
         int v = (int)sock->recv_buffer_len_max;
         memcpy(optval, &v, sizeof(int));
         *optlen = (socklen_t)sizeof(int);
         return 0;
     }
     case SO_SNDBUF: {
-        if (len < (socklen_t)sizeof(int)) return -1;
+        if (len < (socklen_t)sizeof(int)) return -EINVAL;
         int v = (int)sock->send_buffer_len_max;
         memcpy(optval, &v, sizeof(int));
         *optlen = (socklen_t)sizeof(int);
         return 0;
     }
     case SO_RCVTIMEO: {
-        if (len < (socklen_t)sizeof(struct timeval)) return -1;
+        if (len < (socklen_t)sizeof(struct timeval)) return -EINVAL;
         memcpy(optval, &sock->recv_timeout, sizeof(struct timeval));
         *optlen = (socklen_t)sizeof(struct timeval);
         return 0;
     }
     case SO_SNDTIMEO: {
-        if (len < (socklen_t)sizeof(struct timeval)) return -1;
+        if (len < (socklen_t)sizeof(struct timeval)) return -EINVAL;
         memcpy(optval, &sock->send_timeout, sizeof(struct timeval));
         *optlen = (socklen_t)sizeof(struct timeval);
         return 0;
     }
     case SO_LINGER: {
-        if (len < (socklen_t)sizeof(struct linger)) return -1;
+        if (len < (socklen_t)sizeof(struct linger)) return -EINVAL;
         struct linger l = {0};
         l.l_onoff = sock->options.linger ? 1 : 0;
         l.l_linger = sock->linger_seconds;
@@ -1287,42 +1372,61 @@ int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval,
         return 0;
     }
     default:
-        return -1;
+        return -ENOPROTOOPT;
     }
 }
 
 int socket_auto_bind(Socket* sock, bind_table* bound_table,
-                      const uint8_t* dest_ip, uint16_t dest_port,
-                      uint32_t scope_id)
+                     const addr_key* local_key, const uint8_t* dest_ip,
+                     uint16_t dest_port, uint32_t scope_id)
 {
-    if (set_socket_route(sock, dest_ip, scope_id) < 0) {
-        DEBUG_LOG("Failed to set Socket route for connect");
-        return -1;
+    if (!sock || !bound_table || sock->bind_reservation ||
+        (local_key && (local_key->port || local_key->family != sock->family)))
+        return -EINVAL;
+
+    addr_key key = {0};
+    if (local_key) {
+        key = *local_key;
+    } else {
+        if (!dest_ip || set_socket_route(sock, dest_ip, scope_id) < 0) {
+            DEBUG_LOG("Failed to set Socket route for auto bind");
+            return -EHOSTUNREACH;
+        }
+        key.family = sock->family;
+        key.scope_id = scope_id;
+        if (!if_search_best_saddr_by_daddr(sock->route->if_info, sock->family,
+                                           dest_ip, key.addr6)) {
+            DEBUG_LOG("Failed to find suitable source IP for destination");
+            return -EADDRNOTAVAIL;
+        }
     }
 
-    addr_key key = {
-        .family = sock->family,
-        .scope_id = scope_id,
-    };
-    if (!if_search_best_saddr_by_daddr(sock->route->if_info, sock->family,
-                                      dest_ip, key.addr6)) {
-        DEBUG_LOG("Failed to find suitable source IP for destination");
-        return -1;
-    }
-
+    bool reuse = !local_key &&
+        (sock->options.reuseaddr || sock->options.reuseport);
     uint32_t first = get_current_time_ms() % EPHEMERAL_PORT_COUNT;
     for (uint32_t i = 0; i < EPHEMERAL_PORT_COUNT; i++) {
         uint32_t host_port = EPHEMERAL_PORT_FIRST +
             (first + i) % EPHEMERAL_PORT_COUNT;
         key.port = htons((uint16_t)host_port);
 
-        if (!bind_saddr(sock, &key, bound_table))
+        if (dest_ip) {
+            /* When the peer is known, keep the final tuple on this worker. */
+            worker* tuple_worker = select_worker_by_tuple(sock->family,
+                key.addr6, dest_ip, key.port, dest_port);
+            if (tuple_worker != get_current_worker())
+                continue;
+        }
+
+        bind_slot* reservation = bind_reserve(bound_table, &key, reuse);
+        if (!reservation)
             continue;
-        if (sock->family == AF_INET6)
+
+        socket_set_bind_reservation(sock, &key, reservation);
+        if (!local_key && sock->family == AF_INET6)
             sock->sip6_scope_id = scope_id ? scope_id : sock->route->ifindex;
         return 0;
     }
-    return -1;
+    return -EADDRINUSE;
 }
 void destroy_socket(Socket* sock){
     destroy_task(sock->pending_task);
@@ -1347,7 +1451,7 @@ void destroy_socket(Socket* sock){
         PUT_REF(skb);
     }
     PUT_REF(sock->route);
-    free(sock); 
+    free(sock);
 }
 
 Socket* socket_select(Socket* first_sock, uint32_t hash){
@@ -1385,7 +1489,6 @@ void socket_detach_with_fd_entry(Socket* sock){
     if(!entry){
         return;
     }
-    int sockfd = entry->fd ;
     entry->value = NULL;
     sock->fd_entry = NULL;
 
@@ -1393,16 +1496,15 @@ void socket_detach_with_fd_entry(Socket* sock){
     list_node* t;
     FOR_EACH_LIST_SAFE_OFFSET(&sock->pending, pn, t, pending_node, node) {
         remove_list_node(&pn->node);
+#ifdef TEST_EPOLL
         if (pn->cb == epoll_pending_cb) {
             net_epoll_item* it = (net_epoll_item*)pn->value;
             net_epoll* ep = it->ep;
-
-            if (!hash_del(ep->registered_sockfds, (uint8_t*)&sockfd,
-                          sizeof(sockfd))) {
-                ERR_LOG("hash_del");
-            }
+            hash_del_node(ep->registered_sockfds, &it->hash_node);
             epoll_item_unregister(it);
-        } else if (pn->cb == req_pending_cb) {
+        } else
+#endif
+        if (pn->cb == req_pending_cb) {
             /* Req waiter: notify failure */
             req* r = (req*)pn->value;
             req_fail(r, EBADF);

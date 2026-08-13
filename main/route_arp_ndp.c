@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <linux/neighbour.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -83,19 +84,6 @@ static bool ndp_entry_usable(const ndp_info* entry)
                             NUD_PROBE | NUD_PERMANENT | NUD_NOARP)) != 0;
 }
 
-static bool probe_ifname_safe(const char* name)
-{
-    if (!name || !name[0])
-        return false;
-    for (const char* p = name; *p; ++p) {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' ||
-              *p == '.' || *p == ':'))
-            return false;
-    }
-    return true;
-}
-
 static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
                                    uint32_t ifindex)
 {
@@ -115,8 +103,7 @@ static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
         allowed = arp_ping_allowed(ip4, ifindex, now_ms);
     }
 
-    if (allowed && probe_ifname_safe(info->name) &&
-        inet_ntop(family, ip, ip_str, sizeof(ip_str))) {
+    if (allowed && inet_ntop(family, ip, ip_str, sizeof(ip_str))) {
         int len = family == AF_INET6
             ? snprintf(cmd, sizeof(cmd),
                        "ping -6 -I %s -c 1 -W 1 %s >/dev/null 2>&1 &",
@@ -216,13 +203,32 @@ ndp_info* search_ndp_table(const ndp_key* key)
         return NULL;
     }
 
-    if (ret && !ndp_entry_usable((ndp_info*)ret)) {
-        PUT_REF((ndp_info*)ret);
-        ret = 0;
-    }
-    if (!ret && key->ifindex)
-        trigger_neighbor_probe(key->ip_family, key->neigh_ip, key->ifindex);
     return (ndp_info*)ret;
+}
+
+int resolve_neighbor_entry(const ndp_key* key, ndp_info** result)
+{
+    if (result)
+        *result = NULL;
+
+    ndp_info* entry = search_ndp_table(key);
+    if (entry && (entry->state & NUD_FAILED)) {
+        PUT_REF(entry);
+        return -EHOSTUNREACH;
+    }
+
+    if (ndp_entry_usable(entry)) {
+        if (result)
+            *result = entry;
+        else
+            PUT_REF(entry);
+        return 0;
+    }
+
+    PUT_REF(entry);
+    if (key->ifindex)
+        trigger_neighbor_probe(key->ip_family, key->neigh_ip, key->ifindex);
+    return -EINPROGRESS;
 }
 
 static route_info* create_route_info(const route_info* info)

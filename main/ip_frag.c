@@ -53,8 +53,7 @@ static ipq* create_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t proto
     new_ipq->key.protocol=protocol;
 
     update_ipq_timer(new_ipq);
-    if (!hash_add(h, (const uint8_t*)&new_ipq->key, sizeof(new_ipq->key),
-                  (uint64_t)new_ipq)) {
+    if (!hash_add_node(h, &new_ipq->hash_node)) {
         free(new_ipq);
         return NULL;
     }
@@ -64,7 +63,7 @@ static void destroy_ipq(ipq* ipq){
     hash* h = get_ipq_hash();
 
     //DEBUG_LOG("Destroying IPQ: id=%u src=" IP_STR " dst=" IP_STR " proto=%u", ipq->key.id, IP_ARG(ipq->key.src_ip), IP_ARG(ipq->key.dst_ip), ipq->key.protocol);
-    hash_del(h,(uint8_t*)&ipq->key,sizeof(ipq_key));
+    hash_del_node(h, &ipq->hash_node);
     list_node* node;
     list_node* tmp;
     FOR_EACH_LIST_SAFE(&ipq->frag_head, node, tmp){
@@ -84,27 +83,26 @@ static ipq* search_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t proto
     key.src_ip=src_ip;
     key.dst_ip=dst_ip;
     key.protocol=protocol;
-    uint8_t* key_ptr=(uint8_t*)&key;
-    uint32_t key_len=sizeof(ipq_key);
-    uint64_t element=hash_get_element(h,key_ptr,key_len);
-    if(element){
-        return (ipq*)element;
-    }
-    return NULL;
+    hash_node* node = hash_find_node(h, &key);
+    return node ? HASH_CONTAINER_OF(node, ipq, hash_node) : NULL;
 }
 
 
 
-static void ipq_walk_cb(uint64_t element){
-    ipq* ipq_ptr = (ipq*)element;
-    if ((uint32_t)(get_current_time_ms() - ipq_ptr->last_update_time) > IPQ_TIMEOUT) {
-        destroy_ipq(ipq_ptr);
-    }
-}
 void ipq_timer(task* tk){
     hash* h = get_ipq_hash();
 
-    HASH_ELEMENT_WALK(h, ipq_walk_cb);
+    for (uint32_t i = 0; i < h->size; i++) {
+        hash_node* node = h->buckets[i];
+        while (node) {
+            hash_node* next = node->next;
+            ipq* queue = HASH_CONTAINER_OF(node, ipq, hash_node);
+            if ((uint32_t)(get_current_time_ms() - queue->last_update_time) >
+                IPQ_TIMEOUT)
+                destroy_ipq(queue);
+            node = next;
+        }
+    }
 
     update_task_timer(tk, get_current_time_ms() + IPQ_TIMER_INTERVAL);
 }

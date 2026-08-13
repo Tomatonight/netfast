@@ -67,6 +67,7 @@ typedef ndp_key  arp_key;
 
 route_info* search_route_table(const route_key* key);
 ndp_info*   search_ndp_table(const ndp_key* key);
+int         resolve_neighbor_entry(const ndp_key* key, ndp_info** result);
 bool        search_best_saddr_by_daddr(const route_key* key, route_key* answer);
 
 int route_add_entry(const route_info* info);

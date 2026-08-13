@@ -130,11 +130,17 @@ int ether_send(if_info* info, skbuff* skb)
             memcpy(nkey.neigh_ip, &skb->ipv4_hdr->daddr, sizeof(zero4));
     }
 
-    arp_info* neighbor = search_ndp_table(&nkey);
-    if (!neighbor) {
-        DEBUG_LOG("No neighbor entry for next hop, family=%d ifindex=%u",
+    arp_info* neighbor = NULL;
+    int ret = resolve_neighbor_entry(&nkey, &neighbor);
+    if (ret == -EINPROGRESS) {
+        DEBUG_LOG("Neighbor resolution pending; dropping packet, family=%d ifindex=%u",
                   skb->family, info->ifindex);
-        return -EHOSTUNREACH;
+        return 0;
+    }
+    if (ret < 0) {
+        DEBUG_LOG("Neighbor resolution failed, family=%d ifindex=%u",
+                  skb->family, info->ifindex);
+        return ret;
     }
 
     ether_hdr* eth = (ether_hdr*)skb_data_push(skb, sizeof(ether_hdr));
@@ -177,4 +183,3 @@ const if_ops ether_ops={
     .up=ether_up,
     .down=ether_down,
 };
-

@@ -8,7 +8,6 @@
 #include <cjson/cJSON.h>
 
 #include "log.h"
-#include "rss.h"
 #include "worker.h"
 #include "ip.h"
 #include "ipv6.h"
@@ -125,13 +124,14 @@ int cfg_get_if_queues(const char *ifname)
 int configure_init(void)
 {
     g_config new_cfg = {0};
-    new_cfg.ipv4_forward = true;   /* default enabled */
-    new_cfg.ipv6_forward = true;
     cJSON *root = NULL;
     int ret = -1;
-    const char *config_path = NETFAST_CONFIG_FILE;
-
+    const char *config_path = NETFAST_LOCAL_CONFIG_FILE;
     FILE *fp = fopen(config_path, "rb");
+    if (!fp && errno == ENOENT) {
+        config_path = NETFAST_CONFIG_FILE;
+        fp = fopen(config_path, "rb");
+    }
     if (!fp) {
         ERR_LOG("configure_init: cannot open file %s", config_path);
         return -1;
@@ -218,40 +218,6 @@ int configure_init(void)
 
     if (parse_open_if(root, &new_cfg) != 0)
         goto out;
-
-    cJSON *fw4 = cJSON_GetObjectItem(root, "ipv4_forward");
-    if (fw4 && cJSON_IsBool(fw4))
-        new_cfg.ipv4_forward = cJSON_IsTrue(fw4);
-
-    cJSON *fw6 = cJSON_GetObjectItem(root, "ipv6_forward");
-    if (fw6 && cJSON_IsBool(fw6))
-        new_cfg.ipv6_forward = cJSON_IsTrue(fw6);
-
-    cJSON *rss_key = cJSON_GetObjectItem(root, "toeplitz_rss_key");
-    if (rss_key && cJSON_IsString(rss_key) && rss_key->valuestring) {
-        const char *hex = rss_key->valuestring;
-        /* 跳过前导空白 */
-        while (*hex == ' ' || *hex == '\t' || *hex == '\n' || *hex == '\r')
-            ++hex;
-        /* 解析十六进制字符串，直接覆写 TOEPLITZ_RSS_DEFAULT_KEY */
-        for (uint32_t i = 0; i < TOEPLITZ_RSS_KEY_LEN; ++i) {
-            int high = -1, low = -1;
-            if (*hex >= '0' && *hex <= '9')       high = *hex - '0';
-            else if (*hex >= 'a' && *hex <= 'f')  high = 10 + *hex - 'a';
-            else if (*hex >= 'A' && *hex <= 'F')  high = 10 + *hex - 'A';
-            ++hex;
-            if (*hex >= '0' && *hex <= '9')       low = *hex - '0';
-            else if (*hex >= 'a' && *hex <= 'f')  low = 10 + *hex - 'a';
-            else if (*hex >= 'A' && *hex <= 'F')  low = 10 + *hex - 'A';
-            ++hex;
-            if (high < 0 || low < 0) {
-                errno = EINVAL;
-                ERR_LOG("configure_init: toeplitz_rss_key hex parse error at byte %u", i);
-                goto out;
-            }
-            TOEPLITZ_RSS_DEFAULT_KEY[i] = (uint8_t)((high << 4) | low);
-        }
-    }
 
     free(g_cfg.ifs);
     g_cfg = new_cfg;

@@ -2,6 +2,7 @@
 #define IP_FRAG
 
 #include "ip.h"
+#include "hash.h"
 #include "list.h"
 
 typedef struct skbuff skbuff;
@@ -21,6 +22,7 @@ typedef struct ipq_key{
 
 typedef struct ipq{
     ipq_key key;
+    hash_node hash_node;
     uint32_t total_len;       /* payload total length (bytes), not include ip header */
     uint32_t received_len;    /* received payload bytes */
     uint32_t last_update_time;

@@ -136,8 +136,6 @@ int worker_detach(worker *w)
 }
 
 static __thread worker *current_worker = NULL;
-static __thread uint32_t random_state
-    __attribute__((tls_model("initial-exec")));
 
 worker *get_current_worker(void)
 {

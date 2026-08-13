@@ -8,7 +8,9 @@
 #include "worker.h"
 #include "req.h"
 #include "socket.h"
+#ifdef TEST_EPOLL
 #include "req_epoll.h"
+#endif
 #include "udp.h"
 #include "xdp.h"
 #include "fd_entry.h"
@@ -23,16 +25,14 @@ stack_maps* g_stack_maps;
 void process_request(req *r)
 {
     if(r->flag.async_cancel){
-        r->saved_errno = ECANCELED;
-        req_notify(r, -1);
+        req_notify(r, -ECANCELED);
         return;
     }
     fd_entry* sock_entry=get_sock_entry_by_req(r);
     if(sock_entry){
         worker* entry_worker = fd_entry_get_worker(sock_entry);
         if (!entry_worker) {
-            r->saved_errno = EBADF;
-            req_notify(r, -1);
+            req_notify(r, -EBADF);
             return;
         }
         if(entry_worker != get_current_worker()){
@@ -93,15 +93,16 @@ void process_request(req *r)
     case REQ_POLL:
         _poll(r);
         break;
+#ifdef TEST_EPOLL
     case REQ_EPOLL_CTL:
         _epoll_ctl(r);
         break;
+#endif
     case REQ_WORKER_REQ:
         process_submit_req(r);
         break;
     default:
-        r->saved_errno = EINVAL;
-        req_notify(r, -1);
+        req_notify(r, -EINVAL);
         break;
     }
 }
@@ -128,6 +129,7 @@ static void req_task_cb(task *t)
 }
 
 #define PKT_TASK_BUDGET 1024u
+#define TUPLE_BUCKET_COUNT (128U * 1024U)
 
 static void time_task_cb(task* t)
 {
@@ -165,12 +167,12 @@ static int stack_maps_init(void)
 
     maps->udp.bound_table4 = bind_table_create();
     maps->udp.bound_table6 = bind_table_create();
-    maps->udp.tuple_hash4 = hash_create_safe(1024 * 16);
-    maps->udp.tuple_hash6 = hash_create_safe(1024 * 16);
+    maps->udp.tuple_hash4 = tuple_hash_create(TUPLE_BUCKET_COUNT, AF_INET);
+    maps->udp.tuple_hash6 = tuple_hash_create(TUPLE_BUCKET_COUNT, AF_INET6);
     maps->tcp.bound_table4 = bind_table_create();
     maps->tcp.bound_table6 = bind_table_create();
-    maps->tcp.tuple_hash4 = hash_create_safe(1024 * 16);
-    maps->tcp.tuple_hash6 = hash_create_safe(1024 * 16);
+    maps->tcp.tuple_hash4 = tuple_hash_create(TUPLE_BUCKET_COUNT, AF_INET);
+    maps->tcp.tuple_hash6 = tuple_hash_create(TUPLE_BUCKET_COUNT, AF_INET6);
 
     if (!maps->udp.bound_table4 || !maps->udp.bound_table6 ||
         !maps->udp.tuple_hash4 || !maps->udp.tuple_hash6 ||
@@ -236,7 +238,8 @@ int stack_instance_init(stack_instance *s, thread *master)
     if (register_task(master, s->time_task) < 0)
         goto fail;
 
-    s->ipq_hash = hash_create(1024);
+    s->ipq_hash = hash_create(1024,
+        HASH_KEY_OFFSET(ipq, hash_node, key), sizeof(ipq_key));
     if (!s->ipq_hash)
         goto fail;
 
@@ -249,7 +252,8 @@ int stack_instance_init(stack_instance *s, thread *master)
     if (register_task(master, s->ipq_timer_task) < 0)
         goto fail;
 
-    s->ipq6_hash = hash_create(1024);
+    s->ipq6_hash = hash_create(1024,
+        HASH_KEY_OFFSET(ipq6, hash_node, key), sizeof(ipq6_key));
     if (!s->ipq6_hash)
         goto fail;
 
@@ -300,6 +304,8 @@ void req_pending_cb(Socket* sock, void* value, enum notify_event event)
 {
     (void)sock;
     req* r = (req*)value;
+    if (r->status == REQ_WAITING_CLOSE)
+        return;
     req_status expected = notify_event_to_status(event);
     if (expected != REQ_STATUS_ALL && !(r->status & expected))
         return;
@@ -333,8 +339,7 @@ void wait_until(Socket *sock, req *r, req_status status, uint64_t expire)
 	if (!r->timeout_task) {
 		r->timeout_task = create_task(TASK_TYPE_TIMER);
         if (!r->timeout_task) {
-            r->saved_errno = ENOMEM;
-            req_notify(r, -1);
+            req_notify(r, -ENOMEM);
             return;
         }
     }
@@ -345,8 +350,7 @@ void wait_until(Socket *sock, req *r, req_status status, uint64_t expire)
 	if (!r->worker || register_task(r->worker->master, r->timeout_task) < 0) {
         destroy_task(r->timeout_task);
         r->timeout_task = NULL;
-        r->saved_errno = EIO;
-        req_notify(r, -1);
+        req_notify(r, -EIO);
         return;
     }
 

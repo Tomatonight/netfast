@@ -1,5 +1,6 @@
 #ifndef REQ_H
 #define REQ_H
+#include <limits.h>
 #include <stddef.h> 
 #include <sys/types.h> 
 #include <pthread.h>
@@ -13,7 +14,7 @@
 #include "thread.h"
 #include "list.h"
 
-#define REQ_UNSUPPORTED -0x12345
+#define REQ_PENDING INT_MIN
 
 typedef struct Socket Socket;
 typedef struct worker worker;
@@ -40,7 +41,9 @@ typedef enum req_type {
 
     REQ_POLL,
 
+#ifdef TEST_EPOLL
     REQ_EPOLL_CTL,
+#endif
     REQ_WORKER_REQ,
 
 } req_type;
@@ -51,7 +54,8 @@ typedef enum req_status {
     REQ_WAITING_WRITE   = (1 << 1),
     REQ_WAITING_CONNECT = (1 << 2),
     REQ_WAITING_ACCEPT  = (1 << 3),
-    REQ_COMPLETED       = (1 << 4),
+    REQ_WAITING_CLOSE   = (1 << 4),
+    REQ_COMPLETED       = (1 << 5),
 } req_status;
 
 #define REQ_STATUS_ALL  ((req_status)0xFFFFFFFF)
@@ -74,8 +78,8 @@ typedef struct req {
         fd_entry* entry;
     }async;
 
-    int ret;
-    int saved_errno; 
+    int async_fd;
+    int ret;                    /* success value or negative errno */
 
     struct {
         uint32_t no_wait     : 1;  /* 1=push 方不阻塞等待结果 */
@@ -191,12 +195,14 @@ typedef struct req {
             void* cb_argv;
         } poll;
 
+#ifdef TEST_EPOLL
         struct {
             fd_entry* entry;       /* socket fd_entry (for worker routing) */
             fd_entry* ep_entry;    /* epoll fd_entry */
             int       op;
             struct epoll_event event;
         } epoll_ctl;
+#endif
 
         struct {
             fd_entry* entry;
@@ -262,9 +268,4 @@ int net_close(int fd);
 int net_shutdown(int fd, int how);
 int net_listen(int fd, int backlog);
 int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
-int net_epoll_create(void);
-int net_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event);
-int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
-                   int timeout_ms);
-
 #endif
