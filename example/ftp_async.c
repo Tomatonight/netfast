@@ -599,11 +599,11 @@ static void handle_command(ftp_session *session, char *line)
     } else if (strcasecmp(line, "SIZE") == 0) {
         char path[PATH_MAX];
         struct stat status;
-        char reply[128];
         if (!safe_filename(argument) || make_path(session, argument, path) < 0 ||
             stat(path, &status) != 0 || status.st_size < 0) {
             (void)submit_reply(session, "550 File unavailable\r\n", FTP_REPLY_READ_NEXT);
         } else {
+            char reply[128];
             snprintf(reply, sizeof(reply), "213 %lld\r\n",
                      (long long)status.st_size);
             (void)submit_reply(session, reply, FTP_REPLY_READ_NEXT);
@@ -837,7 +837,9 @@ static void complete_data_getsockname(ftp_op *op, int result, int saved_errno)
         const uint8_t *ip = (const uint8_t *)&session->server->listen_addr.sin_addr;
         snprintf(reply, sizeof(reply),
                  "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u)\r\n",
-                 ip[0], ip[1], ip[2], ip[3], port >> 8, port & 0xffu);
+                 (unsigned)ip[0], (unsigned)ip[1],
+                 (unsigned)ip[2], (unsigned)ip[3],
+                 (unsigned)(port >> 8), (unsigned)(port & 0xffu));
     }
     if (submit_data_accept(session) != 0 ||
         submit_reply(session, reply, FTP_REPLY_READ_NEXT) != 0) {
@@ -950,7 +952,7 @@ static void dispatch_completion(net_async_req *request)
         g_server.stop = true;
         return;
     }
-    int result = net_async_req_result(request);
+    int result = request->ret;
     int saved_errno = result < 0 ? -result : 0;
     op_unlink(op);
     op->request = NULL;

@@ -74,16 +74,6 @@ void destroy_list_node(list_node* destroy, void (*free_element)(uint64_t))
 	free(destroy);
 }
 
-bool list_node_exist(list_node* head, list_node* node)
-{
-	list_node* tmp;
-	FOR_EACH_LIST(head, tmp) {
-		if (tmp == node)
-			return true;
-	}
-	return false;
-}
-
 bool list_element_exist(list_node* head, uint64_t element)
 {
 	list_node* tmp;

@@ -45,8 +45,6 @@ int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
  * and call net_async_req_destroy().  A completed request result is
  * non-negative on success and -errno on failure.  All pointed-to buffers must
  * remain valid until completion. */
-typedef struct req net_async_req;
-
 typedef enum net_async_op {
     NET_ASYNC_SOCKET = 1,
     NET_ASYNC_BIND,
@@ -66,12 +64,14 @@ typedef enum net_async_op {
     NET_ASYNC_FCNTL,
 } net_async_op;
 
+typedef struct net_async_req {
+    int type;       /* net_async_op */
+    int async_fd;   /* fd supplied when the request was created */
+    int ret;        /* non-negative result or -errno after completion */
+} net_async_req;
+
 net_async_req *net_async_req_create(int fd, int operation, ...);
 void net_async_req_destroy(net_async_req *request);
-/* Returns the completed operation result directly: non-negative on success,
- * or -errno on failure.  Returns -EINVAL if request is not a detached
- * completion. */
-int net_async_req_result(const net_async_req *request);
 int net_async_create(void);
 int net_async_submit(int cq_fd, net_async_req *request);
 /* Submit requests in array order.  On success, returns the number submitted

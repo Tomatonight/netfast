@@ -77,10 +77,6 @@ data_info* create_data_info(frame_slot* slot, uint32_t start, uint32_t end);
 void copy_data_info(data_info* dst, const data_info* src);
 
 frame_slot* frame_slot_alloc(uint32_t min_data_len);
-uint32_t frame_slot_alloc_batch(frame_slot** out, uint32_t max,
-                                uint32_t min_data_len);
-frame_slot* frame_slot_init_rx(void* frame, uint8_t* data,
-                               uint32_t data_len);
 uint32_t frame_rx_headroom(void);
 
 void frame_global_cache_init(void);

@@ -37,6 +37,7 @@ extern protocol_ops tcp_protocol_ops;
 #define TCP_FINWAIT2_TIMEOUT_MS_DEFAULT    60000u
 #define TCP_DELACK_TIMEOUT_MS_DEFAULT       40u
 #define TCP_NAGLE_INTERVAL_MS_DEFAULT      10u
+#define TCP_CORK_TIMEOUT_MS_DEFAULT         200u
 #define TCP_OUTPUT_BURST_MAX                64u
 #define TCP_KEEPALIVE_RETRY_TIMEOUT_MS_DEFAULT  1000u
 #define TCP_CONNECT_TIMEOUT_MS_DEFAULT      1000u
@@ -147,7 +148,7 @@ typedef struct tcp_pcb{
     uint32_t rcv_wnd;  // receiver window advertised (接收窗口大小，将通告给发送方)
     //uint32_t rcv_wnd_max;  // maximum receiver window (最大接收窗�?
     //uint32_t rcv_adv;  // advertised right edge (已通告的右边界=最大可接收序号+1)
-    uint32_t rcv_mss;
+    uint32_t rcv_mss; // local MSS advertised to the peer
 
     uint32_t last_ack;
     uint32_t last_ack_repeat;
@@ -161,7 +162,8 @@ typedef struct tcp_pcb{
 
     uint32_t snd_wl1;// seq number of last window update (上次窗口更新的序号，用于判断窗口更新是否过时)
     uint32_t snd_wl2;// 上一次“窗口更新”时记录的对端报�?ACK
-    uint32_t snd_mss; // 最大报文段长度（Maximum Segment Size），通常在连接建立时协商确定，表�?TCP 数据部分的最大字节数（不包括 TCP/IP 头部�?
+    uint32_t peer_mss; // MSS advertised by the peer (or protocol default)
+    uint32_t snd_mss; // effective outbound MSS, limited by peer MSS and path MTU
     uint8_t snd_wnd_scale;
     uint8_t rcv_wnd_scale;
     uint32_t backlog;
@@ -183,10 +185,7 @@ typedef struct tcp_pcb{
         uint32_t peer_wnd_scale_ok:1; // 对端在 SYN/SYN-ACK 中提供 Window Scale
     } tcp_flag;
     struct {
-        uint32_t nodelay : 1;      /* TCP_NODELAY */
         uint32_t cork : 1;         /* TCP_CORK */
-        uint32_t quickack : 1;     /* TCP_QUICKACK */
-        
     } tcp_options;
 
     uint32_t ca_recovery_seq; /* snd_nxt snapshot on entering recovery */

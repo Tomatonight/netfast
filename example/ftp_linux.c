@@ -164,8 +164,10 @@ static int start_passive(const ftp_server *server, int control_fd,
         const uint8_t *ip = (const uint8_t *)&address.sin_addr;
         snprintf(reply, sizeof(reply),
                  "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u)\r\n",
-                 ip[0], ip[1], ip[2], ip[3], server->passive_port >> 8,
-                 server->passive_port & 0xff);
+                 (unsigned)ip[0], (unsigned)ip[1],
+                 (unsigned)ip[2], (unsigned)ip[3],
+                 (unsigned)(server->passive_port >> 8),
+                 (unsigned)(server->passive_port & 0xffu));
     }
     if (send_reply(control_fd, reply) != 0) {
         int saved_errno = errno;
@@ -351,7 +353,6 @@ static int serve_session(const ftp_server *server, int control_fd)
                    strcasecmp(line, "EPSV") == 0) {
             if (passive_fd >= 0) {
                 close(passive_fd);
-                passive_fd = -1;
             }
             passive_fd = start_passive(server, control_fd,
                                        strcasecmp(line, "EPSV") == 0);
@@ -373,7 +374,7 @@ static int serve_session(const ftp_server *server, int control_fd)
         } else if (strcasecmp(line, "SIZE") == 0) {
             result = file_size(server, control_fd, argument);
         } else if (strcasecmp(line, "QUIT") == 0) {
-            result = send_reply(control_fd, "221 Goodbye\r\n");
+            (void)send_reply(control_fd, "221 Goodbye\r\n");
             break;
         } else {
             result = send_reply(control_fd, "502 Command not implemented\r\n");

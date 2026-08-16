@@ -242,57 +242,6 @@ static bool xdp_frame_pool_push_idx(uint32_t frame_idx)
     return true;
 }
 
-/* ── Public API: pointer interface, index-based MPMC ring internally. ── */
-uint32_t xdp_frame_alloc_batch(void **out, uint32_t max)
-{
-    uint32_t got = 0;
-
-    while (got < max) {
-        uint32_t idx;
-        if (!xdp_frame_pool_pop_idx(&idx))
-            break;
-        out[got++] = idx_to_ptr(idx);
-    }
-
-    return got;
-}
-
-uint32_t xdp_frame_free_batch(void *const *frames, uint32_t n)
-{
-
-    uint32_t pushed = 0;
-
-    for (uint32_t i = 0; i < n; ++i) {
-        if (!xdp_frame_ptr_valid(frames[i])) {
-            ERR_LOG("xdp: invalid frame pointer=%p\n", frames[i]);
-            continue;
-        }
-
-        uint32_t idx = ptr_to_idx(frames[i]);
-        if (!xdp_frame_pool_push_idx(idx)) {
-            ERR_LOG("xdp: frame pool push failed idx=%u; "
-                    "possible duplicate free or pool corruption\n", idx);
-            continue;
-        }
-
-        pushed++;
-    }
-
-    return pushed;
-}
-
-uint32_t xdp_frame_pool_available(void)
-{
-    uint64_t enqueue = atomic_load_explicit(&g_xdp_frame_pool.enqueue_pos,
-                                            memory_order_acquire);
-    uint64_t dequeue = atomic_load_explicit(&g_xdp_frame_pool.dequeue_pos,
-                                            memory_order_acquire);
-    uint64_t available = enqueue - dequeue;
-    if (available > g_xdp_frame_pool.num_frames)
-        available = g_xdp_frame_pool.num_frames;
-    return (uint32_t)available;
-}
-
 int xdp_frame_pool_init(void)
 {
     frame_global_cache_reset();
@@ -346,19 +295,6 @@ int xdp_frame_pool_init(void)
     frame_global_cache_init();
 
     return 0;
-}
-
-void xdp_frame_pool_destroy(void)
-{
-    /*
-     * All workers, callbacks and AF_XDP ring users must be stopped before
-     * entering this function. Lock-free data structures do not make
-     * concurrent destruction safe.
-     */
-    frame_global_cache_reset();
-    free(g_xdp_frame_pool.slots);
-    free(g_xdp_frame_pool.buffer);
-    memset(&g_xdp_frame_pool, 0, sizeof(g_xdp_frame_pool));
 }
 
 inline int xdp_frame_alloc(void **frame)
@@ -1194,7 +1130,7 @@ static int if_set_hw_rss_toeplitz(if_info* info, int queues)
     for (__u32 i = 0; i < rxfh->indir_size; ++i)
         indir[i] = (__u32)(i % (unsigned)queues);
 
-    if (key && key_len > 0 && rxfh->key_size == key_len)
+    if (rxfh->key_size == key_len)
         memcpy(hw_key, key, key_len);
 
     ioctl_ret = ioctl(fd, SIOCETHTOOL, &ifr);
@@ -1428,11 +1364,10 @@ void xdp_if_read(task *tk)
         data_info*  infos[SKB_DATA_MAX_NUM];
         uint32_t    frame_count = 0;
 		bool packet_bad = false;
-		bool more = false;
 
         do {
             const struct xdp_desc* d = xsk_ring_cons__rx_desc(rx, idx + i);
-			more = d && ((d->options & XDP_PKT_CONTD) != 0);
+			bool more = d && ((d->options & XDP_PKT_CONTD) != 0);
             if (!d || d->len == 0) {
                 if (d && d->len == 0) {
                     uint64_t z_raw = xsk_umem__extract_addr(d->addr);

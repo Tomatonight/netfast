@@ -68,14 +68,9 @@ extern xdp_frame_pool g_xdp_frame_pool;
 
 /* ── Public API (unchanged signatures) ─────────────────────── */
 int xdp_frame_pool_init(void);
-void xdp_frame_pool_destroy(void);
 
 int  xdp_frame_alloc(void **frame);
 void xdp_frame_free(void *frame);
-
-uint32_t xdp_frame_alloc_batch(void **out, uint32_t max);
-uint32_t xdp_frame_free_batch(void *const *frames, uint32_t n);
-uint32_t xdp_frame_pool_available(void);
 
 
 typedef struct if_xdp {

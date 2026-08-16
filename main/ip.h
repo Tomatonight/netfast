@@ -30,7 +30,6 @@ typedef struct ipv4_hdr {
     uint32_t daddr;
     uint32_t options[0];
 } __attribute__((packed)) ipv4_hdr;
-const char* ip_to_str(uint32_t ip);
 int ipv4_init(void);
 int ipv4_recv(skbuff* skb);
 int ipv4_output(skbuff* skb);

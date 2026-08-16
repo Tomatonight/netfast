@@ -12,7 +12,6 @@
 #include <unistd.h>
 
 #include "netfast.h"
-#include "req.h"
 
 #ifndef ACCEPT_DEPTH
 #define ACCEPT_DEPTH 64U
@@ -137,7 +136,8 @@ static int submit_connection_request(server *state, connection *conn,
 static int submit_accept(server *state)
 {
     net_async_req *request = net_async_req_create(
-        state->listen_fd, NET_ASYNC_ACCEPT, NULL, NULL);
+        state->listen_fd, NET_ASYNC_ACCEPT,
+        (struct sockaddr *)NULL, (socklen_t *)NULL);
     if (submit_request(state, request) != 0)
         return -1;
     state->accept_pending++;
@@ -253,7 +253,7 @@ static int complete_request(server *state, net_async_req *request)
     int type = request->type;
     int result = request->ret;
 
-    if (type == REQ_ACCEPT) {
+    if (type == NET_ASYNC_ACCEPT) {
         net_async_req_destroy(request);
         return complete_accept(state, result);
     }
@@ -264,15 +264,15 @@ static int complete_request(server *state, net_async_req *request)
         return -1;
     }
     switch (type) {
-    case REQ_SETSOCKOPT:
+    case NET_ASYNC_SETSOCKOPT:
         if (result < 0)
             return fail_connection(state, conn, result);
         return submit_read(state, conn);
-    case REQ_READ:
+    case NET_ASYNC_READ:
         return complete_read(state, conn, result);
-    case REQ_WRITE:
+    case NET_ASYNC_WRITE:
         return complete_write(state, conn, result);
-    case REQ_CLOSE:
+    case NET_ASYNC_CLOSE:
         if (result < 0) {
             errno = -result;
             return -1;

@@ -519,10 +519,14 @@ int parse_addr_event(struct nlmsghdr* nlh)
     bool primary = !(ifa_flags & IFA_F_SECONDARY);
 
     if (have_local || have_addr) {
-        uint32_t ipv4 = have_local ? ipv4_local : ipv4_addr;
-        const uint8_t* ip = ifa->ifa_family == AF_INET6
-            ? (have_local ? ipv6_local : ipv6_addr)
-            : (const uint8_t*)&ipv4;
+        const uint8_t* ip;
+        uint32_t ipv4;
+        if (ifa->ifa_family == AF_INET6) {
+            ip = have_local ? ipv6_local : ipv6_addr;
+        } else {
+            ipv4 = have_local ? ipv4_local : ipv4_addr;
+            ip = (const uint8_t*)&ipv4;
+        }
         if (nlh->nlmsg_type == RTM_NEWADDR)
             (void)if_add_addr(info, ifa->ifa_family, ip,
                               ifa->ifa_prefixlen, ifa->ifa_scope, primary);

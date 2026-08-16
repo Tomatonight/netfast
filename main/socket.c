@@ -46,8 +46,8 @@ typedef struct tuple_key6 {
 } tuple_key6;
 
 typedef union tuple_key {
-    tuple_key4 key4;
     tuple_key6 key6;
+    tuple_key4 key4;
 } tuple_key;
 
 struct tuple_entry {
@@ -1327,11 +1327,13 @@ int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval,
     case SO_BROADCAST:
     case SO_KEEPALIVE: {
         if (len < (socklen_t)sizeof(int)) return -EINVAL;
-        int v = 0;
-        if (optname == SO_REUSEADDR) v = sock->options.reuseaddr;
-        else if (optname == SO_REUSEPORT) v = sock->options.reuseport;
-        else if (optname == SO_BROADCAST) v = sock->options.broadcast;
-        else if (optname == SO_KEEPALIVE) v = sock->options.keepalive;
+        int v;
+        switch (optname) {
+        case SO_REUSEADDR: v = sock->options.reuseaddr; break;
+        case SO_REUSEPORT: v = sock->options.reuseport; break;
+        case SO_BROADCAST: v = sock->options.broadcast; break;
+        default:           v = sock->options.keepalive; break;
+        }
         memcpy(optval, &v, sizeof(int));
         *optlen = (socklen_t)sizeof(int);
         return 0;

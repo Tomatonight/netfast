@@ -30,9 +30,6 @@ static inline uint32_t fd_lock_idx(uint32_t slot)
 
 int fd_table_init(void)
 {
-    if (g_fd_table)
-        return 0;
-
     fd_entry** table = calloc(FD_TABLE_CAP, sizeof(*table));
     uint32_t* free_slots = malloc(sizeof(*free_slots) * FD_TABLE_CAP);
     if (!table || !free_slots) {
@@ -43,6 +40,7 @@ int fd_table_init(void)
 
     for (uint32_t i = 0; i < FD_LOCK_COUNT; ++i)
         spin_rwlock_init(&g_fd_locks[i]);
+    spin_rwlock_init(&g_free_lock);
 
     g_fd_table = table;
     g_free_slots = free_slots;
@@ -73,9 +71,6 @@ static void destroy_fd_entry(fd_entry* entry)
 fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
                                      worker* w)
 {
-    if (fd_table_init() < 0)
-        return NULL;
-
     CREATE_REF(fd_entry, entry, destroy_fd_entry);
     if (!entry)
         return NULL;

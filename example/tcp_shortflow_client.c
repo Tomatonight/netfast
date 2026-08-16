@@ -159,7 +159,7 @@ static int process_connection(benchmark *bench, client_conn *conn,
             }
             if (n < 0 && errno == EINTR)
                 continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && errno == EAGAIN)
                 return 0;
             return finish_connection(bench, conn, false);
         }
@@ -178,7 +178,7 @@ static int process_connection(benchmark *bench, client_conn *conn,
             }
             if (n < 0 && errno == EINTR)
                 continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && errno == EAGAIN)
                 return 0;
             return finish_connection(bench, conn, false);
         }

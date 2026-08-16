@@ -380,7 +380,7 @@ void netlink_recv_cb(struct task* tk) {
         if (received < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN)
                 return;
             ERR_LOG("netlink: recv failed: %s", strerror(errno));
             return;
@@ -423,4 +423,3 @@ void netlink_recv_cb(struct task* tk) {
             WARN_LOG("netlink: trailing bytes=%d", remaining);
     }
 }
-

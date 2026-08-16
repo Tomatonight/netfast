@@ -38,7 +38,7 @@ else
 fi
 
 if command -v clang >/dev/null 2>&1; then
-    clang --analyze --analyzer-output=text -std=gnu11 -D_GNU_SOURCE \
+    clang --analyze --analyzer-output text -std=gnu11 -D_GNU_SOURCE \
         -I"$root_dir" -I"$root_dir/lib" -I"$root_dir/main" \
         $source_files \
         >"$report_dir/clang-analyzer.stdout" 2>"$report_dir/clang-analyzer.txt" || status=1

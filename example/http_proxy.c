@@ -13,7 +13,6 @@
 #include <unistd.h>
 
 #include "netfast.h"
-#include "req.h"
 
 #define PROXY_PORT 8888
 #define PROXY_BACKLOG 128
@@ -462,12 +461,11 @@ static ssize_t find_headers_end(const char *data, size_t len)
 static int host_from_header(const char *headers, size_t headers_len,
                             char *host, uint16_t *port)
 {
-    const char *line = headers;
     const char *end = headers + headers_len;
     const char *first_end = memmem(headers, headers_len, "\r\n", 2);
     if (!first_end)
         return -1;
-    line = first_end + 2;
+    const char *line = first_end + 2;
 
     while (line < end) {
         const char *line_end = memmem(line, (size_t)(end - line), "\r\n", 2);
@@ -750,7 +748,7 @@ static void dispatch_completion(int cq_fd, net_async_req *request)
     }
 
     proxy_conn *conn = op->conn;
-    int ret = net_async_req_result(request);
+    int ret = request->ret;
     int saved_errno = ret < 0 ? -ret : 0;
     proxy_log("DEBUG", "conn=%llu completed op=%s async_fd=%d ret=%d errno=%d",
               conn ? (unsigned long long)conn->id : 0, op_name(op->kind),

@@ -38,7 +38,7 @@ uint32_t toeplitz_hash(const uint8_t* key, uint32_t key_len,
         for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
             if (data_byte & mask)
                 hash ^= key_window;
-            key_window = (key_window << 1) | !!(key_byte & mask);
+            key_window = (key_window << 1) | ((key_byte & mask) != 0);
         }
     }
 

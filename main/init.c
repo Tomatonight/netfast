@@ -8,6 +8,7 @@
 #include <cjson/cJSON.h>
 
 #include "log.h"
+#include "fd_entry.h"
 #include "worker.h"
 #include "ip.h"
 #include "ipv6.h"
@@ -236,6 +237,11 @@ bool filter_ifname(const char *ifname)
 __attribute__((constructor))
 static void lib_init(void)
 {
+	if (fd_table_init() < 0) {
+		fprintf(stderr, "lib_init: fd_table_init failed\n");
+		goto fail;
+	}
+
 	/* Unit tests initialize the raw frame pool explicitly and must not attach
 	 * XDP programs or start detached workers from the shared-library ctor. */
 	if (getenv("NETFAST_TEST_NO_AUTO_INIT"))

@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -448,6 +449,7 @@ static int test_tcp_loopback(void)
 {
     const char request[] = "netfast tcp loopback";
     const char reply[] = "tcp reply";
+    const char corked[] = "corked write";
     struct sockaddr_in address = {
         .sin_family = AF_INET,
         .sin_port = htons(32101),
@@ -459,6 +461,30 @@ static int test_tcp_loopback(void)
     TEST_ASSERT(listener >= 0);
     int reuse = 1;
     TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                               sizeof(reuse)) == 0);
+    int listener_rcvbuf = 16384;
+    int listener_sndbuf = 32768;
+    struct timeval listener_rcvtimeo = {.tv_sec = 1, .tv_usec = 2000};
+    struct timeval listener_sndtimeo = {.tv_sec = 2, .tv_usec = 3000};
+    struct linger listener_linger = {.l_onoff = 1, .l_linger = 2};
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_RCVBUF,
+                               &listener_rcvbuf,
+                               sizeof(listener_rcvbuf)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_SNDBUF,
+                               &listener_sndbuf,
+                               sizeof(listener_sndbuf)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO,
+                               &listener_rcvtimeo,
+                               sizeof(listener_rcvtimeo)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_SNDTIMEO,
+                               &listener_sndtimeo,
+                               sizeof(listener_sndtimeo)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, SOL_SOCKET, SO_LINGER,
+                               &listener_linger,
+                               sizeof(listener_linger)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, IPPROTO_TCP, TCP_NODELAY, &reuse,
+                               sizeof(reuse)) == 0);
+    TEST_ASSERT(net_setsockopt(listener, IPPROTO_TCP, TCP_CORK, &reuse,
                                sizeof(reuse)) == 0);
     TEST_ASSERT(net_bind(listener, (struct sockaddr *)&address,
                          sizeof(address)) == 0);
@@ -475,18 +501,79 @@ static int test_tcp_loopback(void)
     fd_entry *accepted_entry = hold_fd_entry(accepted);
     TEST_ASSERT(client_entry && accepted_entry);
     tcp_pcb *client_pcb = ((Socket *)client_entry->value)->pcb;
-    tcp_pcb *accepted_pcb = ((Socket *)accepted_entry->value)->pcb;
+    Socket *accepted_sock = (Socket *)accepted_entry->value;
+    tcp_pcb *accepted_pcb = accepted_sock->pcb;
     TEST_ASSERT(tcp_window_scale_negotiated(client_pcb));
     TEST_ASSERT(tcp_window_scale_negotiated(accepted_pcb));
     TEST_ASSERT(client_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
     TEST_ASSERT(accepted_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
+    TEST_ASSERT(client_pcb->snd_mss == accepted_pcb->rcv_mss);
+    TEST_ASSERT(accepted_pcb->snd_mss == client_pcb->rcv_mss);
+    TEST_ASSERT(client_pcb->rcv_mss > 536u);
+    TEST_ASSERT(accepted_sock->recv_buffer_len_max ==
+                (uint32_t)listener_rcvbuf);
+    TEST_ASSERT(accepted_sock->send_buffer_len_max ==
+                (uint32_t)listener_sndbuf);
+    TEST_ASSERT(memcmp(&accepted_sock->recv_timeout, &listener_rcvtimeo,
+                       sizeof(listener_rcvtimeo)) == 0);
+    TEST_ASSERT(memcmp(&accepted_sock->send_timeout, &listener_sndtimeo,
+                       sizeof(listener_sndtimeo)) == 0);
+    TEST_ASSERT(accepted_sock->options.linger &&
+                accepted_sock->linger_seconds == listener_linger.l_linger);
+    TEST_ASSERT(accepted_pcb->nagle_interval == 0);
+    TEST_ASSERT(accepted_pcb->tcp_options.cork);
     PUT_REF(accepted_entry);
     PUT_REF(client_entry);
 
+    int disabled = 0;
+    TEST_ASSERT(net_setsockopt(accepted, IPPROTO_TCP, TCP_CORK, &disabled,
+                               sizeof(disabled)) == 0);
+
+    int client_rcvbuf = 4096;
+    TEST_ASSERT(net_setsockopt(client, SOL_SOCKET, SO_RCVBUF, &client_rcvbuf,
+                               sizeof(client_rcvbuf)) == 0);
+    client_entry = hold_fd_entry(client);
+    TEST_ASSERT(client_entry);
+    client_pcb = ((Socket *)client_entry->value)->pcb;
+    TEST_ASSERT(client_pcb->rcv_wnd == (uint32_t)client_rcvbuf);
+    PUT_REF(client_entry);
+
+    TEST_ASSERT(net_setsockopt(client, IPPROTO_TCP, TCP_CORK, &reuse,
+                               sizeof(reuse)) == 0);
+    client_entry = hold_fd_entry(client);
+    TEST_ASSERT(client_entry);
+    client_pcb = ((Socket *)client_entry->value)->pcb;
+    uint32_t snd_nxt_before_cork = client_pcb->snd_nxt;
+    PUT_REF(client_entry);
+    TEST_ASSERT(net_write(client, corked, sizeof(corked)) ==
+                (int)sizeof(corked));
+    client_entry = hold_fd_entry(client);
+    TEST_ASSERT(client_entry);
+    client_pcb = ((Socket *)client_entry->value)->pcb;
+    TEST_ASSERT(client_pcb->snd_nxt == snd_nxt_before_cork);
+    TEST_ASSERT(((Socket *)client_entry->value)->send_queue.element_number == 1);
+    PUT_REF(client_entry);
+
+    /* Option changes affect subsequent data only.  Existing corked data
+     * remains queued until its already scheduled cork timeout. */
+    TEST_ASSERT(net_setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &reuse,
+                               sizeof(reuse)) == 0);
+    client_entry = hold_fd_entry(client);
+    TEST_ASSERT(client_entry);
+    client_pcb = ((Socket *)client_entry->value)->pcb;
+    TEST_ASSERT(client_pcb->snd_nxt == snd_nxt_before_cork);
+    PUT_REF(client_entry);
+    char buffer[64] = {0};
     TEST_ASSERT(net_fcntl(accepted, F_SETFL, O_NONBLOCK) == 0);
+    TEST_ASSERT(wait_for_read(accepted, buffer, sizeof(buffer)) ==
+                (int)sizeof(corked));
+    TEST_ASSERT(memcmp(buffer, corked, sizeof(corked)) == 0);
+    TEST_ASSERT(net_setsockopt(client, IPPROTO_TCP, TCP_CORK, &disabled,
+                               sizeof(disabled)) == 0);
+
     TEST_ASSERT(net_write(client, request, sizeof(request)) ==
                 (int)sizeof(request));
-    char buffer[64] = {0};
+    memset(buffer, 0, sizeof(buffer));
     TEST_ASSERT(wait_for_read(accepted, buffer, sizeof(buffer)) ==
                 (int)sizeof(request));
     TEST_ASSERT(memcmp(buffer, request, sizeof(request)) == 0);
@@ -607,7 +694,7 @@ static int test_request_error_boundary(void)
     TEST_ASSERT(net_async_wait(cq_fd, &completed, 1, 1, 2000) == 1);
     TEST_ASSERT(completed == request);
     TEST_ASSERT(completed->ret == -EHOSTUNREACH);
-    TEST_ASSERT(net_async_req_result(completed) == -EHOSTUNREACH);
+    TEST_ASSERT(completed->ret == -EHOSTUNREACH);
     net_async_req_destroy(completed);
 
     TEST_ASSERT(net_async_close(cq_fd) == 0);
@@ -684,9 +771,8 @@ static int test_async_multi_wait(void)
             for (uint32_t j = 0; j < batch[i]; ++j) {
                 net_async_req* request = args[i].completed[j];
                 TEST_ASSERT(request->async_fd == -1);
-                TEST_ASSERT(request->type == (req_type)NET_ASYNC_SOCKET);
+                TEST_ASSERT(request->type == NET_ASYNC_SOCKET);
                 TEST_ASSERT(request->ret >= 0);
-                TEST_ASSERT(net_async_req_result(request) == request->ret);
                 TEST_ASSERT(net_close(request->ret) == 0);
                 net_async_req_destroy(args[i].completed[j]);
             }

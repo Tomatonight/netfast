@@ -17,18 +17,18 @@ typedef struct async_cq {
 } async_cq;
 
 
-req* net_async_req_create(int fd, int operation, ...);
+net_async_req* net_async_req_create(int fd, int operation, ...);
 
 /* Destroy an unsubmitted request, or one returned by net_async_wait(). */
-void net_async_req_destroy(req* r);
-int net_async_req_result(const req* r);
+void net_async_req_destroy(net_async_req* request);
 
 
 /* ── public API (fd-based) ── */
 int net_async_create(void);
-int net_async_submit(int cq_fd, req* r);
-int net_async_submit_batch(int cq_fd, req** reqs, uint32_t count);
-int net_async_wait(int cq_fd, req** reqs, uint32_t min,
+int net_async_submit(int cq_fd, net_async_req* request);
+int net_async_submit_batch(int cq_fd, net_async_req** requests,
+                           uint32_t count);
+int net_async_wait(int cq_fd, net_async_req** requests, uint32_t min,
                    uint32_t max, int total_timeout_ms);
 int net_async_close(int cq_fd);
 

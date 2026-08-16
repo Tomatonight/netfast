@@ -1,6 +1,5 @@
 #include "ip.h"
 #include "base.h"
-#include "fd_entry.h"
 #include "init.h"
 #include "ip_frag.h"
 #include "route_arp_ndp.h"
@@ -19,12 +18,6 @@
 static _Atomic(uint32_t) ip_id;
 static const uint8_t default_ttl = 64;
 
-const char* ip_to_str(uint32_t ip)
-{
-    static _Thread_local char buf[INET_ADDRSTRLEN];
-    return inet_ntop(AF_INET, &ip, buf, sizeof(buf)) ? buf : NULL;
-}
-
 static void ip_id_init(void)
 {
     atomic_store_explicit(&ip_id, (uint32_t)get_current_time_ms(),
@@ -36,9 +29,7 @@ int ipv4_init(void)
     ip_id_init();
     if (route_init() < 0)
         return -1;
-    if (tcp_metrics_init() < 0)
-        return -1;
-    return fd_table_init();
+    return tcp_metrics_init();
 }
 
 static bool check_ipv4_hdr(skbuff* skb)

@@ -86,7 +86,7 @@ static int accept_ready(int epfd, int listen_fd, uint64_t total,
         if (fd < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN)
                 return 0;
             return -1;
         }
@@ -129,7 +129,7 @@ static int process_connection(int epfd, connection *conn, uint32_t events)
             }
             if (n < 0 && errno == EINTR)
                 continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && errno == EAGAIN)
                 break;
             return -1;
         }
@@ -153,7 +153,7 @@ static int process_connection(int epfd, connection *conn, uint32_t events)
             }
             if (n < 0 && errno == EINTR)
                 continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && errno == EAGAIN)
                 break;
             return -1;
         }

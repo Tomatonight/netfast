@@ -91,8 +91,6 @@ static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
     if (!info)
         return;
 
-    char ip_str[INET6_ADDRSTRLEN];
-    char cmd[256];
     uint64_t now_ms = get_current_time_ms();
     bool allowed;
     if (family == AF_INET6) {
@@ -103,16 +101,20 @@ static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
         allowed = arp_ping_allowed(ip4, ifindex, now_ms);
     }
 
-    if (allowed && inet_ntop(family, ip, ip_str, sizeof(ip_str))) {
-        int len = family == AF_INET6
-            ? snprintf(cmd, sizeof(cmd),
-                       "ping -6 -I %s -c 1 -W 1 %s >/dev/null 2>&1 &",
-                       info->name, ip_str)
-            : snprintf(cmd, sizeof(cmd),
-                       "ping -I %s -c 1 -W 1 %s >/dev/null 2>&1 &",
-                       info->name, ip_str);
-        if (len >= 0 && len < (int)sizeof(cmd) && system(cmd) == -1)
-            DEBUG_LOG("failed to start neighbor probe via if=%s", info->name);
+    if (allowed) {
+        char ip_str[INET6_ADDRSTRLEN];
+        if (inet_ntop(family, ip, ip_str, sizeof(ip_str))) {
+            char cmd[256];
+            int len = family == AF_INET6
+                ? snprintf(cmd, sizeof(cmd),
+                           "ping -6 -I %s -c 1 -W 1 %s >/dev/null 2>&1 &",
+                           info->name, ip_str)
+                : snprintf(cmd, sizeof(cmd),
+                           "ping -I %s -c 1 -W 1 %s >/dev/null 2>&1 &",
+                           info->name, ip_str);
+            if (len >= 0 && len < (int)sizeof(cmd) && system(cmd) == -1)
+                DEBUG_LOG("failed to start neighbor probe via if=%s", info->name);
+        }
     }
     PUT_REF(info);
 }
@@ -718,7 +720,6 @@ bool search_best_saddr_by_daddr(const route_key* key, route_key* answer)
 
 static void free_route_element(uint64_t element)
 {
-    if (!element) return;
     list_node* head = (list_node*)element;
 
     route_info* it;
@@ -732,7 +733,6 @@ static void free_route_element(uint64_t element)
 
 static void free_arp_element(uint64_t element)
 {
-    if (!element) return;
     list_node* head = (list_node*)element;
     ndp_info* entry;
     list_node* tmp;

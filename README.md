@@ -3,8 +3,8 @@
 [English](./README.md) | [简体中文](./README_zh.md)
 
 NetFast is an experimental userspace TCP/IP stack built on Linux AF_XDP. It
-combines a worker-owned network stack, UMEM-backed packet buffers, an epoll-like
-readiness API, and a completion-queue-based asynchronous API in one C library.
+combines a worker-owned network stack, UMEM-backed packet buffers, and a
+completion-queue-based asynchronous API in one C library.
 
 The asynchronous API is the primary high-throughput interface: applications can
 submit many socket operations in one batch, keep multiple requests in flight,
@@ -26,79 +26,125 @@ operation.
 - **Multi-worker ownership** and Toeplitz RSS steering for connection affinity.
 - **TCP and UDP over IPv4/IPv6**, including routing, ARP/NDP, ICMP, timers,
   retransmission, fragmentation, and reassembly.
-- **POSIX-style synchronous and non-blocking APIs**, plus an epoll-compatible
-  readiness interface.
+- **POSIX-style synchronous and non-blocking socket APIs**.
 - **UMEM-aware frame caches** and scatter-gather-capable socket buffers.
 - **Netlink integration** for routes, addresses, and neighbor state.
 
 ## Async API at a Glance
 
+The asynchronous interface has three main objects:
+
+- A **completion queue (CQ)** receives requests and returns completed work.
+- A **request (`net_async_req`)** describes an operation and its target fd.
+- A **completed request** is the original request pointer returned by
+  `net_async_wait()`, with the result stored directly in the request.
+
+The following example performs one asynchronous write on an already connected
+TCP socket. It intentionally submits only one request to make the complete flow
+easy to follow:
+
 ```c
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <netfast.h>
 
-enum { BATCH = 64 };
-
-int submit_writes(int socket_fd, const void *buffers[BATCH],
-                  const uint32_t lengths[BATCH])
+int async_write_once(int socket_fd, const void *buffer, uint32_t length)
 {
+    /* 1. Create a completion queue. */
     int cq_fd = net_async_create();
     if (cq_fd < 0)
         return -1;
 
-    net_async_req *submitted[BATCH];
-    for (uint32_t i = 0; i < BATCH; ++i) {
-        submitted[i] = net_async_req_create(socket_fd, NET_ASYNC_WRITE,
-                                             buffers[i], lengths[i]);
-        if (!submitted[i])
-            return -1;
-    }
-
-    int accepted = net_async_submit_batch(cq_fd, submitted, BATCH);
-    if (accepted != BATCH)
+    /* 2. Create a write request. buffer must remain valid until completion. */
+    net_async_req *request = net_async_req_create(
+        socket_fd, NET_ASYNC_WRITE, buffer, length);
+    if (!request) {
+        int saved_errno = errno;
+        net_async_close(cq_fd);
+        errno = saved_errno;
         return -1;
-
-    uint32_t remaining = BATCH;
-    while (remaining) {
-        net_async_req *completed[BATCH];
-        uint32_t desired = remaining < 16 ? remaining : 16;
-        int count = net_async_wait(cq_fd, completed,
-                                   desired,  /* desired completion batch */
-                                   BATCH,    /* output array capacity */
-                                   250);     /* overall timeout in ms */
-        if (count < 0)
-            return -1;
-        if (count == 0)
-            continue;
-
-        for (int i = 0; i < count; ++i) {
-            int result = net_async_req_result(completed[i]);
-            if (result < 0)
-                errno = -result;
-            net_async_req_destroy(completed[i]);
-        }
-        remaining -= (uint32_t)count;
     }
 
-    return net_async_close(cq_fd);
+    /* 3. After a successful submit, the CQ temporarily owns the request. */
+    if (net_async_submit(cq_fd, request) < 0) {
+        int saved_errno = errno;
+        net_async_req_destroy(request);
+        net_async_close(cq_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* 4. Wait for one completion; -1 means wait indefinitely. */
+    net_async_req *completed = NULL;
+    if (net_async_wait(cq_fd, &completed, 1, 1, -1) != 1) {
+        int saved_errno = errno;
+        net_async_close(cq_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /*
+     * completed is the request submitted above:
+     *   completed->type     == NET_ASYNC_WRITE
+     *   completed->async_fd == socket_fd
+     *   completed->ret      == bytes written, or -errno on failure
+     */
+    int result = completed->ret;
+    net_async_req_destroy(completed);
+    net_async_close(cq_fd);
+
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
 }
 ```
 
-Async ownership rules:
+Common request forms are:
+
+```c
+net_async_req_create(-1, NET_ASYNC_SOCKET, family, type, protocol);
+net_async_req_create(fd, NET_ASYNC_CONNECT, addr, addrlen);
+net_async_req_create(fd, NET_ASYNC_ACCEPT, addr, addrlen_ptr);
+net_async_req_create(fd, NET_ASYNC_READ, buffer, length);
+net_async_req_create(fd, NET_ASYNC_WRITE, buffer, length);
+net_async_req_create(fd, NET_ASYNC_CLOSE);
+```
+
+After completion, read `req->type`, `req->async_fd`, and `req->ret` directly:
+
+- `type` identifies the operation that completed.
+- `async_fd` is the fd supplied when the request was created.
+- `ret` is non-negative on success and `-errno` on failure. Successful
+  `SOCKET` and `ACCEPT` operations return a new fd; successful `READ` and
+  `WRITE` operations return a byte count. A `READ` result of `0` means the peer
+  has cleanly closed its sending side.
+
+To keep several operations in flight, call `net_async_submit()` repeatedly or
+use `net_async_submit_batch()`. A typical wait that collects up to 64
+completions is:
+
+```c
+net_async_req *completed[64];
+int count = net_async_wait(cq_fd, completed,
+                           1,     /* wait for at least one completion */
+                           64,    /* capacity of completed[] */
+                           1000); /* total timeout for this wait, in ms */
+```
+
+Request ownership rules:
 
 1. `net_async_req_create()` returns a request owned by the application.
 2. A successful `net_async_submit()` transfers ownership to the CQ.
 3. A positive `net_async_submit_batch()` result transfers only the accepted
    prefix of the request array.
 4. `net_async_wait()` returns ownership of completed requests to the caller.
-5. Inspect each result, then release it with `net_async_req_destroy()`.
+5. Read `type`, `async_fd`, and `ret` directly from each completed request,
+   then release it with `net_async_req_destroy()`.
 6. Buffers and address objects referenced by a request must stay valid until
    that request completes.
-
-Each asynchronous completion stores a non-negative result on success or
-`-errno` on failure. Synchronous `net_*` calls keep POSIX semantics: they
-return `-1` and set `errno`.
 
 `net_async_wait()` may return a partial batch when its overall timeout expires.
 Concurrent threads may wait on the same CQ with different `min_complete`
@@ -109,7 +155,6 @@ values.
 ```text
 Application
   |-- synchronous socket API
-  |-- epoll-compatible readiness API
   `-- async submit / completion queues
                  |
           request routing
@@ -144,11 +189,10 @@ For a first installation, use the guided setup script:
 ./setup.sh
 ```
 
-It checks or installs build dependencies, avoids active/primary default-route
-and SSH interfaces, detects the selected interface's current queue count, writes a
-local `netfast_config.json`, builds the release profile, and installs NetFast under
-`/usr/local`. It does not attach XDP during installation; XDP is attached when a
-root process first loads `libnetfast.so`.
+It checks or installs build dependencies, detects the selected interface's
+current queue count, writes a local `netfast_config.json`, builds the release
+profile, and installs NetFast under `/usr/local`. It does not attach XDP during
+installation; XDP is attached when a root process first loads `libnetfast.so`.
 
 For an unattended lab installation, specify the dedicated interface explicitly:
 
@@ -156,9 +200,8 @@ For an unattended lab installation, specify the dedicated interface explicitly:
 ./setup.sh --interface ens192 --queues 2 --workers 2 --yes
 ```
 
-Use `./setup.sh --help` for safety overrides and `--dry-run` to inspect the plan
-without changing the system. The script deliberately refuses to select the
-active management interface unless `--allow-management-interface` is supplied.
+Use `./setup.sh --help` to list all options and `--dry-run` to inspect the plan
+without changing the system.
 
 ### Requirements
 
@@ -223,7 +266,7 @@ Example configuration:
 | --- | --- | --- |
 | `thread_num` | Yes | Number of worker threads, from 1 to 64. Workers are pinned to CPUs on a best-effort basis. |
 | `open_if` | Yes | Non-empty array of interfaces owned by NetFast. Interface names must be unique. Interfaces omitted from this list do not get AF_XDP sockets. |
-| `open_if[].name` | Yes | Linux interface name, for example `ens192`. Check it with `ip -br link`. Do not select the interface used for SSH or desktop management. |
+| `open_if[].name` | Yes | Linux interface name, for example `ens192`. Check it with `ip -br link`. |
 | `open_if[].queues` | No | Number of AF_XDP RX/TX queues, from 1 to 32. Missing or `0` means `thread_num`. The NIC must expose all requested queue IDs. |
 | `logfile` | Yes | Non-empty log path shorter than 256 bytes. NetFast creates the file if its parent directory exists and permissions allow it. |
 
@@ -249,19 +292,12 @@ an unwritable log path makes initialization fail. Restart the application after
 editing the installed file. Running `make install` again overwrites the
 installed configuration with the selected `CONFIG_FILE`.
 
-### Network safety
+### XDP traffic ownership
 
-- Do **not** attach NetFast to the interface carrying your SSH, desktop, or web
-  management connection. XDP redirection takes that traffic away from the
-  kernel stack and may disconnect the machine.
-- Routes and neighbors are learned through Netlink; interfaces not listed in
-  `open_if` are filtered from the NetFast data plane.
-- Packets redirected by XDP are not visible to a normal `tcpdump` capture on
-  the kernel network stack.
-- AF_XDP zero-copy availability depends on the NIC driver. Unsupported devices
-  fall back to copy mode unless zero-copy is forced.
+After XDP is attached, NetFast takes ownership of all TCP and UDP traffic on
+every interface configured in `open_if`.
 
-## Synchronous API and optional Epoll API
+## Synchronous API
 
 The public header also exposes familiar calls such as:
 
@@ -273,15 +309,11 @@ net_read(fd, response, response_capacity);
 net_close(fd);
 ```
 
-The custom epoll implementation is excluded by default. Build with
-`make TEST_EPOLL=1 …` to enable `net_epoll_create()`, `net_epoll_ctl()`, and
-`net_epoll_wait()`; without it, those calls fail with `ENOTSUP`.
-
 ## Repository Layout
 
 ```text
 lib/       AF_XDP, queues, RSS, frame cache, and base utilities
-main/      TCP/IP stack, sockets, workers, optional epoll, and async requests
+main/      TCP/IP stack, sockets, workers, and async requests
 docs/      protocol design notes
 example/   example programs and test resources
 test/      unit, integration, stress, and analysis tooling

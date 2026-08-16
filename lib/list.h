@@ -43,7 +43,6 @@ int add_list_node_compare(list_node* head, list_node* add,
 void add_list_node_pre(list_node* last, list_node* add);
 void remove_list_node(list_node* remove);
 void destroy_list_node(list_node* destroy, void (*free_element)(uint64_t));
-bool list_node_exist(list_node* head, list_node* node);
 bool list_element_exist(list_node* head, uint64_t element);
 void clear_list_head(list_node* head, void (*free_element)(uint64_t));
 

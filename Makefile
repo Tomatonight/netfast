@@ -96,7 +96,7 @@ CONFIG_FILE ?= $(firstword $(wildcard netfast_config.json) config.example.json)
 
 .DEFAULT_GOAL := debug
 
-.PHONY: all build clean bpf install uninstall debug release relwithdebinfo ftp-async FORCE
+.PHONY: all build clean bpf install uninstall debug release relwithdebinfo ftp-async http-async FORCE
 
 all: debug
 
@@ -150,6 +150,12 @@ $(BUILD_DIR)/example/ftp_async_server: example/ftp_async.c $(LIB)
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -Wl,-rpath,'$$ORIGIN/..' -lnetfast -o $@
 
 ftp-async: $(BUILD_DIR)/example/ftp_async_server
+
+$(BUILD_DIR)/example/http_async_server: example/http_async.c $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -Wl,-rpath,'$$ORIGIN/..' -lnetfast -o $@
+
+http-async: $(BUILD_DIR)/example/http_async_server
 
 install: $(LIB) $(BPF_OBJ) $(HEADER) $(CONFIG_FILE)
 	install -d $(DESTDIR)$(LIB_DIR)

@@ -22,7 +22,7 @@ _Static_assert(XDP_UMEM_FRAME_SIZE >=
 static inline frame_cache* get_local_frame_cache(void)
 {
     worker* current = get_current_worker();
-    return (&current->master->frame_cache);
+    return &current->master->frame_cache;
 }
 
 
@@ -300,10 +300,6 @@ static void cache_free_slot(frame_slot* slot)
         return;
     }
     frame_cache* cache = get_local_frame_cache();
-    if (!cache) {
-        PUT_REF(slot->page);
-        return;
-    }
     if (!local_cache_push(cache, (uint8_t)size_class, slot)) {
         local_cache_spill(cache, (uint8_t)size_class);
         bool cached = local_cache_push(cache, (uint8_t)size_class, slot);
@@ -358,7 +354,7 @@ static void init_slot(frame_slot* slot, page_info* page, uint8_t* data,
     slot->slot_size = slot_size;
 }
 
-static frame_slot* alloc_slot_page(uint8_t size_class, frame_cache* local_cache)
+static frame_slot* alloc_slot_page(uint8_t size_class, frame_cache* cache)
 {
     page_info* page = NULL;
     if (xdp_frame_alloc((void**)&page) != 0)
@@ -375,7 +371,7 @@ static frame_slot* alloc_slot_page(uint8_t size_class, frame_cache* local_cache)
                           memory_order_release);
 
     frame_slot* first = NULL;
-    for (uint16_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < count; ++i) {
         frame_slot* slot = (frame_slot*)((uint8_t*)page + slot_offset +
                                         (size_t)i * stride);
         uint8_t* data = (uint8_t*)slot + sizeof(*slot) +
@@ -385,13 +381,9 @@ static frame_slot* alloc_slot_page(uint8_t size_class, frame_cache* local_cache)
             first = slot;
             continue;
         }
-        if (!local_cache) {
-            PUT_REF(page);
-            continue;
-        }
-        if (!local_cache_push(local_cache, size_class, slot)) {
-            local_cache_spill(local_cache, size_class);
-            bool cached = local_cache_push(local_cache, size_class, slot);
+        if (!local_cache_push(cache, size_class, slot)) {
+            local_cache_spill(cache, size_class);
+            bool cached = local_cache_push(cache, size_class, slot);
             assert(cached);
             (void)cached;
         }
@@ -400,16 +392,13 @@ static frame_slot* alloc_slot_page(uint8_t size_class, frame_cache* local_cache)
 }
 
 static frame_slot* frame_slot_alloc_class(uint8_t size_class,
-                                          frame_cache* local_cache)
+                                          frame_cache* cache)
 {
-    frame_slot* slot = NULL;
-    if (local_cache) {
-        slot = local_cache_pop(local_cache, size_class);
-        if (!slot && local_cache_refill(local_cache, size_class))
-            slot = local_cache_pop(local_cache, size_class);
-    }
+    frame_slot* slot = local_cache_pop(cache, size_class);
+    if (!slot && local_cache_refill(cache, size_class))
+        slot = local_cache_pop(cache, size_class);
     if (!slot)
-        slot = alloc_slot_page(size_class, local_cache);
+        slot = alloc_slot_page(size_class, cache);
     return slot;
 }
 
@@ -420,52 +409,6 @@ frame_slot* frame_slot_alloc(uint32_t min_data_len)
         return NULL;
     return frame_slot_alloc_class((uint8_t)size_class,
                                    get_local_frame_cache());
-}
-
-uint32_t frame_slot_alloc_batch(frame_slot** out, uint32_t max,
-                                uint32_t min_data_len)
-{
-    if (!out)
-        return 0;
-    int size_class = frame_size_class(min_data_len);
-    if (size_class < 0)
-        return 0;
-    frame_cache* local_cache = get_local_frame_cache();
-
-    uint32_t got = 0;
-    while (got < max) {
-        if (local_cache) {
-            frame_slot* slot = local_cache_pop(local_cache,
-                                                (uint8_t)size_class);
-            if (slot) {
-                out[got++] = slot;
-                continue;
-            }
-            if (local_cache_refill(local_cache, (uint8_t)size_class))
-                continue;
-        }
-
-        frame_slot* slot = alloc_slot_page((uint8_t)size_class, local_cache);
-        if (!slot)
-            break;
-        out[got++] = slot;
-    }
-    return got;
-}
-
-frame_slot* frame_slot_init_rx(void* frame, uint8_t* data, uint32_t data_len)
-{
-    if (!frame || !data)
-        return NULL;
-    page_info* page = frame;
-    uint32_t slot_offset = align_up_u32((uint32_t)sizeof(*page), 16U);
-    frame_slot* slot = (frame_slot*)((uint8_t*)page + slot_offset);
-
-    INIT_REF(page, destroy_page_info);
-    uint16_t slot_size = data_len > UINT16_MAX ? UINT16_MAX
-                                                : (uint16_t)data_len;
-    init_slot(slot, page, data, slot_size, true);
-    return slot;
 }
 
 static void destroy_frame_slot(void* ptr)

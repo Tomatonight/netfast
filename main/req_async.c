@@ -15,6 +15,11 @@ _Static_assert((int)NET_ASYNC_SOCKET == (int)REQ_SOCKET &&
                (int)NET_ASYNC_FCNTL == (int)REQ_FCNTL,
                "public async operations must match internal request types");
 
+static inline req* async_req_from_public(net_async_req* request)
+{
+    return (req*)((uint8_t*)request - offsetof(req, public));
+}
+
 typedef struct async_waiter {
     struct async_waiter* next;
     uint32_t need;
@@ -96,8 +101,9 @@ static req* async_cq_pop(async_cq* cq)
     return r;
 }
 
-static int async_submit_batch(fd_entry* entry, req** reqs, uint32_t count);
-static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
+static int async_submit_batch(fd_entry* entry, net_async_req** requests,
+                              uint32_t count);
+static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
                       uint32_t max, int total_timeout_ms);
 static int async_close(fd_entry* entry);
 
@@ -172,9 +178,10 @@ static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
     return 0;
 }
 
-static int async_submit_batch(fd_entry* entry, req** reqs, uint32_t count)
+static int async_submit_batch(fd_entry* entry, net_async_req** requests,
+                              uint32_t count)
 {
-    if (!reqs || count == 0 || count > INT_MAX) {
+    if (!requests || count == 0 || count > INT_MAX) {
         errno = EINVAL;
         return -1;
     }
@@ -190,7 +197,8 @@ static int async_submit_batch(fd_entry* entry, req** reqs, uint32_t count)
     uint64_t worker_mask = 0;
     uint32_t submitted = 0;
     while (submitted < count &&
-           async_submit_one(cq, reqs[submitted], &worker_mask) == 0) {
+           async_submit_one(cq, async_req_from_public(requests[submitted]),
+                            &worker_mask) == 0) {
         submitted++;
     }
 
@@ -215,10 +223,10 @@ static uint64_t async_add_ns(uint64_t now, uint64_t delta)
     return UINT64_MAX - now < delta ? UINT64_MAX : now + delta;
 }
 
-static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
+static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
                       uint32_t max, int total_timeout_ms)
 {
-    if (!reqs || min == 0 || max < min || max > INT_MAX) {
+    if (!requests || min == 0 || max < min || max > INT_MAX) {
         errno = EINVAL;
         return -1;
     }
@@ -244,7 +252,7 @@ static int async_wait(fd_entry* entry, req** reqs, uint32_t min,
             req* r = async_cq_pop(cq);
             if (!r)
                 break;
-            reqs[count++] = r;
+            requests[count++] = &r->public;
         }
 
         if ((uint32_t)count >= min)
@@ -554,26 +562,27 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
     }
     if (!valid) {
         int saved_errno = errno;
-        net_async_req_destroy(r);
+        net_async_req_destroy(&r->public);
         errno = saved_errno;
         return NULL;
     }
     return r;
 }
 
-req* net_async_req_create(int fd, int operation, ...)
+net_async_req* net_async_req_create(int fd, int operation, ...)
 {
     va_list ap;
     va_start(ap, operation);
     req* r = create_async_req_va(fd, (req_type)operation, ap);
     va_end(ap);
-    return r;
+    return r ? &r->public : NULL;
 }
 
-void net_async_req_destroy(req* r)
+void net_async_req_destroy(net_async_req* request)
 {
-    if (!r)
+    if (!request)
         return;
+    req* r = async_req_from_public(request);
 
     spin_lock(&r->done_mtx);
     if (r->async.cq) {
@@ -589,19 +598,6 @@ void net_async_req_destroy(req* r)
     async_req_free(r);
 }
 
-int net_async_req_result(const req* r)
-{
-    if (!r)
-        return -EINVAL;
-
-    req* mutable_r = (req*)r;
-    spin_lock(&mutable_r->done_mtx);
-    bool completed = mutable_r->done && !mutable_r->async.cq;
-    int ret = mutable_r->ret;
-    spin_unlock(&mutable_r->done_mtx);
-    return completed ? ret : -EINVAL;
-}
-
 /* ---- public fd-based wrappers ---- */
 
 static fd_entry* hold_async_entry(int fd)
@@ -615,33 +611,34 @@ static fd_entry* hold_async_entry(int fd)
     return NULL;
 }
 
-int net_async_submit(int cq_fd, req* r)
+int net_async_submit(int cq_fd, net_async_req* request)
 {
     fd_entry* entry = hold_async_entry(cq_fd);
     if (!entry)
         return -1;
-    int ret = async_submit_batch(entry, &r, 1);
+    int ret = async_submit_batch(entry, &request, 1);
     PUT_REF(entry);
     return ret == 1 ? 0 : -1;
 }
 
-int net_async_submit_batch(int cq_fd, req** reqs, uint32_t count)
+int net_async_submit_batch(int cq_fd, net_async_req** requests,
+                           uint32_t count)
 {
     fd_entry* entry = hold_async_entry(cq_fd);
     if (!entry)
         return -1;
-    int ret = async_submit_batch(entry, reqs, count);
+    int ret = async_submit_batch(entry, requests, count);
     PUT_REF(entry);
     return ret;
 }
 
-int net_async_wait(int cq_fd, req** reqs, uint32_t min,
+int net_async_wait(int cq_fd, net_async_req** requests, uint32_t min,
                    uint32_t max, int total_timeout_ms)
 {
     fd_entry* entry = hold_async_entry(cq_fd);
     if (!entry)
         return -1;
-    int ret = async_wait(entry, reqs, min, max, total_timeout_ms);
+    int ret = async_wait(entry, requests, min, max, total_timeout_ms);
     PUT_REF(entry);
     return ret;
 }

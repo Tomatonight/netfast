@@ -13,6 +13,7 @@
 #include "queue.h"
 #include "thread.h"
 #include "list.h"
+#include "netfast.h"
 
 #define REQ_PENDING INT_MIN
 
@@ -64,7 +65,14 @@ typedef struct req {
     mpscq_node node;
     worker* worker;
 
-    req_type type;
+    union {
+        net_async_req public;
+        struct {
+            int type;
+            int async_fd;
+            int ret;
+        };
+    };
     req_status status;
     pending_node pn;          /* for socket->pending attachment */
 
@@ -77,9 +85,6 @@ typedef struct req {
         async_cq* cq;
         fd_entry* entry;
     }async;
-
-    int async_fd;
-    int ret;                    /* success value or negative errno */
 
     struct {
         uint32_t no_wait     : 1;  /* 1=push 方不阻塞等待结果 */

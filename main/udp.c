@@ -460,8 +460,17 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     }
 
     PUT_REF(skb);
-    ret = send_ret == -EAGAIN ? -ENOBUFS
-        : send_ret == -ENETDOWN ? -ENETDOWN : -EHOSTUNREACH;
+    switch (send_ret) {
+    case -EAGAIN:
+        ret = -ENOBUFS;
+        break;
+    case -ENETDOWN:
+        ret = -ENETDOWN;
+        break;
+    default:
+        ret = -EHOSTUNREACH;
+        break;
+    }
 
 exit:
     if (was_bound)

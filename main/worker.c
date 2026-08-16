@@ -197,12 +197,11 @@ void submit_req_2_worker(worker *w, void *argv, int (*cb)(void *), bool wait)
 
 void process_submit_req(req* r)
 {
-    void* argv        = r->argv.worker_req.argv;
     int (*cb)(void*)  = r->argv.worker_req.cb;
     int ret = 0;
 
     if (cb)
-        ret = cb(argv);
+        ret = cb(r->argv.worker_req.argv);
 
     req_notify(r, ret);
 }
