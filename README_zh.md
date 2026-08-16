@@ -298,3 +298,7 @@ test/      单元、集成、压力和静态分析工具
 ```
 
 公共 API 源文件为 [`main/netfast.h`](./main/netfast.h)。
+
+## 项目文章
+
+- [我用 C 和 AF_XDP 写了一个用户态 TCP/IP 协议栈：NetFast](./docs/introducing_netfast_zh.md)

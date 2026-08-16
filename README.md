@@ -320,3 +320,7 @@ test/      unit, integration, stress, and analysis tooling
 ```
 
 The public API source is [`main/netfast.h`](./main/netfast.h).
+
+## Project article
+
+- [Building a userspace TCP/IP stack with C and AF_XDP (Chinese)](./docs/introducing_netfast_zh.md)
