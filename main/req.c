@@ -10,9 +10,6 @@
 
 #include "req.h"
 #include "req_async.h"
-#ifdef TEST_EPOLL
-#include "req_epoll.h"
-#endif
 #include "req_socket.h"
 #include "fd_entry.h"
 #include "log.h"
@@ -31,7 +28,7 @@ req* req_create(void)
 
 void req_init(req* r)
 {
-    memset(r, 0, sizeof(req));
+    memset(r, 0, sizeof(*r));
     spin_lock_init(&r->done_mtx);
     pthread_mutex_init(&r->done_wait_mtx, NULL);
     pthread_cond_init(&r->done_cv, NULL);
@@ -103,6 +100,32 @@ int net_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
         return -1;
     }
     int ret = entry->ops->connect(entry, addr, addrlen);
+    PUT_REF(entry);
+    return ret;
+}
+
+int net_listen(int fd, int backlog)
+{
+    fd_entry* entry = hold_fd_entry(fd);
+    if (!entry || !entry->ops->listen) {
+        errno = entry ? ENOTSOCK : EBADF;
+        PUT_REF(entry);
+        return -1;
+    }
+    int ret = entry->ops->listen(entry, backlog);
+    PUT_REF(entry);
+    return ret;
+}
+
+int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    fd_entry* entry = hold_fd_entry(fd);
+    if (!entry || !entry->ops->accept) {
+        errno = entry ? ENOTSOCK : EBADF;
+        PUT_REF(entry);
+        return -1;
+    }
+    int ret = entry->ops->accept(entry, addr, addrlen);
     PUT_REF(entry);
     return ret;
 }
@@ -265,92 +288,12 @@ int net_shutdown(int fd, int how)
     return ret;
 }
 
-int net_listen(int fd, int backlog)
-{
-    fd_entry* entry = hold_fd_entry(fd);
-    if (!entry || !entry->ops->listen) {
-        errno = entry ? ENOTSOCK : EBADF;
-        PUT_REF(entry);
-        return -1;
-    }
-    int ret = entry->ops->listen(entry, backlog);
-    PUT_REF(entry);
-    return ret;
-}
-
-int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
-{
-    fd_entry* entry = hold_fd_entry(fd);
-    if (!entry || !entry->ops->accept) {
-        errno = entry ? ENOTSOCK : EBADF;
-        PUT_REF(entry);
-        return -1;
-    }
-    int ret = entry->ops->accept(entry, addr, addrlen);
-    PUT_REF(entry);
-    return ret;
-}
-
-int net_epoll_create(void)
-{
-#ifdef TEST_EPOLL
-    return req_epoll_create();
-#else
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-int net_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event)
-{
-#ifdef TEST_EPOLL
-    fd_entry *entry = hold_fd_entry(epfd);
-    if (!entry || !entry->ops->epoll_ctl) {
-        errno = entry ? EINVAL : EBADF;
-        PUT_REF(entry);
-        return -1;
-    }
-    int ret = entry->ops->epoll_ctl(entry, op, sockfd, event);
-    PUT_REF(entry);
-    return ret;
-#else
-    (void)epfd;
-    (void)op;
-    (void)sockfd;
-    (void)event;
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
-                   int timeout_ms)
-{
-#ifdef TEST_EPOLL
-    fd_entry *entry = hold_fd_entry(epfd);
-    if (!entry || !entry->ops->epoll_wait) {
-        errno = entry ? EINVAL : EBADF;
-        PUT_REF(entry);
-        return -1;
-    }
-    int ret = entry->ops->epoll_wait(entry, events, maxevents, timeout_ms);
-    PUT_REF(entry);
-    return ret;
-#else
-    (void)epfd;
-    (void)events;
-    (void)maxevents;
-    (void)timeout_ms;
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-
 void req_notify(req* r, int ret)
 {
     bool notify_free;
     bool async;
     bool wake_waiter = !r->flag.no_wait;
     async_cq* cq = NULL;
-    fd_entry* async_entry = NULL;
 
     if (wake_waiter)
         pthread_mutex_lock(&r->done_wait_mtx);
@@ -370,11 +313,8 @@ void req_notify(req* r, int ret)
     r->done = 1;
     notify_free = r->flag.notify_free;
     async = r->async.cq != NULL;
-    if (async) {
+    if (async)
         cq = r->async.cq;
-        async_entry = r->async.entry;
-        r->async.entry = NULL;
-    }
     if (wake_waiter)
         pthread_cond_signal(&r->done_cv);
     spin_unlock(&r->done_mtx);
@@ -383,11 +323,6 @@ void req_notify(req* r, int ret)
 
     /* async path: push to completion queue instead of signalling cv */
     if (async) {
-        /* The worker is finished with the target object.  Drop the request's
-         * fd_entry hold before publishing the CQ node; after mpscq_push(), a
-         * consumer may immediately dequeue and destroy the request. */
-        PUT_REF(async_entry);
-
         /* Publish all metadata before the node.  Once mpscq_push() returns,
          * a waiter may dequeue and destroy r immediately. */
         /* Reserve the count before publishing the node so a consumer can

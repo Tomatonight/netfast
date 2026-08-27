@@ -38,8 +38,11 @@ typedef struct skbuff {
 	struct Socket* sock;
 	union {
 		struct {
-			uint32_t seq;
+			uint32_t seq;     /* TCP 序号空间的半开左边界。 */
+			uint32_t seq_end; /* 半开右边界，包含 payload 及 SYN/FIN。 */
+			uint32_t sack_retransmit_high;
 			uint8_t flag;
+			uint8_t sack_state;
 		} tcp;
 	} l4_private;
 	union {
@@ -81,22 +84,15 @@ typedef struct skbuff {
 	ref_info ref;
 } skbuff;
 
-static inline skbuff *skb_from_queue_node(list_node *node)
+static inline skbuff *skb_from_node(list_node *node, size_t offset)
 {
-	if (!node)
-		return NULL;
-	return (skbuff *)((uint8_t *)node - offsetof(skbuff, queue_node));
+    if (!node)
+        return NULL;
+    return (skbuff *)((uint8_t *)node - offset);
 }
 
-static inline skbuff *skb_from_tx_node(list_node *node)
-{
-	if (!node)
-		return NULL;
-	return (skbuff *)((uint8_t *)node - offsetof(skbuff, tx_node));
-}
-
-#define SKB_FROM_QUEUE_NODE(n) skb_from_queue_node((n))
-#define SKB_FROM_TX_NODE(n)    skb_from_tx_node((n))
+#define SKB_FROM_NODE(n, member) \
+    skb_from_node((n), offsetof(skbuff, member))
 static inline data_info* skb_end_data_info(skbuff* skb){
 	data_info* end = &skb->data0;
 	while (end->next)
@@ -127,6 +123,7 @@ static inline uint32_t skb_end_space(skbuff* skb)
 	data_info* di = skb_end_data_info(skb);
 	return (uint32_t)((di->slot->data + di->size) - di->end);
 }
+/* Consuming all data keeps the final data_info/frame_slot as an empty buffer. */
 uint32_t skb_consume(skbuff* skb, uint32_t size, bool linear);
 int  skb_send_frags(skbuff* skb);
 bool skb_data_expand(skbuff* skb, uint32_t size, bool begin);

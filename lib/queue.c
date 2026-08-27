@@ -4,9 +4,24 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+void init_queue(queue* q)
+{
+	q->first.next = &q->last;
+	q->first.pre = NULL;
+	q->last.pre = &q->first;
+	q->last.next = NULL;
+	q->element_number = 0;
+}
+
 void add_queue(queue* q, list_node* node)
 {
 	add_list_node_pre(&q->last, node);
+	q->element_number++;
+}
+
+void add_queue_first(queue* q, list_node* node)
+{
+	add_list_node(&q->first, node);
 	q->element_number++;
 }
 
@@ -34,12 +49,6 @@ list_node* pop_queue(queue* q)
 	return node;
 }
 
-void add_queue_first(queue* q, list_node* node)
-{
-	add_list_node(&q->first, node);
-	q->element_number++;
-}
-
 list_node* pop_queue_last(queue* q)
 {
 	if (!q->element_number)
@@ -48,15 +57,6 @@ list_node* pop_queue_last(queue* q)
 	remove_list_node(node);
 	q->element_number--;
 	return node;
-}
-
-void init_queue(queue* q)
-{
-	q->first.next = &q->last;
-	q->first.pre = NULL;
-	q->last.pre = &q->first;
-	q->last.next = NULL;
-	q->element_number = 0;
 }
 
 bool queue_exist(queue* q, uint64_t element)

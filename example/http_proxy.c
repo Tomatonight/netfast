@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -19,6 +20,9 @@
 #define HEADER_CAPACITY (32u * 1024u)
 #define RELAY_CAPACITY (32u * 1024u)
 #define MAX_HOST_LENGTH 255u
+#define HEADER_TIMEOUT_MS 10000u
+#define CONNECT_TIMEOUT_MS 10000u
+#define RELAY_IDLE_TIMEOUT_MS 30000u
 
 typedef struct proxy_conn proxy_conn;
 typedef struct proxy_op proxy_op;
@@ -54,11 +58,12 @@ struct proxy_conn {
     size_t initial_len;
     uint64_t client_to_upstream;
     uint64_t upstream_to_client;
+    uint64_t last_activity_ms;
 };
 
 struct proxy_op {
     proxy_op *next;
-    net_async_req *request;
+    req *request;
     proxy_op_kind kind;
     proxy_conn *conn;
     int fd;
@@ -72,6 +77,19 @@ struct proxy_op {
 static volatile sig_atomic_t g_stop;
 static proxy_op *g_ops;
 static uint64_t g_next_connection_id = 1;
+
+static int set_socket_timeout(int fd, uint32_t timeout_ms)
+{
+    struct timeval timeout = {
+        .tv_sec = (time_t)(timeout_ms / 1000u),
+        .tv_usec = (suseconds_t)(timeout_ms % 1000u) * 1000,
+    };
+    if (net_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                       &timeout, sizeof(timeout)) != 0)
+        return -1;
+    return net_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                          &timeout, sizeof(timeout));
+}
 
 static const char *op_name(proxy_op_kind kind)
 {
@@ -93,6 +111,9 @@ static const char *op_name(proxy_op_kind kind)
 
 static void proxy_log(const char *level, const char *fmt, ...)
 {
+    if (strcmp(level, "ERROR") != 0)
+        return;
+
     struct timespec now;
     struct tm tm_now;
     char timestamp[32];
@@ -158,13 +179,42 @@ static void op_unlink(proxy_op *op)
     }
 }
 
-static proxy_op *op_find(net_async_req *request)
+static proxy_op *op_find(req *request)
 {
     for (proxy_op *op = g_ops; op; op = op->next) {
         if (op->request == request)
             return op;
     }
     return NULL;
+}
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static bool is_relay_operation(proxy_op_kind kind)
+{
+    return kind == PROXY_OP_CLIENT_READ ||
+           kind == PROXY_OP_UPSTREAM_READ ||
+           kind == PROXY_OP_UPSTREAM_WRITE ||
+           kind == PROXY_OP_CLIENT_WRITE;
+}
+
+static void relay_mark_activity(proxy_conn *conn)
+{
+    conn->last_activity_ms = monotonic_ms();
+}
+
+static bool relay_is_active(const proxy_conn *conn)
+{
+    uint64_t now = monotonic_ms();
+
+    return conn->last_activity_ms &&
+           now - conn->last_activity_ms < RELAY_IDLE_TIMEOUT_MS;
 }
 
 static void conn_destroy(proxy_conn *conn)
@@ -209,40 +259,40 @@ static int submit_operation(int cq_fd, proxy_op *op)
     switch (op->kind) {
     case PROXY_OP_ACCEPT:
         op->peer_addr_len = sizeof(op->peer_addr);
-        op->request = net_async_req_create(op->fd, NET_ASYNC_ACCEPT,
+        op->request = net_async_req_create(op->fd, REQ_ACCEPT,
             (struct sockaddr *)&op->peer_addr, &op->peer_addr_len);
         break;
     case PROXY_OP_CLIENT_HEADERS:
-        op->request = net_async_req_create(conn->client_fd, NET_ASYNC_READ,
+        op->request = net_async_req_create(conn->client_fd, REQ_READ,
             conn->headers + conn->headers_len,
             (uint32_t)(HEADER_CAPACITY - conn->headers_len));
         break;
     case PROXY_OP_UPSTREAM_SOCKET:
-        op->request = net_async_req_create(-1, NET_ASYNC_SOCKET, AF_INET,
+        op->request = net_async_req_create(-1, REQ_SOCKET, AF_INET,
                                             SOCK_STREAM, IPPROTO_TCP);
         break;
     case PROXY_OP_UPSTREAM_CONNECT:
         op->request = net_async_req_create(conn->upstream_fd,
-            NET_ASYNC_CONNECT, (const struct sockaddr *)&conn->upstream_addr,
+            REQ_CONNECT, (const struct sockaddr *)&conn->upstream_addr,
             (socklen_t)sizeof(conn->upstream_addr));
         break;
     case PROXY_OP_CONNECT_REPLY:
     case PROXY_OP_ERROR_REPLY:
     case PROXY_OP_CLIENT_WRITE:
-        op->request = net_async_req_create(conn->client_fd, NET_ASYNC_WRITE,
+        op->request = net_async_req_create(conn->client_fd, REQ_WRITE,
             op->buffer + op->offset, (uint32_t)(op->length - op->offset));
         break;
     case PROXY_OP_INITIAL_UPSTREAM_WRITE:
     case PROXY_OP_UPSTREAM_WRITE:
-        op->request = net_async_req_create(conn->upstream_fd, NET_ASYNC_WRITE,
+        op->request = net_async_req_create(conn->upstream_fd, REQ_WRITE,
             op->buffer + op->offset, (uint32_t)(op->length - op->offset));
         break;
     case PROXY_OP_CLIENT_READ:
-        op->request = net_async_req_create(conn->client_fd, NET_ASYNC_READ,
+        op->request = net_async_req_create(conn->client_fd, REQ_READ,
             op->buffer, (uint32_t)op->length);
         break;
     case PROXY_OP_UPSTREAM_READ:
-        op->request = net_async_req_create(conn->upstream_fd, NET_ASYNC_READ,
+        op->request = net_async_req_create(conn->upstream_fd, REQ_READ,
             op->buffer, (uint32_t)op->length);
         break;
     }
@@ -256,9 +306,9 @@ static int submit_operation(int cq_fd, proxy_op *op)
 
     op_link(op);
     if (net_async_submit(cq_fd, op->request) == 0) {
-        proxy_log("DEBUG", "conn=%llu submitted op=%s async_fd=%d",
+        proxy_log("DEBUG", "conn=%llu submitted op=%s fd=%d",
                   conn ? (unsigned long long)conn->id : 0,
-                  op_name(op->kind), op->request->async_fd);
+                  op_name(op->kind), op->fd);
         return 0;
     }
 
@@ -361,6 +411,7 @@ static int start_relay(int cq_fd, proxy_conn *conn)
 {
     if (conn->closing)
         return -1;
+    relay_mark_activity(conn);
     if (submit_relay_read(cq_fd, conn, true) != 0 ||
         submit_relay_read(cq_fd, conn, false) != 0) {
         conn_close(conn, "cannot start relay");
@@ -569,7 +620,7 @@ static int resolve_target(proxy_conn *conn)
     struct addrinfo *result = NULL;
     int ret = getaddrinfo(conn->host, port, &hints, &result);
     if (ret != 0) {
-        proxy_log("ERROR", "conn=%llu resolve %s:%s failed: %s",
+        proxy_log("INFO", "conn=%llu resolve %s:%s failed: %s",
                   (unsigned long long)conn->id, conn->host, port,
                   gai_strerror(ret));
         return -1;
@@ -624,6 +675,11 @@ static void complete_accept(int cq_fd, proxy_op *op, int ret, int saved_errno)
     conn->id = g_next_connection_id++;
     conn->client_fd = ret;
     conn->upstream_fd = -1;
+    if (set_socket_timeout(conn->client_fd, HEADER_TIMEOUT_MS) != 0) {
+        conn_close(conn, "cannot set client timeout");
+        conn_reap(conn);
+        return;
+    }
     conn->headers = calloc(1, HEADER_CAPACITY + 1);
     if (!conn->headers) {
         conn_close(conn, "cannot allocate header buffer");
@@ -660,8 +716,20 @@ static void complete_headers(int cq_fd, proxy_conn *conn, int ret,
         return;
     }
 
-    if (prepare_http_request(conn, (size_t)header_end) != 0 ||
-        resolve_target(conn) != 0) {
+    if (prepare_http_request(conn, (size_t)header_end) != 0) {
+        send_error(cq_fd, conn, "400 Bad Request");
+        return;
+    }
+    /* Never proxy back to this listener.  A request for the proxy URL itself
+     * would otherwise recurse through the public NAT address until every
+     * connection slot is consumed. */
+    if (conn->port == PROXY_PORT) {
+        proxy_log("INFO", "conn=%llu refusing proxy loop target=%s:%u",
+                  (unsigned long long)conn->id, conn->host, conn->port);
+        send_error(cq_fd, conn, "508 Loop Detected");
+        return;
+    }
+    if (resolve_target(conn) != 0) {
         send_error(cq_fd, conn, "400 Bad Request");
         return;
     }
@@ -675,10 +743,22 @@ static void complete_headers(int cq_fd, proxy_conn *conn, int ret,
 static void complete_write(int cq_fd, proxy_op *op, int ret, int saved_errno)
 {
     proxy_conn *conn = op->conn;
+    if (ret < 0 && is_relay_operation(op->kind) &&
+        (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) &&
+        relay_is_active(conn)) {
+        if (submit_operation(cq_fd, op) == 0)
+            return;
+        op_free(op);
+        conn_close(conn, "cannot resume timed-out relay write");
+        return;
+    }
     if (ret <= 0) {
+        op_free(op);
         conn_close(conn, ret == 0 ? "short write" : strerror(saved_errno));
         return;
     }
+    if (is_relay_operation(op->kind))
+        relay_mark_activity(conn);
     op->offset += (size_t)ret;
     if (op->offset < op->length) {
         if (submit_operation(cq_fd, op) != 0) {
@@ -722,12 +802,22 @@ static void complete_relay_read(int cq_fd, proxy_op *op, int ret,
                                 int saved_errno)
 {
     proxy_conn *conn = op->conn;
+    if (ret < 0 &&
+        (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) &&
+        relay_is_active(conn)) {
+        if (submit_operation(cq_fd, op) == 0)
+            return;
+        op_free(op);
+        conn_close(conn, "cannot resume timed-out relay read");
+        return;
+    }
     if (ret <= 0) {
         op_free(op);
         conn_close(conn, ret == 0 ? "relay EOF" : strerror(saved_errno));
         return;
     }
 
+    relay_mark_activity(conn);
     op->length = (size_t)ret;
     op->offset = 0;
     op->kind = op->kind == PROXY_OP_CLIENT_READ ? PROXY_OP_UPSTREAM_WRITE
@@ -738,7 +828,7 @@ static void complete_relay_read(int cq_fd, proxy_op *op, int ret,
     }
 }
 
-static void dispatch_completion(int cq_fd, net_async_req *request)
+static void dispatch_completion(int cq_fd, req *request)
 {
     proxy_op *op = op_find(request);
     if (!op) {
@@ -748,11 +838,11 @@ static void dispatch_completion(int cq_fd, net_async_req *request)
     }
 
     proxy_conn *conn = op->conn;
-    int ret = request->ret;
+    int ret = net_async_result(request, NULL);
     int saved_errno = ret < 0 ? -ret : 0;
-    proxy_log("DEBUG", "conn=%llu completed op=%s async_fd=%d ret=%d errno=%d",
+    proxy_log("DEBUG", "conn=%llu completed op=%s fd=%d ret=%d errno=%d",
               conn ? (unsigned long long)conn->id : 0, op_name(op->kind),
-              request->async_fd, ret, saved_errno);
+              op->fd, ret, saved_errno);
     op_unlink(op);
     op->request = NULL;
     net_async_req_destroy(request);
@@ -779,13 +869,17 @@ static void dispatch_completion(int cq_fd, net_async_req *request)
             break;
         }
         conn->upstream_fd = ret;
+        if (set_socket_timeout(conn->upstream_fd, CONNECT_TIMEOUT_MS) != 0) {
+            conn_close(conn, "cannot set upstream connect timeout");
+            break;
+        }
         if (submit_upstream_connect(cq_fd, conn) != 0)
             send_error(cq_fd, conn, "502 Bad Gateway");
         break;
     case PROXY_OP_UPSTREAM_CONNECT:
         op_free(op);
         if (ret < 0) {
-            proxy_log("ERROR", "conn=%llu connect %s:%u failed: %s",
+            proxy_log("INFO", "conn=%llu connect %s:%u failed: %s",
                       (unsigned long long)conn->id, conn->host, conn->port,
                       strerror(saved_errno));
             send_error(cq_fd, conn, "502 Bad Gateway");
@@ -794,6 +888,11 @@ static void dispatch_completion(int cq_fd, net_async_req *request)
         proxy_log("INFO", "conn=%llu connected target=%s:%u fd=%d",
                   (unsigned long long)conn->id, conn->host, conn->port,
                   conn->upstream_fd);
+        if (set_socket_timeout(conn->client_fd, RELAY_IDLE_TIMEOUT_MS) != 0 ||
+            set_socket_timeout(conn->upstream_fd, RELAY_IDLE_TIMEOUT_MS) != 0) {
+            conn_close(conn, "cannot set relay timeout");
+            break;
+        }
         if (conn->is_connect) {
             static const char established[] =
                 "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -855,13 +954,26 @@ int main(void)
     proxy_log("INFO", "NetFast async HTTP proxy listening on 0.0.0.0:%u",
               PROXY_PORT);
     while (!g_stop) {
-        net_async_req *completed[64];
+        req *completed[64];
         int count = net_async_wait(cq_fd, completed, 1, 64, 1000);
         if (count < 0) {
             if (errno == EINTR)
                 continue;
             proxy_log("ERROR", "async wait failed: %s", strerror(errno));
             break;
+        }
+        /* A timeout and useful work for the same connection can be returned
+         * in one CQ batch.  Record every successful relay operation before
+         * dispatching any timeout, so completion order cannot close an active
+         * one-way transfer. */
+        uint64_t activity_ms = monotonic_ms();
+        for (int i = 0; i < count; ++i) {
+            proxy_op *op = op_find(completed[i]);
+
+            if (op && op->conn &&
+                net_async_result(completed[i], NULL) > 0 &&
+                is_relay_operation(op->kind))
+                op->conn->last_activity_ms = activity_ms;
         }
         for (int i = 0; i < count; ++i)
             dispatch_completion(cq_fd, completed[i]);

@@ -47,6 +47,7 @@ typedef struct protocol_ops {
     int (*write)(struct Socket* sock, req* req, const void* buf, uint32_t len);
     int (*recvfrom)(struct Socket* sock, req* req, void* buf, uint32_t len, int flags, sockaddr_in* addr, socklen_t* addrlen);
     int (*sendto)(struct Socket* sock, req* req, const void* buf, uint32_t len, int flags, sockaddr_in* addr, socklen_t addrlen);
+
     int (*release)(struct Socket* sock, req* req);
     int (*connect)(struct Socket* sock, req* req, const struct sockaddr_in* addr, socklen_t addrlen);
     int (*bind)(struct Socket* sock, req* req, const struct sockaddr_in* addr, socklen_t addrlen);
@@ -56,7 +57,6 @@ typedef struct protocol_ops {
     int (*getpeername)(struct Socket* sock, req* req, struct sockaddr_in* addr, socklen_t* addrlen);
     int (*setsockopt)(struct Socket* sock, req* req, int level, int optname, const void* optval, socklen_t optlen);
     int (*getsockopt)(struct Socket* sock, req* req, int level, int optname, void* optval, socklen_t* optlen);
-    uint32_t (*poll)(struct Socket* sock);
     int (*shutdown)(struct Socket* sock, req* req, int how);
 } protocol_ops;
 
@@ -104,7 +104,7 @@ typedef struct Socket {
     } flag;
 
     queue recv_queue;
-    uint32_t recv_buffer_len;
+    uint32_t recv_buffer_len; /* bytes currently readable by the application */
     uint32_t recv_buffer_len_max;
     queue send_queue;
     uint32_t send_buffer_len;
@@ -128,25 +128,28 @@ typedef struct Socket {
 } Socket;
 
 void socket_notify_event(Socket* sock, enum notify_event event);
-Socket* create_socket(int family, int type, int protocol);
 
-void _socket(req* req);
-void _read(req* req);
-void _write(req* req);
-void _close(req* req);
-void _shutdown(req* req);
-void _connect(req* req);
-void _bind(req* req);
-void _listen(req* req);
-void _accept(req* req);
-void _sendto(req* req);
-void _recvfrom(req* req);
-void _getsockname(req* req);
-void _getpeername(req* req);
-void _setsockopt(req* req);
-void _getsockopt(req* req);
-void _fcntl(req* req);
-void _poll(req* req);
+Socket* create_socket(int family, int type, int protocol);
+void set_socket_worker(Socket* sock, worker* w);
+void destroy_socket(Socket* sock);
+void socket_detach_with_fd_entry(Socket* sock);
+
+void socket_process_create_request(req* req);
+void socket_process_bind_request(req* req);
+void socket_process_listen_request(req* req);
+void socket_process_accept_request(req* req);
+void socket_process_connect_request(req* req);
+void socket_process_read_request(req* req);
+void socket_process_write_request(req* req);
+void socket_process_sendto_request(req* req);
+void socket_process_recvfrom_request(req* req);
+void socket_process_getsockname_request(req* req);
+void socket_process_getpeername_request(req* req);
+void socket_process_close_request(req* req);
+void socket_process_shutdown_request(req* req);
+void socket_process_setsockopt_request(req* req);
+void socket_process_getsockopt_request(req* req);
+void socket_process_fcntl_request(req* req);
 
 int socket_setsockopt(struct Socket* sock, int level, int optname, const void* optval, socklen_t optlen);
 int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval, socklen_t* optlen);
@@ -170,14 +173,11 @@ bool bind_exist(const addr_key* key, const bind_table* bound_table);
 
 void set_skb_by_socket(skbuff* skb, Socket* sock);
 int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id);
-void destroy_socket(Socket* sock);
 
 int socket_auto_bind(Socket* sock, bind_table* bound_table,
                      const addr_key* local_key, const uint8_t* dest_ip,
                      uint16_t dest_port, uint32_t scope_id);
 
 Socket* socket_select(Socket* sock, uint32_t rss);
-void set_socket_worker(Socket* sock, worker* w);
-void socket_detach_with_fd_entry(Socket* sock);
 
 #endif

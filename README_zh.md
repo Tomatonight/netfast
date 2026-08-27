@@ -29,7 +29,7 @@ worker 独占的网络协议栈、UMEM 数据缓冲和基于完成队列（CQ）
 异步接口可以理解为三个对象：
 
 - **CQ（完成队列）**：应用提交请求、接收完成结果的队列。
-- **请求（`net_async_req`）**：描述要对哪个 fd 执行什么操作。
+- **请求（`req`）**：描述要对哪个 fd 执行什么操作。
 - **完成请求**：操作结束后，`net_async_wait()` 返回原来的请求指针，结果
   直接保存在请求中。
 
@@ -50,8 +50,8 @@ int async_write_once(int socket_fd, const void *buffer, uint32_t length)
         return -1;
 
     /* 2. 创建写请求。buffer 在请求完成前必须保持有效。 */
-    net_async_req *request = net_async_req_create(
-        socket_fd, NET_ASYNC_WRITE, buffer, length);
+    req *request = net_async_req_create(
+        socket_fd, REQ_WRITE, buffer, length);
     if (!request) {
         int saved_errno = errno;
         net_async_close(cq_fd);
@@ -69,7 +69,7 @@ int async_write_once(int socket_fd, const void *buffer, uint32_t length)
     }
 
     /* 4. 等待一个完成；-1 表示一直等待。 */
-    net_async_req *completed = NULL;
+    req *completed = NULL;
     if (net_async_wait(cq_fd, &completed, 1, 1, -1) != 1) {
         int saved_errno = errno;
         net_async_close(cq_fd);
@@ -77,13 +77,8 @@ int async_write_once(int socket_fd, const void *buffer, uint32_t length)
         return -1;
     }
 
-    /*
-     * completed 就是上面提交的 request：
-     *   completed->type     == NET_ASYNC_WRITE
-     *   completed->async_fd == socket_fd
-     *   completed->ret      == 写入字节数，失败时为 -errno
-     */
-    int result = completed->ret;
+    req_type type;
+    int result = net_async_result(completed, &type);
     net_async_req_destroy(completed);
     net_async_close(cq_fd);
 
@@ -98,27 +93,41 @@ int async_write_once(int socket_fd, const void *buffer, uint32_t length)
 常用调用的参数形式如下：
 
 ```c
-net_async_req_create(-1, NET_ASYNC_SOCKET, family, type, protocol);
-net_async_req_create(fd, NET_ASYNC_CONNECT, addr, addrlen);
-net_async_req_create(fd, NET_ASYNC_ACCEPT, addr, addrlen_ptr);
-net_async_req_create(fd, NET_ASYNC_READ, buffer, length);
-net_async_req_create(fd, NET_ASYNC_WRITE, buffer, length);
-net_async_req_create(fd, NET_ASYNC_CLOSE);
+net_async_req_create(-1, REQ_SOCKET, family, type, protocol);
+net_async_req_create(fd, REQ_CONNECT, addr, addrlen);
+net_async_req_create(fd, REQ_ACCEPT, addr, addrlen_ptr);
+net_async_req_create(fd, REQ_READ, buffer, length);
+net_async_req_create(fd, REQ_WRITE, buffer, length);
+net_async_req_create(fd, REQ_CLOSE);
 ```
 
-完成后直接访问 `req->type`、`req->async_fd` 和 `req->ret`：
+完成后调用 `net_async_result()`。其返回操作结果，可为 `NULL` 的输出
+指针用来获取请求类型：
+
+```c
+int result = net_async_result(completed, NULL);
+int result_with_type = net_async_result(completed, &type);
+```
+
+请求参数不再由 `net_async_result()` 返回，需要时通过
+`net_async_argv()` 访问：
+
+```c
+req_argv *argv = net_async_argv(completed);
+struct sockaddr *client_addr = argv->accept.addr;
+socklen_t client_addr_len = *argv->accept.addrlen;
+```
 
 - `type` 表示完成的请求类型。
-- `async_fd` 是创建请求时传入的 fd。
-- `ret` 成功时是非负结果，失败时是 `-errno`。`SOCKET` 和 `ACCEPT`
+- 返回值成功时是非负结果，失败时是 `-errno`。`SOCKET` 和 `ACCEPT`
   成功时返回新 fd，`READ` 和 `WRITE` 成功时返回处理的字节数；`READ`
   返回 `0` 表示对端已经正常关闭发送方向。
 
-需要并发处理多个操作时，可以连续调用 `net_async_submit()`，或者使用
-`net_async_submit_batch()` 批量提交。一次最多取回 64 个完成的典型写法是：
+需要并发处理多个操作时，对每个请求调用一次 `net_async_submit()`。一次最多
+取回 64 个完成的典型写法是：
 
 ```c
-net_async_req *completed[64];
+req *completed[64];
 int count = net_async_wait(cq_fd, completed,
                            1,     /* 至少等待 1 个完成 */
                            64,    /* 数组最多容纳 64 个 */
@@ -129,11 +138,14 @@ int count = net_async_wait(cq_fd, completed,
 
 1. `net_async_req_create()` 返回由应用持有的请求。
 2. `net_async_submit()` 成功后，请求所有权转移给 CQ。
-3. `net_async_submit_batch()` 返回正数时，只转移数组前缀中已接受的请求。
-4. `net_async_wait()` 把已完成请求的所有权交回调用者。
-5. 完成后直接读取请求的 `type`、`async_fd` 和 `ret`，再调用
-   `net_async_req_destroy()` 释放请求。
-6. 请求引用的数据缓冲和地址对象必须保持有效，直到请求完成。
+3. `net_async_wait()` 把已完成请求的所有权交回调用者。
+4. 完成后使用 `net_async_result()` 读取结果。取回的请求可以再次
+   提交到相同或其他 CQ，也可以调用 `net_async_req_destroy()` 释放。
+5. 在途请求不能重复提交；在 `net_async_wait()` 返回该请求前，
+   `net_async_submit()` 会失败并设置 `errno = EBUSY`。
+6. 重新提交使用 `net_async_argv()` 中的当前参数；如需修改，只能在
+   请求被取回后、下一次提交前修改。
+7. 请求引用的数据缓冲和地址对象必须保持有效，直到请求完成。
 
 `net_async_wait()` 在整体超时到期时可以返回不足 `min_complete` 的部分批次。
 多个线程可以在同一 CQ 上使用不同的 `min_complete`。
@@ -168,7 +180,7 @@ int count = net_async_wait(cq_fd, completed,
 
 ## 构建
 
-### 引导式安装（Debian/Ubuntu）
+### 安装脚本（Debian/Ubuntu）
 
 首次安装可以直接运行：
 
@@ -176,17 +188,14 @@ int count = net_async_wait(cq_fd, completed,
 ./setup.sh
 ```
 
-脚本会检查或安装构建依赖，读取所选网卡的当前队列数，生成本机
-`netfast_config.json`，构建 Release 版并安装到 `/usr/local`。安装过程不会
-挂载 XDP；第一个以 root 身份加载 `libnetfast.so` 的进程才会挂载。
+脚本只检查或安装构建依赖，然后依次执行默认的 Release 版 `make` 和
+`make install`。它不选择接口、不计算队列或 worker，也不生成配置文件。
+本地存在 `netfast_config.json` 时安装该文件，否则安装
+`config.example.json`。安装过程不会挂载 XDP；第一个以 root 身份加载
+`libnetfast.so` 的进程才会挂载。
 
-在可控实验环境中可以显式指定参数：
-
-```bash
-./setup.sh --interface ens192 --queues 2 --workers 2 --yes
-```
-
-使用 `./setup.sh --help` 查看所有选项，使用 `--dry-run` 只检查而不修改系统。
+使用 `./setup.sh --help` 查看所有选项，使用 `--dry-run` 只检查依赖并显示
+将要执行的命令。
 
 ### 依赖
 
@@ -196,15 +205,15 @@ int count = net_async_wait(cq_fd, completed,
 - 挂载 XDP 和初始化运行时所需的 root 权限
 
 ```bash
+make -j$(nproc)                  # 默认 Release
 make debug -j$(nproc)
-make release -j$(nproc)
 make relwithdebinfo -j$(nproc)
 ```
 
 动态库位于 `build/libnetfast.so`。安装 Release 版本：
 
 ```bash
-sudo make PROFILE=release install
+sudo make install
 ```
 
 默认安装到 `/usr/local`，包含动态库、公共头文件、XDP 重定向程序和配置文件。
@@ -222,7 +231,7 @@ sudo make PROFILE=release install
 ```bash
 cp config.example.json netfast_config.json
 editor netfast_config.json
-sudo make PROFILE=release install
+sudo make install
 ```
 
 Makefile 在本地 `netfast_config.json` 存在时优先安装它，否则安装
@@ -237,6 +246,8 @@ Makefile 在本地 `netfast_config.json` 存在时优先安装它，否则安装
   "open_if": [
     { "name": "ens192", "queues": 2 }
   ],
+  "source_port_range": [1024, 32767],
+  "redirect_fragments": false,
   "logfile": "/tmp/user_stack.log"
 }
 ```
@@ -249,6 +260,8 @@ Makefile 在本地 `netfast_config.json` 存在时优先安装它，否则安装
 | `open_if` | 是 | NetFast 接管的网卡数组，不能为空，网卡名不能重复。未列入的网卡不会创建 AF_XDP socket。 |
 | `open_if[].name` | 是 | Linux 网卡名，例如 `ens192`，可用 `ip -br link` 查看。 |
 | `open_if[].queues` | 否 | AF_XDP RX/TX 队列数，范围为 1～32。省略或填 `0` 时等于 `thread_num`；网卡必须实际提供这些队列 ID。 |
+| `source_port_range` | 否 | TCP 和 UDP 共用的源端口闭区间。自动绑定只从该范围选端口；显式绑定非零端口时，范围外端口会失败。默认值为 `[1024, 32767]`。 |
+| `redirect_fragments` | 否 | 为 `true` 时把 IPv4/IPv6 分片报文重定向给 NetFast；为 `false`（默认值）时留给内核。 |
 | `logfile` | 是 | 非空日志路径，长度小于 256 字节。父目录存在且权限允许时，NetFast 会创建该文件。 |
 
 `queues` 表示硬件队列 ID 数量，不是每个 worker 的队列数。队列 `q` 分配给
@@ -261,19 +274,27 @@ ethtool -x ens192
 ```
 
 单队列网卡应设置 `"queues": 1`，NetFast 会跳过 RSS 配置。多队列时
-NetFast 会使用编译内置的默认 key 写入 Toeplitz RSS 间接表；RSS ioctl
-失败会记录日志并继续初始化，但流量可能无法均匀分配。非本机 IPv4 和
-IPv6 报文转发默认关闭。
+NetFast 会使用编译内置的双向一致 key 写入 Toeplitz RSS 间接表，使同一
+IPv4/IPv6 TCP 或 UDP 流的两个方向进入相同队列和 worker；RSS ioctl 失败
+会记录日志并继续初始化，但流量可能无法均匀分配。非本机 IPv4 和 IPv6
+报文转发默认关闭。
 
 配置在动态库构造阶段只解析一次。JSON 格式错误、缺少必填字段、数值
 越界、队列不存在或日志路径不可写都会导致初始化失败。修改安装配置
 后必须重启应用。重新执行 `make install` 会用当前选中的 `CONFIG_FILE`
 覆盖已安装配置。
 
+初始化期间，NetFast 会把 `source_port_range` 合并写入 Linux 的
+`net.ipv4.ip_local_reserved_ports`，保留系统已有配置，同时阻止内核 TCP/UDP
+协议栈自动分配 NetFast 接管的端口。该 sysctl 属于当前网络命名空间，修改它
+需要与挂载 XDP 通常相同的管理权限。NetFast 正常退出时会把该范围恢复为
+初始化前的保留状态，范围外的保留配置保持不变。完成端口保留后的初始化失败
+也会执行相同清理；不会运行动态库析构流程的异常终止无法自动清理。
+
 ### XDP 流量接管
 
-XDP 挂载后，`open_if` 中配置的接口上的所有 TCP 和 UDP 流量都会由
-NetFast 接管。
+XDP 挂载后，只重定向目的端口落在 `source_port_range` 内的 TCP/UDP 报文。
+分片报文无法可靠取得传输层目的端口，因此由 `redirect_fragments` 单独控制。
 
 ## 同步接口
 

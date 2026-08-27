@@ -8,9 +8,6 @@
 #include "worker.h"
 #include "req.h"
 #include "socket.h"
-#ifdef TEST_EPOLL
-#include "req_epoll.h"
-#endif
 #include "udp.h"
 #include "xdp.h"
 #include "fd_entry.h"
@@ -22,13 +19,13 @@
 
 stack_maps* g_stack_maps;
 
-void process_request(req *r)
+void stack_process_request(req *r)
 {
     if(r->flag.async_cancel){
         req_notify(r, -ECANCELED);
         return;
     }
-    fd_entry* sock_entry=get_sock_entry_by_req(r);
+    fd_entry* sock_entry=fd_entry_from_request(r);
     if(sock_entry){
         worker* entry_worker = fd_entry_get_worker(sock_entry);
         if (!entry_worker) {
@@ -36,70 +33,62 @@ void process_request(req *r)
             return;
         }
         if(entry_worker != get_current_worker()){
-            change_req_worker(r, entry_worker);
+            worker_move_request(r, entry_worker);
             return;
         }
     }
     switch (r->type)
     {
     case REQ_SOCKET:
-        _socket(r);
+        socket_process_create_request(r);
         break;
     case REQ_BIND:
-        _bind(r);
+        socket_process_bind_request(r);
         break;
     case REQ_CONNECT:
-        _connect(r);
+        socket_process_connect_request(r);
         break;
     case REQ_LISTEN:
-        _listen(r);
+        socket_process_listen_request(r);
         break;
     case REQ_ACCEPT:
-        _accept(r);
+        socket_process_accept_request(r);
         break;
     case REQ_WRITE:
-        _write(r);
+        socket_process_write_request(r);
         break;
     case REQ_READ:
-        _read(r);
+        socket_process_read_request(r);
         break;
     case REQ_SENDTO:
-        _sendto(r);
+        socket_process_sendto_request(r);
         break;
     case REQ_RECVFROM:
-        _recvfrom(r);
+        socket_process_recvfrom_request(r);
         break;
     case REQ_GETSOCKNAME:
-        _getsockname(r);
+        socket_process_getsockname_request(r);
         break;
     case REQ_GETPEERNAME:
-        _getpeername(r);
+        socket_process_getpeername_request(r);
         break;
     case REQ_CLOSE:
-        _close(r);
+        socket_process_close_request(r);
         break;
     case REQ_SHUTDOWN:
-        _shutdown(r);
+        socket_process_shutdown_request(r);
         break;
     case REQ_SETSOCKOPT:
-        _setsockopt(r);
+        socket_process_setsockopt_request(r);
         break;
     case REQ_GETSOCKOPT:
-        _getsockopt(r);
+        socket_process_getsockopt_request(r);
         break;
     case REQ_FCNTL:
-        _fcntl(r);
+        socket_process_fcntl_request(r);
         break;
-    case REQ_POLL:
-        _poll(r);
-        break;
-#ifdef TEST_EPOLL
-    case REQ_EPOLL_CTL:
-        _epoll_ctl(r);
-        break;
-#endif
-    case REQ_WORKER_REQ:
-        process_submit_req(r);
+        case REQ_WORKER_REQ:
+        worker_process_submitted_request(r);
         break;
     default:
         req_notify(r, -EINVAL);
@@ -109,7 +98,7 @@ void process_request(req *r)
 
 #define REQ_TASK_BUDGET 128u
 
-static void req_task_cb(task *t)
+static void stack_request_task_cb(task *t)
 {
     stack_instance *s = (stack_instance *)t->argv;
     notify_queue_drain(&s->req_msg);
@@ -120,7 +109,7 @@ static void req_task_cb(task *t)
             break;
 
         req *r = (req *)n;
-        process_request(r);
+        stack_process_request(r);
     }
     if (!notify_queue_is_empty(&s->req_msg)) {
         t->parent_thread->work_pending = 1;
@@ -131,13 +120,13 @@ static void req_task_cb(task *t)
 #define PKT_TASK_BUDGET 1024u
 #define TUPLE_BUCKET_COUNT (128U * 1024U)
 
-static void time_task_cb(task* t)
+static void stack_time_task_cb(task* t)
 {
     (void)t;
     current_time_ms = read_now_ms();
 }
 
-static void pkt_task_cb(task *t)
+static void stack_packet_task_cb(task *t)
 {
     stack_instance *s = (stack_instance *)t->argv;
 
@@ -234,7 +223,7 @@ int stack_instance_init(stack_instance *s, thread *master)
     s->time_task = create_task(TASK_TYPE_LOOP);
     if (!s->time_task)
         goto fail;
-    s->time_task->cb_loop = time_task_cb;
+    s->time_task->cb_loop = stack_time_task_cb;
     if (register_task(master, s->time_task) < 0)
         goto fail;
 
@@ -272,7 +261,7 @@ int stack_instance_init(stack_instance *s, thread *master)
     if (!s->req_task)
         goto fail;
     s->req_task->fd = s->req_msg.efd;
-    s->req_task->cb_read = req_task_cb;
+    s->req_task->cb_read = stack_request_task_cb;
     s->req_task->argv = (uint64_t)s;
     if (register_task(master, s->req_task) < 0)
         goto fail;
@@ -284,7 +273,7 @@ int stack_instance_init(stack_instance *s, thread *master)
     if (!s->pkt_task)
         goto fail;
     s->pkt_task->fd = s->pkt_msg.efd;
-    s->pkt_task->cb_read = pkt_task_cb;
+    s->pkt_task->cb_read = stack_packet_task_cb;
     s->pkt_task->argv = (uint64_t)s;
     if (register_task(master, s->pkt_task) < 0)
         goto fail;
@@ -298,9 +287,9 @@ fail:
     return -1;
 }
 
-/* req_pending_cb: callback installed in req->pn, invoked by socket_notify_event.
- * With bit flags, checks if any of the events intersect the req's wait mask. */
-void req_pending_cb(Socket* sock, void* value, enum notify_event event)
+/* stack_request_pending_cb: callback installed in req->pn, invoked by socket_notify_event.
+ * With bit flags, checks if any of the events intersect the request's wait mask. */
+void stack_request_pending_cb(Socket* sock, void* value, enum notify_event event)
 {
     (void)sock;
     req* r = (req*)value;
@@ -311,27 +300,27 @@ void req_pending_cb(Socket* sock, void* value, enum notify_event event)
         return;
     /* Remove from pending list before processing to avoid re-entry */
     remove_list_node(&r->pn.node);
-    process_request(r);
+    stack_process_request(r);
 }
 
-void wait(Socket *sock, req *r, req_status status)
+void stack_wait_request(Socket *sock, req *r, req_status status)
 {
 	r->status = status;
 	r->wait_sock = sock;
 	if (!LIST_ATTACHED(&r->pn.node)) {
 		r->pn.value = r;
-		r->pn.cb    = req_pending_cb;
+		r->pn.cb    = stack_request_pending_cb;
 		add_list_node(&sock->pending, &r->pn.node);
 	}
 }
 
-void wait_timeout_cb(task *tk)
+void stack_wait_timeout_cb(task *tk)
 {
 	req *r = (req *)tk->argv;
-	process_request(r);
+	stack_process_request(r);
 }
 
-void wait_until(Socket *sock, req *r, req_status status, uint64_t expire)
+void stack_wait_request_until(Socket *sock, req *r, req_status status, uint64_t expire)
 {
 	r->status = status;
 	r->wait_sock = sock;
@@ -343,7 +332,7 @@ void wait_until(Socket *sock, req *r, req_status status, uint64_t expire)
             return;
         }
     }
-	r->timeout_task->cb_timer = wait_timeout_cb;
+	r->timeout_task->cb_timer = stack_wait_timeout_cb;
 	r->timeout_task->argv = (uint64_t)r;
 	r->timeout_task->timeout = expire;
 
@@ -357,12 +346,12 @@ void wait_until(Socket *sock, req *r, req_status status, uint64_t expire)
 	if (!LIST_ATTACHED(&r->pn.node)) {
 		r->pn.node.next = NULL;
 		r->pn.value = r;
-		r->pn.cb    = req_pending_cb;
+		r->pn.cb    = stack_request_pending_cb;
 		add_list_node(&sock->pending, &r->pn.node);
 	}
 }
 
-static void socket_pending_task_cb(task* tk)
+static void stack_socket_pending_task_cb(task* tk)
 {
     Socket* sock = (Socket*)tk->argv;
     unregister_task(sock->pending_task);
@@ -374,7 +363,7 @@ static void socket_pending_task_cb(task* tk)
 
     /* Callbacks remove themselves only when the event satisfies their wait.
      * Leaving unmatched waiters attached prevents an unrelated notification
-     * (for example EPOLLOUT) from losing a pending read request. */
+     * from losing a pending request. */
     pending_node* pn;
     list_node* tmp;
     FOR_EACH_LIST_SAFE_OFFSET(&sock->pending, pn, tmp, pending_node, node) {
@@ -390,7 +379,7 @@ void socket_notify_event(Socket* sock, enum notify_event event)
 
 	sock->notified_events |= (uint32_t)event;
 
-	/* No read/epoll waiter can consume this notification yet.  Keep the
+	/* No waiter can consume this notification yet.  Keep the
 	 * readiness bits, but avoid allocating and scheduling a timer task. */
 	if (!sock->pending.next)
 		return;
@@ -406,7 +395,7 @@ void socket_notify_event(Socket* sock, enum notify_event event)
 		sock->pending_task = create_task(TASK_TYPE_TIMER);
 		if (!sock->pending_task)
 			return;
-		sock->pending_task->cb_timer = socket_pending_task_cb;
+		sock->pending_task->cb_timer = stack_socket_pending_task_cb;
 		sock->pending_task->argv = (uint64_t)sock;
 		
 	}

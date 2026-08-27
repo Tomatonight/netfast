@@ -25,6 +25,7 @@
 
 #include "if.h"
 #include "queue.h"
+#include "rss.h"
 #include "worker.h"
 #include "thread.h"
 #include "skbuff.h"
@@ -37,24 +38,17 @@
 #include "init.h"
 #include "log.h"
 #include "xdp.h"
+#include "xdp_redirect_config.h"
 
 _Static_assert(XDP_UMEM_FRAME_CNT != 0 &&
                (XDP_UMEM_FRAME_CNT & (XDP_UMEM_FRAME_CNT - 1U)) == 0,
                "XDP_UMEM_FRAME_CNT must be a power of two");
 
 xdp_frame_pool g_xdp_frame_pool = {0};
-
-static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb);
-static int xdp_tx_send(if_xdp* ix, skbuff* skb);
-static void if_xdp_unbind_socket(if_xdp* ix);
-static void xdp_if_write(task* tk);
-
-
-static struct xsk_umem*      g_xdp_umem = NULL;
-static struct xsk_ring_prod  g_umem_fq = {0};
-static struct xsk_ring_cons  g_umem_cq = {0};
-
-static spinlock_t    g_xdp_umem_lock;
+static struct xsk_umem* g_xdp_umem = NULL;
+static struct xsk_ring_prod g_umem_fq = {0};
+static struct xsk_ring_cons g_umem_cq = {0};
+static spinlock_t g_xdp_umem_lock;
 
 typedef struct xdp_prog_shared {
     int ifindex;
@@ -65,32 +59,17 @@ typedef struct xdp_prog_shared {
     struct xdp_prog_shared* next;
 } xdp_prog_shared;
 
-static void destroy_xdp_prog_shared(xdp_prog_shared* shared);
-
 static xdp_prog_shared* g_xdp_prog_list = NULL;
 
-void xdp_cleanup_programs(void)
-{
-    xdp_prog_shared* it = g_xdp_prog_list;
-    while (it) {
-        xdp_prog_shared* next = it->next;
-        if (it->xsks_map_fd > 0) {
-            for (__u32 key = 0; key < 32; ++key)
-                (void)bpf_map_delete_elem(it->xsks_map_fd, &key);
-        }
-        destroy_xdp_prog_shared(it);
-        it = next;
-    }
-    g_xdp_prog_list = NULL;
-}
+/* ── 全局 UMEM frame 池 ────────────────────────────────── */
 
-static inline void *idx_to_ptr(uint32_t idx)
+static inline void *xdp_frame_index_to_ptr(uint32_t idx)
 {
 	return (uint8_t *)g_xdp_frame_pool.buffer +
 	       (size_t)idx * g_xdp_frame_pool.frame_size;
 }
 
-static inline uint32_t ptr_to_idx(void *ptr)
+static inline uint32_t xdp_frame_ptr_to_index(void *ptr)
 {
 	return (uint32_t)(((uintptr_t)ptr - (uintptr_t)g_xdp_frame_pool.buffer)
 	                  / g_xdp_frame_pool.frame_size);
@@ -303,7 +282,7 @@ inline int xdp_frame_alloc(void **frame)
     uint32_t idx;
     if (!xdp_frame_pool_pop_idx(&idx))
         return -1;
-    *frame = idx_to_ptr(idx);
+    *frame = xdp_frame_index_to_ptr(idx);
     return 0;
 }
 
@@ -314,11 +293,13 @@ inline void xdp_frame_free(void *frame)
         return;
     }
 
-    uint32_t idx = ptr_to_idx(frame);
+    uint32_t idx = xdp_frame_ptr_to_index(frame);
     if (!xdp_frame_pool_push_idx(idx))
         ERR_LOG("xdp: frame pool push failed idx=%u; "
                 "possible duplicate free or pool corruption\n", idx);
 }
+
+/* ── UMEM 生命周期与 ring 回收 ──────────────────────────── */
 
 static int xdp_umem_create(void)
 {
@@ -383,13 +364,13 @@ int xdp_init(void)
 }
 
 
-static inline uint64_t umem_frame_addr(uint64_t addr)
+static inline uint64_t xdp_umem_frame_addr(uint64_t addr)
 {
     uint64_t data = xsk_umem__add_offset_to_addr(addr);
     return data & ~((uint64_t)XDP_UMEM_FRAME_SIZE - 1U);
 }
 
-static inline uint64_t umem_tx_addr(const frame_slot* slot,
+static inline uint64_t xdp_umem_tx_addr(const frame_slot* slot,
                                     const uint8_t* data)
 {
     uint64_t slot_addr = (uint64_t)((const uint8_t*)slot -
@@ -401,7 +382,7 @@ static inline uint64_t umem_tx_addr(const frame_slot* slot,
     return slot_addr | (data_offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
 }
 
-static inline frame_slot* tx_slot_from_addr(uint64_t addr)
+static inline frame_slot* xdp_tx_slot_from_addr(uint64_t addr)
 {
     frame_slot* slot = xsk_umem__get_data(
         g_xdp_frame_pool.buffer, xsk_umem__extract_addr(addr));
@@ -412,10 +393,10 @@ static inline frame_slot* tx_slot_from_addr(uint64_t addr)
     return slot;
 }
 
-static inline void umem_release_addr(uint64_t addr)
+static inline void xdp_umem_release_addr(uint64_t addr)
 {
     xdp_frame_free(xsk_umem__get_data(g_xdp_frame_pool.buffer,
-                                      umem_frame_addr(addr)));
+                                      xdp_umem_frame_addr(addr)));
 }
 
 /* Drain all four rings on teardown, returning frames to pool and releasing
@@ -428,7 +409,7 @@ static void xdp_drain_ring_pending(if_xdp* ix)
 	for (uint32_t j = 0; j < rx_n; ++j) {
 		const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&ix->rx, rx_idx + j);
 		if (desc)
-			umem_release_addr(desc->addr);
+			xdp_umem_release_addr(desc->addr);
 	}
 	if (rx_n)
 		xsk_ring_cons__release(&ix->rx, rx_n);
@@ -439,7 +420,7 @@ static void xdp_drain_ring_pending(if_xdp* ix)
 	for (__u32 i = tx_cons; i != tx_prod; ++i) {
 		struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, i);
 		if (!d) continue;
-		frame_slot* slot = tx_slot_from_addr(d->addr);
+		frame_slot* slot = xdp_tx_slot_from_addr(d->addr);
 		PUT_REF(slot);
 	}
 
@@ -447,12 +428,12 @@ static void xdp_drain_ring_pending(if_xdp* ix)
 	const __u32 fq_cons = *ix->fq.consumer;
 	const __u32 fq_prod  = *ix->fq.producer;
 	for (__u32 i = fq_cons; i != fq_prod; ++i) {
-		umem_release_addr(*xsk_ring_prod__fill_addr(&ix->fq, i));
+		xdp_umem_release_addr(*xsk_ring_prod__fill_addr(&ix->fq, i));
 	}
 }
 
 //填充提供给内核用于接收的frame
-static void umem_refill_fq(if_xdp* ix, struct xsk_ring_prod *fq)
+static void xdp_umem_refill_fill_ring(if_xdp* ix, struct xsk_ring_prod *fq)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_prod_nb_free(fq, XDP_FILL_QUEUE_SIZE);
@@ -484,7 +465,7 @@ static void umem_refill_fq(if_xdp* ix, struct xsk_ring_prod *fq)
     }
 }
 
-static void umem_complete_tx(if_xdp* ix)
+static void xdp_umem_complete_tx(if_xdp* ix)
 {
     struct xsk_ring_cons* cq = &ix->cq;
     uint32_t idx = 0;
@@ -492,13 +473,15 @@ static void umem_complete_tx(if_xdp* ix)
 
     for (uint32_t i = 0; i < n; ++i) {
         uint64_t addr = *xsk_ring_cons__comp_addr(cq, idx + i);
-        frame_slot* slot = tx_slot_from_addr(addr);
+        frame_slot* slot = xdp_tx_slot_from_addr(addr);
         PUT_REF(slot);
     }
 
     xsk_ring_cons__release(cq, n);
 }
 
+
+/* ── TX ring 提交、回收与背压 ───────────────────────────── */
 
 static void xdp_tx_update_watch(if_xdp* ix)
 {
@@ -540,7 +523,7 @@ static void xdp_tx_kick_loop(task* tk)
 {
     if_xdp* ix = (if_xdp*)tk->argv;
 
-    umem_complete_tx(ix);
+    xdp_umem_complete_tx(ix);
     xdp_tx_flush(ix);
 }
 
@@ -552,8 +535,8 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
     uint32_t frames = skb->data_num;
 
     uint32_t tx_idx = 0;
-    umem_refill_fq(ix, &ix->fq);
-    umem_complete_tx(ix);
+    xdp_umem_refill_fill_ring(ix, &ix->fq);
+    xdp_umem_complete_tx(ix);
 
     uint32_t reserved = xsk_ring_prod__reserve(&ix->tx, frames, &tx_idx);
     if (reserved != frames) {
@@ -577,7 +560,7 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
     for (uint32_t i = 0; i < frames; ++i, di = di->next) {
         frame_slot* slot = di->slot;
         struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
-        d->addr = umem_tx_addr(slot, di->start);
+        d->addr = xdp_umem_tx_addr(slot, di->start);
         d->len = di->end - di->start;
         d->options = 0;
         if (i == 0 && meta->flags)
@@ -609,15 +592,15 @@ static void xdp_tx_drain_pending(if_xdp* ix)
     if (!ix->pending_tx_queue.element_number)
         return;
 
-    umem_complete_tx(ix);
+    xdp_umem_complete_tx(ix);
     while (ix->pending_tx_queue.element_number) {
-        skbuff* skb = SKB_FROM_TX_NODE(get_queue_first(&ix->pending_tx_queue));
+        skbuff* skb = SKB_FROM_NODE(get_queue_first(&ix->pending_tx_queue), tx_node);
         if (!skb)
             break;
 
         int ret = xdp_tx_submit(ix, skb);
         if (ret == -EAGAIN) {
-            umem_complete_tx(ix);
+            xdp_umem_complete_tx(ix);
             ret = xdp_tx_submit(ix, skb);
         }
         if (ret == -EAGAIN)
@@ -638,13 +621,15 @@ static void xdp_tx_drain_pending(if_xdp* ix)
 static void xdp_tx_drop_pending(if_xdp* ix)
 {
     skbuff* skb;
-    while ((skb = SKB_FROM_TX_NODE(pop_queue(&ix->pending_tx_queue))) != NULL) {
+    while ((skb = SKB_FROM_NODE(pop_queue(&ix->pending_tx_queue), tx_node)) != NULL) {
         PUT_REF(skb);
     }
     ix->pending_tx_frames = 0;
 }
 
-static void if_xdp_detach_mode(int ifindex, __u32 flags)
+/* ── XDP 程序附着与 AF_XDP socket 生命周期 ─────────────── */
+
+static void xdp_interface_detach_mode(int ifindex, __u32 flags)
 {
     int err;
     err = bpf_xdp_detach(ifindex, flags, NULL);
@@ -655,14 +640,14 @@ static void if_xdp_detach_mode(int ifindex, __u32 flags)
              ifindex, flags, err, strerror(-err));
 }
 
-static void if_xdp_detach_existing_prog(int ifindex)
+static void xdp_interface_detach_existing_program(int ifindex)
 {
-    if_xdp_detach_mode(ifindex, XDP_FLAGS_SKB_MODE);
-    if_xdp_detach_mode(ifindex, XDP_FLAGS_DRV_MODE);
-    if_xdp_detach_mode(ifindex, XDP_FLAGS_HW_MODE);
+    xdp_interface_detach_mode(ifindex, XDP_FLAGS_SKB_MODE);
+    xdp_interface_detach_mode(ifindex, XDP_FLAGS_DRV_MODE);
+    xdp_interface_detach_mode(ifindex, XDP_FLAGS_HW_MODE);
 }
 
-static __u32 if_xdp_mode_flags(uint32_t mode)
+static __u32 xdp_interface_mode_flags(uint32_t mode)
 {
     if (mode == XDP_MODE_SKB)
         return XDP_FLAGS_SKB_MODE;
@@ -674,7 +659,7 @@ static __u32 if_xdp_mode_flags(uint32_t mode)
 }
 
 #ifdef DEBUG
-static const char* if_xdp_mode_name(uint32_t mode)
+static const char* xdp_interface_mode_name(uint32_t mode)
 {
     if (mode == XDP_MODE_SKB)
         return "skb";
@@ -686,7 +671,7 @@ static const char* if_xdp_mode_name(uint32_t mode)
 }
 #endif
 
-static xdp_prog_shared* find_xdp_prog_shared(int ifindex)
+static xdp_prog_shared* xdp_program_find(int ifindex)
 {
     xdp_prog_shared* it = g_xdp_prog_list;
     while (it) {
@@ -697,7 +682,7 @@ static xdp_prog_shared* find_xdp_prog_shared(int ifindex)
     return NULL;
 }
 
-static void destroy_xdp_prog_shared(xdp_prog_shared* shared)
+static void xdp_program_destroy(xdp_prog_shared* shared)
 {
     if (shared->xdp_link) {
         int err = bpf_link__destroy(shared->xdp_link);
@@ -706,9 +691,9 @@ static void destroy_xdp_prog_shared(xdp_prog_shared* shared)
                      shared->ifindex, err);
         }
     } else {
-        __u32 flags = if_xdp_mode_flags(shared->xdp_attach_mode);
+        __u32 flags = xdp_interface_mode_flags(shared->xdp_attach_mode);
         if (flags)
-            if_xdp_detach_mode(shared->ifindex, flags);
+            xdp_interface_detach_mode(shared->ifindex, flags);
     }
 
     if (shared->xdp_obj)
@@ -717,7 +702,22 @@ static void destroy_xdp_prog_shared(xdp_prog_shared* shared)
     free(shared);
 }
 
-static void if_xdp_release_redirect_prog(if_xdp* ix)
+void xdp_cleanup_programs(void)
+{
+    xdp_prog_shared* it = g_xdp_prog_list;
+    while (it) {
+        xdp_prog_shared* next = it->next;
+        if (it->xsks_map_fd > 0) {
+            for (__u32 key = 0; key < 32; ++key)
+                (void)bpf_map_delete_elem(it->xsks_map_fd, &key);
+        }
+        xdp_program_destroy(it);
+        it = next;
+    }
+    g_xdp_prog_list = NULL;
+}
+
+static void xdp_interface_release_redirect_program(if_xdp* ix)
 {
     ix->prog_shared      = NULL;
     ix->xdp_obj          = NULL;
@@ -727,7 +727,7 @@ static void if_xdp_release_redirect_prog(if_xdp* ix)
     ix->xdp_attach_mode  = XDP_MODE_UNSPEC;
 }
 
-static int if_xdp_attach_redirect_prog(if_xdp* ix)
+static int xdp_interface_attach_redirect_program(if_xdp* ix)
 {
 
     ix->ifindex  = (int)if_nametoindex(ix->info->name);
@@ -736,7 +736,7 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
         return -1;
     }
 
-    xdp_prog_shared* shared = find_xdp_prog_shared(ix->ifindex);
+    xdp_prog_shared* shared = xdp_program_find(ix->ifindex);
     if (shared) {
         ix->prog_shared = shared;
         ix->xdp_obj = shared->xdp_obj;
@@ -779,6 +779,29 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
         return -1;
     }
 
+    int config_map_fd = bpf_object__find_map_fd_by_name(
+        obj, NETFAST_XDP_CONFIG_MAP_NAME);
+    if (config_map_fd < 0) {
+        ERR_LOG("xdp: find %s fd failed path=%s\n",
+                NETFAST_XDP_CONFIG_MAP_NAME, obj_path);
+        bpf_object__close(obj);
+        return -1;
+    }
+    __u32 config_key = NETFAST_XDP_CONFIG_KEY;
+    netfast_xdp_config redirect_config = {
+        .source_port_first = g_cfg.source_port_range.first,
+        .source_port_last = g_cfg.source_port_range.last,
+        .redirect_fragments = g_cfg.redirect_fragments,
+    };
+    if (bpf_map_update_elem(config_map_fd, &config_key, &redirect_config,
+                            BPF_ANY) != 0) {
+        ERR_LOG("xdp: update %s failed path=%s errno=%d(%s)\n",
+                NETFAST_XDP_CONFIG_MAP_NAME, obj_path, errno,
+                strerror(errno));
+        bpf_object__close(obj);
+        return -1;
+    }
+
     int prog_fd = bpf_program__fd(prog);
     if (prog_fd < 0) {
         ERR_LOG("xdp: get xdp prog fd failed path=%s fd=%d\n", obj_path, prog_fd);
@@ -786,7 +809,7 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
         return -1;
     }
 
-    if_xdp_detach_existing_prog(ix->ifindex);
+    xdp_interface_detach_existing_program(ix->ifindex);
 
     static const uint32_t attach_modes[] = {
         XDP_MODE_NATIVE,
@@ -798,14 +821,14 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
     for (size_t i = 0; i < sizeof(attach_modes) / sizeof(attach_modes[0]); i++) {
         uint32_t mode = attach_modes[i];
         attach_err = bpf_xdp_attach(ix->ifindex, prog_fd,
-                                    if_xdp_mode_flags(mode), NULL);
+                                    xdp_interface_mode_flags(mode), NULL);
         if (attach_err == 0) {
             attached_mode = mode;
             break;
         }
 
         DEBUG_LOG("xdp: attach redirect prog failed if=%s mode=%s err=%d(%s)\n",
-                  ix->info->name, if_xdp_mode_name(mode), attach_err,
+                  ix->info->name, xdp_interface_mode_name(mode), attach_err,
                   strerror(-attach_err));
     }
 
@@ -820,14 +843,14 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
     int map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
     if (map_fd <= 0) {
         ERR_LOG("xdp: find xsks_map fd failed path=%s\n", obj_path);
-        if_xdp_detach_mode(ix->ifindex, if_xdp_mode_flags(ix->xdp_attach_mode));
+        xdp_interface_detach_mode(ix->ifindex, xdp_interface_mode_flags(ix->xdp_attach_mode));
         bpf_object__close(obj);
         return -1;
     }
 
     shared = calloc(1, sizeof(*shared));
     if (!shared) {
-        if_xdp_detach_mode(ix->ifindex, if_xdp_mode_flags(ix->xdp_attach_mode));
+        xdp_interface_detach_mode(ix->ifindex, xdp_interface_mode_flags(ix->xdp_attach_mode));
         bpf_object__close(obj);
         ERR_LOG("xdp: allocate shared redirect state failed if=%s\n", ix->info->name);
         return -1;
@@ -849,76 +872,7 @@ static int if_xdp_attach_redirect_prog(if_xdp* ix)
     return 0;
 }
 
-static int if_xdp_bind_socket(if_xdp* ix)
-{
-    const uint32_t queue_id = ix->queue_id;
-
-    if (if_xdp_attach_redirect_prog(ix) != 0)
-        return -1;
-
-    uint32_t xdp_flags = if_xdp_mode_flags(ix->xdp_attach_mode);
-
-    uint16_t bind_flags = XDP_USE_NEED_WAKEUP;
-
-    struct xsk_socket_config cfg = {
-        .rx_size      = XDP_RX_QUEUE_SIZE,
-        .tx_size      = XDP_TX_QUEUE_SIZE,
-        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags    = xdp_flags,
-        .bind_flags   = bind_flags,
-    };
-
-    ix->xsk = NULL;
-
-    int err;
-    spin_lock(&g_xdp_umem_lock);
-    if (!g_xdp_umem && xdp_umem_create() != 0) {
-        spin_unlock(&g_xdp_umem_lock);
-        if_xdp_release_redirect_prog(ix);
-        return -1;
-    }
-    err = xsk_socket__create_shared(&ix->xsk, ix->info->name, queue_id,
-                                    g_xdp_umem,
-                                    &ix->rx, &ix->tx,
-                                    &ix->fq, &ix->cq,
-                                    &cfg);
-    spin_unlock(&g_xdp_umem_lock);
-
-    if (err != 0) {
-        ERR_LOG("xdp : xsk_socket__create failed if=%s q=%u err=%d(%s) bind_flags=0x%x libbpf_flags=0x%x\n",
-                ix->info->name, queue_id, err, strerror(-err),
-                (unsigned int)cfg.bind_flags, (unsigned int)cfg.libbpf_flags);
-        if_xdp_release_redirect_prog(ix);
-        return -1;
-    }
-
-    int xsk_fd = xsk_socket__fd(ix->xsk);
-    if (xsk_fd < 0) {
-        ERR_LOG("xdp: xsk_socket__fd invalid if=%s fd=%d\n", ix->info->name, xsk_fd);
-        if_xdp_unbind_socket(ix);
-        if_xdp_release_redirect_prog(ix);
-        return -1;
-    }
-
-    __u32 key   = queue_id;
-    __u32 value = (__u32)xsk_fd;
-    if (bpf_map_update_elem(ix->xsks_map_fd, &key, &value, 0) != 0) {
-        ERR_LOG("xdp: update xsks_map failed if=%s map_fd=%d q=%u errno=%d(%s)\n",
-            ix->info->name, ix->xsks_map_fd, queue_id, errno, strerror(errno));
-        if_xdp_unbind_socket(ix);
-        if_xdp_release_redirect_prog(ix);
-        return -1;
-    }
-
-    DEBUG_LOG("xdp: xsk create ok if=%s fd=%d bind_flags=0x%x\n",
-               ix->info->name, xsk_socket__fd(ix->xsk), (unsigned int)cfg.bind_flags);
-
-	    /* 初始填充 FQ，使内核可以把到达的包写入 UMEM。 */
-    umem_refill_fq(ix, &ix->fq);
-    return 0;
-}
-
-static void if_xdp_unbind_socket(if_xdp* ix)
+static void xdp_interface_unbind_socket(if_xdp* ix)
 {
     xdp_drain_ring_pending(ix);
     if (ix->xsk) {
@@ -936,7 +890,76 @@ static void if_xdp_unbind_socket(if_xdp* ix)
     }
 }
 
-static int if_set_hw_rss_toeplitz(if_info* info, int queues)
+static int xdp_interface_bind_socket(if_xdp* ix)
+{
+    const uint32_t queue_id = ix->queue_id;
+
+    if (xdp_interface_attach_redirect_program(ix) != 0)
+        return -1;
+
+    uint32_t xdp_flags = xdp_interface_mode_flags(ix->xdp_attach_mode);
+
+    uint16_t bind_flags = XDP_USE_NEED_WAKEUP | XDP_USE_SG;
+
+    struct xsk_socket_config cfg = {
+        .rx_size      = XDP_RX_QUEUE_SIZE,
+        .tx_size      = XDP_TX_QUEUE_SIZE,
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .xdp_flags    = xdp_flags,
+        .bind_flags   = bind_flags,
+    };
+
+    ix->xsk = NULL;
+
+    int err;
+    spin_lock(&g_xdp_umem_lock);
+    if (!g_xdp_umem && xdp_umem_create() != 0) {
+        spin_unlock(&g_xdp_umem_lock);
+        xdp_interface_release_redirect_program(ix);
+        return -1;
+    }
+    err = xsk_socket__create_shared(&ix->xsk, ix->info->name, queue_id,
+                                    g_xdp_umem,
+                                    &ix->rx, &ix->tx,
+                                    &ix->fq, &ix->cq,
+                                    &cfg);
+    spin_unlock(&g_xdp_umem_lock);
+
+    if (err != 0) {
+        ERR_LOG("xdp : xsk_socket__create failed if=%s q=%u err=%d(%s) bind_flags=0x%x libbpf_flags=0x%x\n",
+                ix->info->name, queue_id, err, strerror(-err),
+                (unsigned int)cfg.bind_flags, (unsigned int)cfg.libbpf_flags);
+        xdp_interface_release_redirect_program(ix);
+        return -1;
+    }
+
+    int xsk_fd = xsk_socket__fd(ix->xsk);
+    if (xsk_fd < 0) {
+        ERR_LOG("xdp: xsk_socket__fd invalid if=%s fd=%d\n", ix->info->name, xsk_fd);
+        xdp_interface_unbind_socket(ix);
+        xdp_interface_release_redirect_program(ix);
+        return -1;
+    }
+
+    __u32 key   = queue_id;
+    __u32 value = (__u32)xsk_fd;
+    if (bpf_map_update_elem(ix->xsks_map_fd, &key, &value, 0) != 0) {
+        ERR_LOG("xdp: update xsks_map failed if=%s map_fd=%d q=%u errno=%d(%s)\n",
+            ix->info->name, ix->xsks_map_fd, queue_id, errno, strerror(errno));
+        xdp_interface_unbind_socket(ix);
+        xdp_interface_release_redirect_program(ix);
+        return -1;
+    }
+
+    DEBUG_LOG("xdp: xsk create ok if=%s fd=%d bind_flags=0x%x\n",
+               ix->info->name, xsk_socket__fd(ix->xsk), (unsigned int)cfg.bind_flags);
+
+	    /* 初始填充 FQ，使内核可以把到达的包写入 UMEM。 */
+    xdp_umem_refill_fill_ring(ix, &ix->fq);
+    return 0;
+}
+
+static int xdp_configure_hw_rss(if_info* info, int queues)
 {
     /* Interfaces omitted from open_if do not own AF_XDP queues.  A single
      * queue needs no traffic distribution and may legitimately expose no
@@ -1094,8 +1117,7 @@ static int if_set_hw_rss_toeplitz(if_info* info, int queues)
         return -1;
     }
 
-    /* Fetch the current table and key.  Keeping the returned key matters on
-     * drivers whose key size differs from NetFast's configured key. */
+    /* 获取当前配置，同时取得驱动要求的间接表和 key 长度。 */
     rxfh->cmd = ETHTOOL_GRSSH;
     rxfh->indir_size = query.indir_size;
     rxfh->key_size = query.key_size;
@@ -1126,12 +1148,18 @@ static int if_set_hw_rss_toeplitz(if_info* info, int queues)
     const uint8_t* key = toeplitz_rss_get_key(&key_len);
 
     rxfh->cmd = ETHTOOL_SRSSH;
+    /* ETH_RSS_HASH_TOP 位于 bit 0，但 UAPI 头文件只公开字段，没有公开
+     * 内核内部的符号。明确请求 Toeplitz，避免保留 XOR/CRC32。 */
+    rxfh->hfunc = 1u;
+    rxfh->input_xfrm = 0;
 
     for (__u32 i = 0; i < rxfh->indir_size; ++i)
         indir[i] = (__u32)(i % (unsigned)queues);
 
-    if (rxfh->key_size == key_len)
-        memcpy(hw_key, key, key_len);
+    /* 部分驱动使用 40 B，部分驱动使用更长的 key。重复同一个 16-bit
+     * 周期既保持双向一致，也让硬件使用的有效前缀与软件完全相同。 */
+    for (__u32 i = 0; i < rxfh->key_size; ++i)
+        hw_key[i] = key[i % key_len];
 
     ioctl_ret = ioctl(fd, SIOCETHTOOL, &ifr);
     if (ioctl_ret != 0) {
@@ -1149,6 +1177,14 @@ static int if_set_hw_rss_toeplitz(if_info* info, int queues)
     return 0;
 }
 
+/* ── 对外接口生命周期与收发入口 ────────────────────────── */
+
+static void xdp_interface_write(task* tk)
+{
+    if_xdp* ix = (if_xdp*)tk->argv;
+    xdp_tx_drain_pending(ix);
+}
+
 int xdp_if_start(if_info *info)
 {
     /* Netlink reports every link, whereas only open_if entries are AF_XDP
@@ -1156,7 +1192,7 @@ int xdp_if_start(if_info *info)
     if (!info)
         return 0;
 
-    int queues = cfg_get_if_queues(info->name);
+    int queues = config_get_interface_queues(info->name);
     if (queues <= 0)
         return 0;
 
@@ -1165,7 +1201,7 @@ int xdp_if_start(if_info *info)
 
     /* RSS configuration is performed once by the main worker. */
     if (w == main_worker && queues > 1 &&
-        if_set_hw_rss_toeplitz(info, queues) < 0) {
+        xdp_configure_hw_rss(info, queues) < 0) {
         ERR_LOG("xdp: RSS configuration failed if=%s", info->name);
     }
 
@@ -1185,7 +1221,7 @@ int xdp_if_start(if_info *info)
         ix->info     = info;
         ix->queue_id = (uint32_t)q;
         init_queue(&ix->pending_tx_queue);
-        if (if_xdp_bind_socket(ix) != 0) {
+        if (xdp_interface_bind_socket(ix) != 0) {
             ERR_LOG("xdp: bind failed if=%s q=%d", info->name, q);
             free(ix);
 			(void)xdp_if_stop(info);
@@ -1195,8 +1231,8 @@ int xdp_if_start(if_info *info)
         ix->tk = create_task(TASK_TYPE_FD_READ);
         if (!ix->tk) {
             ERR_LOG("xdp: create_task failed if=%s q=%d", info->name, q);
-            if_xdp_unbind_socket(ix);
-			if_xdp_release_redirect_prog(ix);
+            xdp_interface_unbind_socket(ix);
+			xdp_interface_release_redirect_program(ix);
             free(ix);
 			(void)xdp_if_stop(info);
             return -1;
@@ -1204,15 +1240,15 @@ int xdp_if_start(if_info *info)
 
         ix->tk->fd      = xsk_socket__fd(ix->xsk);
         ix->tk->cb_read = xdp_if_read;
-        ix->tk->cb_write = xdp_if_write;
+        ix->tk->cb_write = xdp_interface_write;
         ix->tk->cb_err  = NULL;
         ix->tk->argv    = (uint64_t)ix;   /* xdp_if_read recovers ix directly */
 
         if (register_task(w->master, ix->tk) != 0) {
             ERR_LOG("xdp: register_task failed if=%s q=%d", info->name, q);
             destroy_task(ix->tk);
-            if_xdp_unbind_socket(ix);
-            if_xdp_release_redirect_prog(ix);
+            xdp_interface_unbind_socket(ix);
+            xdp_interface_release_redirect_program(ix);
             free(ix);
 			(void)xdp_if_stop(info);
             return -1;
@@ -1222,8 +1258,8 @@ int xdp_if_start(if_info *info)
         if (!ix->tx_kick_task) {
             ERR_LOG("xdp: create TX kick task failed if=%s q=%d", info->name, q);
             destroy_task(ix->tk);
-            if_xdp_unbind_socket(ix);
-			if_xdp_release_redirect_prog(ix);
+            xdp_interface_unbind_socket(ix);
+			xdp_interface_release_redirect_program(ix);
             free(ix);
 			(void)xdp_if_stop(info);
             return -1;
@@ -1234,8 +1270,8 @@ int xdp_if_start(if_info *info)
             ERR_LOG("xdp: register TX kick task failed if=%s q=%d", info->name, q);
             destroy_task(ix->tx_kick_task);
             destroy_task(ix->tk);
-            if_xdp_unbind_socket(ix);
-			if_xdp_release_redirect_prog(ix);
+            xdp_interface_unbind_socket(ix);
+			xdp_interface_release_redirect_program(ix);
             free(ix);
 			(void)xdp_if_stop(info);
             return -1;
@@ -1250,7 +1286,7 @@ int xdp_if_start(if_info *info)
 
 int xdp_if_stop(if_info *info)
 {
-    int queues = cfg_get_if_queues(info->name);
+    int queues = config_get_interface_queues(info->name);
 
     if (queues <= 0)
         return 0;
@@ -1275,10 +1311,10 @@ int xdp_if_stop(if_info *info)
 			ix->tk = NULL;
 		}
         xdp_tx_drop_pending(ix);
-        umem_complete_tx(ix);
+        xdp_umem_complete_tx(ix);
 
-		if_xdp_release_redirect_prog(ix);
-        if_xdp_unbind_socket(ix);
+		xdp_interface_release_redirect_program(ix);
+        xdp_interface_unbind_socket(ix);
         free(ix);
     }
 
@@ -1290,7 +1326,7 @@ int xdp_if_stop(if_info *info)
         while (it) {
             if (it->ifindex == ifindex) {
                 *prev = it->next;
-                destroy_xdp_prog_shared(it);
+                xdp_program_destroy(it);
                 break;
             }
             prev = &it->next;
@@ -1331,7 +1367,7 @@ void xdp_if_read(task *tk)
 		if (ix->rx_drop_contd) {
 			bool more = (desc->options & XDP_PKT_CONTD) != 0;
 			uint64_t raw = xsk_umem__extract_addr(desc->addr);
-			umem_release_addr(raw - raw % g_xdp_frame_pool.frame_size);
+			xdp_umem_release_addr(raw - raw % g_xdp_frame_pool.frame_size);
 			ix->rx_drop_contd = more;
 			i++;
 			continue;
@@ -1343,7 +1379,7 @@ void xdp_if_read(task *tk)
             uint64_t frame_addr = raw_addr;
             if ((raw_addr % g_xdp_frame_pool.frame_size) != 0)
                 frame_addr = raw_addr - (raw_addr % g_xdp_frame_pool.frame_size);
-            umem_release_addr(frame_addr);
+            xdp_umem_release_addr(frame_addr);
             i++;
             continue;
         }
@@ -1356,7 +1392,7 @@ void xdp_if_read(task *tk)
             uint64_t frame_addr = raw_addr;
             if ((raw_addr % g_xdp_frame_pool.frame_size) != 0)
                 frame_addr = raw_addr - (raw_addr % g_xdp_frame_pool.frame_size);
-            umem_release_addr(frame_addr);
+            xdp_umem_release_addr(frame_addr);
             i++;
             continue;
         }
@@ -1374,7 +1410,7 @@ void xdp_if_read(task *tk)
                     uint64_t z_fa  = z_raw;
                     if ((z_raw % g_xdp_frame_pool.frame_size) != 0)
                         z_fa = z_raw - (z_raw % g_xdp_frame_pool.frame_size);
-                    umem_release_addr(z_fa);
+                    xdp_umem_release_addr(z_fa);
                 }
 				packet_bad = true;
                 i++;
@@ -1393,7 +1429,7 @@ void xdp_if_read(task *tk)
 
             void* frame = xsk_umem__get_data(g_xdp_frame_pool.buffer, frame_addr);
             if (!frame) {
-                umem_release_addr(frame_addr);
+                xdp_umem_release_addr(frame_addr);
 				packet_bad = true;
                 i++;
 				if (!more) break;
@@ -1402,14 +1438,14 @@ void xdp_if_read(task *tk)
 
             uint8_t*  payload = (uint8_t*)xsk_umem__get_data(g_xdp_frame_pool.buffer, data_addr);
             if (!payload) {
-                umem_release_addr(frame_addr);
+                xdp_umem_release_addr(frame_addr);
 				packet_bad = true;
                 i++;
 				if (!more) break;
 				continue;
             }
 			if (packet_bad || d->len > cap || frame_count >= SKB_DATA_MAX_NUM) {
-				umem_release_addr(frame_addr);
+				xdp_umem_release_addr(frame_addr);
 				packet_bad = true;
 				i++;
 				if (!more) break;
@@ -1420,7 +1456,7 @@ void xdp_if_read(task *tk)
 
             frame_slot* slot = frame_slot_from_rx_frame(frame);
             if (!slot) {
-                umem_release_addr(frame_addr);
+                xdp_umem_release_addr(frame_addr);
 				packet_bad = true;
                 i++;
 				if (!more) break;
@@ -1488,25 +1524,10 @@ void xdp_if_read(task *tk)
     }
 
     xsk_ring_cons__release(rx, n);
-    umem_refill_fq(ix, &ix->fq);
-    umem_complete_tx(ix);
+    xdp_umem_refill_fill_ring(ix, &ix->fq);
+    xdp_umem_complete_tx(ix);
     drained += n;
 	}
-}
-
-static void xdp_if_write(task* tk)
-{
-    if_xdp* ix = (if_xdp*)tk->argv;
-    xdp_tx_drain_pending(ix);
-}
-
-int xdp_if_send(if_info *info, skbuff *skb)
-{
-    if_xdp* ix = xdp_tx_pick(info, skb);
-    if (!ix)
-        return -ENETDOWN;
-
-    return xdp_tx_send(ix, skb);
 }
 
 static int xdp_tx_send(if_xdp* ix, skbuff* skb)
@@ -1526,7 +1547,7 @@ static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb)
 {
     worker* w = get_current_worker();
     int w_idx = (int)(w - g_workers);
-    int queues = cfg_get_if_queues(info->name);
+    int queues = config_get_interface_queues(info->name);
 
     if (w_idx >= queues)
         return NULL;
@@ -1537,7 +1558,16 @@ static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb)
     return (if_xdp*)info->xdp_data[q];
 }
 
-static int xdp_process_send(skbuff* skb)
+int xdp_if_send(if_info *info, skbuff *skb)
+{
+    if_xdp* ix = xdp_tx_pick(info, skb);
+    if (!ix)
+        return -ENETDOWN;
+
+    return xdp_tx_send(ix, skb);
+}
+
+static int xdp_process_queued_send(skbuff* skb)
 {
     return xdp_if_send(skb->route->if_info, skb);
 }
@@ -1548,13 +1578,13 @@ int xdp_transmit_skb(struct if_info *info, skbuff *skb)
     if (ix)
         return xdp_tx_send(ix, skb);
 
-    int queues = cfg_get_if_queues(info->name);
+    int queues = config_get_interface_queues(info->name);
     if (queues <= 0)
         return -ENETDOWN;
     uint32_t h = (uint32_t)((uintptr_t)skb);
     int pick = (int)(h % (uint32_t)queues);
     worker* txw = &g_workers[pick % g_worker_num];
 
-    transmit_skb_2_worker(txw, skb, xdp_process_send);
+    worker_enqueue_skb(txw, skb, xdp_process_queued_send);
     return 0;
 }

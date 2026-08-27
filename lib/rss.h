@@ -21,7 +21,7 @@ typedef struct worker worker;
 extern worker* g_workers;
 extern int g_worker_num;
 
-worker* select_worker_by_tuple(sa_family_t family,
+worker* rss_select_worker_by_tuple(sa_family_t family,
     const uint8_t* saddr, const uint8_t* daddr,
     uint16_t sport, uint16_t dport);
 

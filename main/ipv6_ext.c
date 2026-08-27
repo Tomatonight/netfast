@@ -10,12 +10,12 @@
 
 #include <string.h>
 
-static inline hash* get_ipq6_hash(void)
+static inline hash* ipv6_frag_queue_table(void)
 {
     return get_current_worker()->stack.ipq6_hash;
 }
 
-static ipq6_key make_ipq6_key(uint32_t id, const uint8_t* src,
+static ipq6_key ipv6_frag_make_key(uint32_t id, const uint8_t* src,
                               const uint8_t* dst)
 {
     ipq6_key key = {.id = id};
@@ -24,7 +24,7 @@ static ipq6_key make_ipq6_key(uint32_t id, const uint8_t* src,
     return key;
 }
 
-static ipq6* create_ipq6(const ipq6_key* key)
+static ipq6* ipv6_frag_queue_create(const ipq6_key* key)
 {
     ipq6* q = calloc(1, sizeof(*q));
     if (!q)
@@ -32,41 +32,41 @@ static ipq6* create_ipq6(const ipq6_key* key)
 
     q->key = *key;
     q->last_update_time = (uint32_t)get_current_time_ms();
-    if (!hash_add_node(get_ipq6_hash(), &q->hash_node)) {
+    if (!hash_add_node(ipv6_frag_queue_table(), &q->hash_node)) {
         free(q);
         return NULL;
     }
     return q;
 }
 
-static void free_ipq6_frag(ipq6_frag* frag)
+static void ipv6_frag_piece_free(ipq6_frag* frag)
 {
     PUT_REF(frag->skb);
     free(frag);
 }
 
-static void destroy_ipq6(ipq6* q)
+static void ipv6_frag_queue_destroy(ipq6* q)
 {
-    hash_del_node(get_ipq6_hash(), &q->hash_node);
+    hash_del_node(ipv6_frag_queue_table(), &q->hash_node);
 
     ipq6_frag* frag;
     list_node* next;
     FOR_EACH_LIST_SAFE_OFFSET(&q->frag_head, frag, next, ipq6_frag, node) {
         remove_list_node(&frag->node);
-        free_ipq6_frag(frag);
+        ipv6_frag_piece_free(frag);
     }
     free(q);
 }
 
-static ipq6* search_ipq6(const ipq6_key* key)
+static ipq6* ipv6_frag_queue_find(const ipq6_key* key)
 {
-    hash_node* node = hash_find_node(get_ipq6_hash(), key);
+    hash_node* node = hash_find_node(ipv6_frag_queue_table(), key);
     return node ? HASH_CONTAINER_OF(node, ipq6, hash_node) : NULL;
 }
 
 void ipq6_timer(task* tk)
 {
-    hash* h = get_ipq6_hash();
+    hash* h = ipv6_frag_queue_table();
     uint32_t now = (uint32_t)get_current_time_ms();
     for (uint32_t i = 0; i < h->size; i++) {
         hash_node* node = h->buckets[i];
@@ -74,14 +74,14 @@ void ipq6_timer(task* tk)
             hash_node* next = node->next;
             ipq6* queue = HASH_CONTAINER_OF(node, ipq6, hash_node);
             if (now - queue->last_update_time > IPQ6_TIMEOUT)
-                destroy_ipq6(queue);
+                ipv6_frag_queue_destroy(queue);
             node = next;
         }
     }
     update_task_timer(tk, now + IPQ6_TIMER_INTERVAL);
 }
 
-static int frag6_offset_cmp(list_node* a, list_node* b)
+static int ipv6_frag_compare_offset(list_node* a, list_node* b)
 {
     ipq6_frag* fa = HASH_CONTAINER_OF(a, ipq6_frag, node);
     ipq6_frag* fb = HASH_CONTAINER_OF(b, ipq6_frag, node);
@@ -90,7 +90,7 @@ static int frag6_offset_cmp(list_node* a, list_node* b)
     return fa->offset > fb->offset;
 }
 
-static bool is_variable_ext_header(uint8_t next_header)
+static bool ipv6_extension_header_is_variable(uint8_t next_header)
 {
     return next_header == IPV6_NEXTHDR_HOPOPT ||
            next_header == IPV6_NEXTHDR_DSTOPTS ||
@@ -103,7 +103,7 @@ typedef struct ipv6_frag_info {
     uint32_t previous_nh_offset;
 } ipv6_frag_info;
 
-static bool find_frag_header(const skbuff* skb, ipv6_frag_info* info)
+static bool ipv6_find_fragment_header(const skbuff* skb, ipv6_frag_info* info)
 {
     if (!skb->ipv6_hdr || skb_data_len(skb) < IPV6_HDR_LEN)
         return false;
@@ -126,7 +126,7 @@ static bool find_frag_header(const skbuff* skb, ipv6_frag_info* info)
             return true;
         }
 
-        if (!is_variable_ext_header(next_header))
+        if (!ipv6_extension_header_is_variable(next_header))
             return false;
 
         uint8_t ext[2];
@@ -144,14 +144,14 @@ static bool find_frag_header(const skbuff* skb, ipv6_frag_info* info)
 
 bool ipv6_has_frag(const skbuff* skb)
 {
-    return find_frag_header(skb, NULL);
+    return ipv6_find_fragment_header(skb, NULL);
 }
 
 skbuff* ipv6_defrag(skbuff* skb)
 {
     ipv6_hdr* ip6 = skb->ipv6_hdr;
     ipv6_frag_info info;
-    if (!find_frag_header(skb, &info))
+    if (!ipv6_find_fragment_header(skb, &info))
         return NULL;
 
     uint16_t frag_off_host = ntohs(info.header.frag_off);
@@ -195,12 +195,12 @@ skbuff* ipv6_defrag(skbuff* skb)
     frag->len = frag_payload_len;
     INC_REF(skb);
 
-    ipq6_key key = make_ipq6_key(info.header.id, ip6->saddr, ip6->daddr);
-    ipq6* q = search_ipq6(&key);
+    ipq6_key key = ipv6_frag_make_key(info.header.id, ip6->saddr, ip6->daddr);
+    ipq6* q = ipv6_frag_queue_find(&key);
     if (!q) {
-        q = create_ipq6(&key);
+        q = ipv6_frag_queue_create(&key);
         if (!q) {
-            free_ipq6_frag(frag);
+            ipv6_frag_piece_free(frag);
             WARN_LOG("Failed to create IPv6 reassembly queue");
             return NULL;
         }
@@ -210,8 +210,8 @@ skbuff* ipv6_defrag(skbuff* skb)
     } else if (q->unfrag_len != info.offset ||
                q->previous_nh_offset != info.previous_nh_offset ||
                q->next_header != info.header.next_hdr) {
-        free_ipq6_frag(frag);
-        destroy_ipq6(q);
+        ipv6_frag_piece_free(frag);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
     q->last_update_time = (uint32_t)get_current_time_ms();
@@ -228,7 +228,7 @@ skbuff* ipv6_defrag(skbuff* skb)
         if (!mf && existing_end > frag_end)
             inconsistent_end = true;
         if (frag_offset_bytes < existing_end && existing_start < frag_end) {
-            free_ipq6_frag(frag);
+            ipv6_frag_piece_free(frag);
             DEBUG_LOG("Overlapping IPv6 fragment offset=%u len=%u",
                      frag_offset_bytes, frag_payload_len);
             return NULL;
@@ -237,13 +237,13 @@ skbuff* ipv6_defrag(skbuff* skb)
 
     if (inconsistent_end ||
         (!mf && q->flag.last_recved && q->total_len != frag_end)) {
-        free_ipq6_frag(frag);
-        destroy_ipq6(q);
+        ipv6_frag_piece_free(frag);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
 
-    if (add_list_node_compare(&q->frag_head, &frag->node, frag6_offset_cmp) < 0) {
-        free_ipq6_frag(frag);
+    if (add_list_node_compare(&q->frag_head, &frag->node, ipv6_frag_compare_offset) < 0) {
+        ipv6_frag_piece_free(frag);
         return NULL;
     }
 
@@ -264,7 +264,7 @@ skbuff* ipv6_defrag(skbuff* skb)
 
     if (q->received_len != q->total_len) {
         DEBUG_LOG("IPv6 received_len %u != total_len %u", q->received_len, q->total_len);
-        destroy_ipq6(q);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
 
@@ -283,7 +283,7 @@ skbuff* ipv6_defrag(skbuff* skb)
     if (!first_frag || unfrag_len > sizeof(unfrag) ||
         !skb_copy_bits(first_frag->skb, 0,
                        unfrag, unfrag_len)) {
-        destroy_ipq6(q);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
 
@@ -301,7 +301,7 @@ skbuff* ipv6_defrag(skbuff* skb)
             PUT_REF(f->skb);
             free(f);
             PUT_REF(reassembled);
-            destroy_ipq6(q);
+            ipv6_frag_queue_destroy(q);
             return NULL;
         }
 
@@ -309,7 +309,7 @@ skbuff* ipv6_defrag(skbuff* skb)
             PUT_REF(f->skb);
             free(f);
             PUT_REF(reassembled);
-            destroy_ipq6(q);
+            ipv6_frag_queue_destroy(q);
             return NULL;
         }
         if (!reassembled) {
@@ -319,7 +319,7 @@ skbuff* ipv6_defrag(skbuff* skb)
                 PUT_REF(f->skb);
                 free(f);
                 PUT_REF(reassembled);
-                destroy_ipq6(q);
+                ipv6_frag_queue_destroy(q);
                 return NULL;
             }
         }
@@ -329,21 +329,21 @@ skbuff* ipv6_defrag(skbuff* skb)
     }
 
     if (!reassembled) {
-        destroy_ipq6(q);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
 
     uint32_t payload_len = unfrag_len - IPV6_HDR_LEN + expect_byte;
     if (payload_len > UINT16_MAX) {
         PUT_REF(reassembled);
-        destroy_ipq6(q);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
 
     uint8_t* unfrag_header = skb_data_push(reassembled, unfrag_len);
     if (!unfrag_header) {
         PUT_REF(reassembled);
-        destroy_ipq6(q);
+        ipv6_frag_queue_destroy(q);
         return NULL;
     }
     memcpy(unfrag_header, unfrag, unfrag_len);
@@ -356,11 +356,11 @@ skbuff* ipv6_defrag(skbuff* skb)
 
     reassembled->flag.is_defrag = 1;
 
-    destroy_ipq6(q);
+    ipv6_frag_queue_destroy(q);
     return reassembled;
 }
 
-static bool push_frag_headers(skbuff* skb, const uint8_t fixed_header[],
+static bool ipv6_push_fragment_headers(skbuff* skb, const uint8_t fixed_header[],
                               uint8_t next_header, uint32_t id,
                               uint16_t offset8, bool more,
                               uint32_t payload_len)
@@ -385,7 +385,7 @@ static bool push_frag_headers(skbuff* skb, const uint8_t fixed_header[],
     return true;
 }
 
-static void free_frag_list(skbuff* skb)
+static void ipv6_free_fragment_list(skbuff* skb)
 {
     skbuff* frag;
     list_node* next;
@@ -423,7 +423,7 @@ bool ipv6_frag(skbuff* skb)
     static _Atomic(uint32_t) next_frag_id = 1;
     uint32_t id = htonl(atomic_fetch_add_explicit(
         &next_frag_id, 1, memory_order_relaxed));
-    if (!push_frag_headers(skb, fixed_header, orig_next_hdr, id, 0, true,
+    if (!ipv6_push_fragment_headers(skb, fixed_header, orig_next_hdr, id, 0, true,
                            frag_payload)) {
         PUT_REF(cur);
         return false;
@@ -441,7 +441,7 @@ bool ipv6_frag(skbuff* skb)
             cur_payload = frag_payload;
         }
 
-        if (!push_frag_headers(cur, fixed_header, orig_next_hdr, id,
+        if (!ipv6_push_fragment_headers(cur, fixed_header, orig_next_hdr, id,
                                (uint16_t)(offset_bytes / 8u), next != NULL,
                                cur_payload)) {
             PUT_REF(next);
@@ -462,6 +462,6 @@ bool ipv6_frag(skbuff* skb)
 
 fail:
     PUT_REF(cur);
-    free_frag_list(skb);
+    ipv6_free_fragment_list(skb);
     return false;
 }

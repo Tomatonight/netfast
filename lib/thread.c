@@ -179,7 +179,7 @@ void destroy_thread(thread* t)
 	free(t);
 }
 
-static void unregister_loop_task(task* tk)
+static void thread_unregister_loop_task(task* tk)
 {
 	thread* t = tk->parent_thread;
 	if (!t)
@@ -202,7 +202,7 @@ int register_task(thread* t, task* tk)
 		if (tk->registered) {
 			if (tk->parent_thread == t)
 				return 0;
-			unregister_loop_task(tk);
+			thread_unregister_loop_task(tk);
 		}
 
 		tk->parent_thread = t;
@@ -312,7 +312,7 @@ void unregister_task(task* tk)
 
 	thread* t = tk->parent_thread;
 	if (tk->task_type == TASK_TYPE_LOOP) {
-		unregister_loop_task(tk);
+		thread_unregister_loop_task(tk);
 		return;
 	}
 	if (tk->task_type == TASK_TYPE_TIMER) {
@@ -326,7 +326,7 @@ void unregister_task(task* tk)
 	tk->parent_thread = NULL;
 }
 
-static int do_loop_tasks(thread* t)
+static int thread_process_loop_tasks(thread* t)
 {
 	int do_sum = 0;
 	task* tk;
@@ -342,7 +342,7 @@ static int do_loop_tasks(thread* t)
 	return do_sum;
 }
 
-static int do_fd_tasks(thread* t, int timeout_ms)
+static int thread_process_fd_tasks(thread* t, int timeout_ms)
 {
 	int ready_num = epoll_wait(t->epoll_fd, t->events, MAX_EPOLL_EVENTS, timeout_ms);
 	if (ready_num < 0) {
@@ -378,7 +378,7 @@ static int do_fd_tasks(thread* t, int timeout_ms)
 	return do_sum;
 }
 
-static int fire_timer_task(task* tk, uint64_t now_ms)
+static int thread_fire_timer_task(task* tk, uint64_t now_ms)
 {
 	if (tk->timeout > now_ms)
 		return 0;
@@ -391,7 +391,7 @@ static int fire_timer_task(task* tk, uint64_t now_ms)
 	return 1;
 }
 
-static int process_current_timer_slot(thread* t, uint64_t now_ms)
+static int thread_process_timer_slot(thread* t, uint64_t now_ms)
 {
 	int do_sum = 0;
 
@@ -416,23 +416,23 @@ static int process_current_timer_slot(thread* t, uint64_t now_ms)
 		/* The callback may unregister, migrate, or destroy other timers.
 		 * Pop one timer at a time from the real wheel so those operations
 		 * never see nodes linked to a stack-local temporary list. */
-		do_sum += fire_timer_task(tk, now_ms);
+		do_sum += thread_fire_timer_task(tk, now_ms);
 	}
 
 	return do_sum;
 }
 
-static int do_timer_tasks(thread* t)
+static int thread_process_timer_tasks(thread* t)
 {
     int do_sum = 0;
 	    uint64_t now_ms = get_current_time_ms();
     uint64_t elapsed_ms = now_ms - t->last_timer_check_ms;
     uint64_t elapsed_ticks = elapsed_ms / WHEEL_0_TICK_MS;
 
-    do_sum += process_current_timer_slot(t, now_ms);
+    do_sum += thread_process_timer_slot(t, now_ms);
     for (uint64_t i = 0; i < elapsed_ticks; i++) {
         wheel_advance(t);
-        do_sum += process_current_timer_slot(t, now_ms);
+        do_sum += thread_process_timer_slot(t, now_ms);
     }
 
     /* Keep the sub-tick remainder so wheel slots advance at 10 ms, not 1 ms. */
@@ -444,8 +444,8 @@ static int do_timer_tasks(thread* t)
 int thread_step(thread* t)
 {
 	current_time_ms = read_now_ms();
-	int do_sum = do_loop_tasks(t) + do_timer_tasks(t);
-	int fd_sum = do_fd_tasks(t, THREAD_EPOLL_WAIT_TIME);
+	int do_sum = thread_process_loop_tasks(t) + thread_process_timer_tasks(t);
+	int fd_sum = thread_process_fd_tasks(t, THREAD_EPOLL_WAIT_TIME);
 	if (fd_sum > 0)
 		do_sum += fd_sum;
 
@@ -461,8 +461,8 @@ void thread_loop(thread* t)
 		int timeout_ms = t->work_pending ? 0 : THREAD_EPOLL_WAIT_TIME;
 		t->work_pending = 0;
 
-		(void)do_loop_tasks(t);
-		(void)do_timer_tasks(t);
-		(void)do_fd_tasks(t, timeout_ms);
+		(void)thread_process_loop_tasks(t);
+		(void)thread_process_timer_tasks(t);
+		(void)thread_process_fd_tasks(t, timeout_ms);
 	}
 }

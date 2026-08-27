@@ -21,7 +21,7 @@
 
 typedef struct connection {
     struct connection *request_next;
-    net_async_req *pending_request;
+    req *pending_request;
     int fd;
     bool failed;
     struct linger linger;
@@ -52,7 +52,7 @@ static double seconds_between(const struct timespec *start,
            (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
 }
 
-static uint32_t request_bucket(const net_async_req *request)
+static uint32_t request_bucket(const req *request)
 {
     uintptr_t value = (uintptr_t)request;
     return (uint32_t)((value >> 4) * UINT64_C(11400714819323198485)) &
@@ -60,7 +60,7 @@ static uint32_t request_bucket(const net_async_req *request)
 }
 
 static void request_add(server *state, connection *conn,
-                        net_async_req *request)
+                        req *request)
 {
     uint32_t bucket = request_bucket(request);
     conn->pending_request = request;
@@ -68,7 +68,7 @@ static void request_add(server *state, connection *conn,
     state->requests[bucket] = conn;
 }
 
-static connection *request_remove(server *state, net_async_req *request)
+static connection *request_remove(server *state, req *request)
 {
     uint32_t bucket = request_bucket(request);
     connection **link = &state->requests[bucket];
@@ -99,7 +99,7 @@ static bool valid_pattern(const unsigned char *data, size_t size)
     return true;
 }
 
-static int submit_request(server *state, net_async_req *request)
+static int submit_request(server *state, req *request)
 {
     if (!request)
         return -1;
@@ -112,7 +112,7 @@ static int submit_request(server *state, net_async_req *request)
 }
 
 static int submit_connection_request(server *state, connection *conn,
-                                     net_async_req *request)
+                                     req *request)
 {
     if (!request)
         return -1;
@@ -127,16 +127,15 @@ static int submit_connection_request(server *state, connection *conn,
         errno = saved_errno;
         return -1;
     }
-    /* async_fd is informational and can be reused after close starts.  The
-     * request object itself is the stable identity of this operation. */
+    /* The request object is the stable identity of this operation. */
     request_add(state, conn, request);
     return 0;
 }
 
 static int submit_accept(server *state)
 {
-    net_async_req *request = net_async_req_create(
-        state->listen_fd, NET_ASYNC_ACCEPT,
+    req *request = net_async_req_create(
+        state->listen_fd, REQ_ACCEPT,
         (struct sockaddr *)NULL, (socklen_t *)NULL);
     if (submit_request(state, request) != 0)
         return -1;
@@ -156,24 +155,24 @@ static int fill_accept_pipeline(server *state)
 
 static int submit_read(server *state, connection *conn)
 {
-    net_async_req *request = net_async_req_create(
-        conn->fd, NET_ASYNC_READ, conn->data + conn->received,
+    req *request = net_async_req_create(
+        conn->fd, REQ_READ, conn->data + conn->received,
         (uint32_t)(conn->payload_size - conn->received));
     return submit_connection_request(state, conn, request);
 }
 
 static int submit_linger(server *state, connection *conn)
 {
-    net_async_req *request = net_async_req_create(
-        conn->fd, NET_ASYNC_SETSOCKOPT, SOL_SOCKET, SO_LINGER,
+    req *request = net_async_req_create(
+        conn->fd, REQ_SETSOCKOPT, SOL_SOCKET, SO_LINGER,
         &conn->linger, (socklen_t)sizeof(conn->linger));
     return submit_connection_request(state, conn, request);
 }
 
 static int submit_write(server *state, connection *conn)
 {
-    net_async_req *request = net_async_req_create(
-        conn->fd, NET_ASYNC_WRITE, conn->data + conn->sent,
+    req *request = net_async_req_create(
+        conn->fd, REQ_WRITE, conn->data + conn->sent,
         (uint32_t)(conn->payload_size - conn->sent));
     return submit_connection_request(state, conn, request);
 }
@@ -181,7 +180,7 @@ static int submit_write(server *state, connection *conn)
 static int submit_close(server *state, connection *conn)
 {
     return submit_connection_request(
-        state, conn, net_async_req_create(conn->fd, NET_ASYNC_CLOSE));
+        state, conn, net_async_req_create(conn->fd, REQ_CLOSE));
 }
 
 static int fail_connection(server *state, connection *conn, int result)
@@ -203,8 +202,8 @@ static int complete_accept(server *state, int result)
     }
     connection *conn = calloc(1, sizeof(*conn) + state->payload_size);
     if (!conn) {
-        net_async_req *close_request =
-            net_async_req_create(result, NET_ASYNC_CLOSE);
+        req *close_request =
+            net_async_req_create(result, REQ_CLOSE);
         (void)submit_request(state, close_request);
         return -1;
     }
@@ -248,12 +247,12 @@ static int complete_write(server *state, connection *conn, int result)
         ? submit_write(state, conn) : submit_close(state, conn);
 }
 
-static int complete_request(server *state, net_async_req *request)
+static int complete_request(server *state, req *request)
 {
-    int type = request->type;
-    int result = request->ret;
+    req_type type;
+    int result = net_async_result(request, &type);
 
-    if (type == NET_ASYNC_ACCEPT) {
+    if (type == REQ_ACCEPT) {
         net_async_req_destroy(request);
         return complete_accept(state, result);
     }
@@ -264,15 +263,15 @@ static int complete_request(server *state, net_async_req *request)
         return -1;
     }
     switch (type) {
-    case NET_ASYNC_SETSOCKOPT:
+    case REQ_SETSOCKOPT:
         if (result < 0)
             return fail_connection(state, conn, result);
         return submit_read(state, conn);
-    case NET_ASYNC_READ:
+    case REQ_READ:
         return complete_read(state, conn, result);
-    case NET_ASYNC_WRITE:
+    case REQ_WRITE:
         return complete_write(state, conn, result);
-    case NET_ASYNC_CLOSE:
+    case REQ_CLOSE:
         if (result < 0) {
             errno = -result;
             return -1;
@@ -346,7 +345,7 @@ int main(int argc, char **argv)
 
     bool fatal = false;
     while (state.completed + state.failed < state.total) {
-        net_async_req *completed[COMPLETION_BATCH];
+        req *completed[COMPLETION_BATCH];
         int count = net_async_wait(state.cq_fd, completed, 1,
                                    COMPLETION_BATCH, 30000);
         if (count <= 0) {

@@ -16,11 +16,11 @@ typedef struct queue {
 void init_queue(queue* q);
 void add_queue(queue* q, list_node* node);
 void add_queue_first(queue* q, list_node* node);
+list_node* get_queue_first(queue* q);
+list_node* get_queue_last(queue* q);
 list_node* pop_queue(queue* q);
 list_node* pop_queue_last(queue* q);
 bool queue_exist(queue* q, uint64_t element);
-list_node* get_queue_first(queue* q);
-list_node* get_queue_last(queue* q);
 
 #define QUEUE_EMPTY(q) ((q)->element_number == 0)
 

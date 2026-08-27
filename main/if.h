@@ -75,7 +75,8 @@ if_info* search_if_by_index(uint32_t ifindex);
 bool if_add_addr(if_info* info, sa_family_t family, const uint8_t* ip,
                  uint32_t prefix_len, uint8_t scope, bool primary);
 bool if_has_addr(if_info* info, sa_family_t family, const uint8_t* ip);
-bool search_addr_exist(sa_family_t family, const uint8_t* ip, uint32_t ifindex);
+bool if_has_loopback(void);
+bool if_address_exists(sa_family_t family, const uint8_t* ip, uint32_t ifindex);
 
 int parse_link_event(struct nlmsghdr *nlh);
 int parse_addr_event(struct nlmsghdr *nlh);
@@ -84,8 +85,6 @@ bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
                                    const uint8_t* daddr, uint8_t* saddr);
 
 if_info* if_create_virtual_loopback(void);
-
-bool if_has_loopback(void);
 
 #endif
 

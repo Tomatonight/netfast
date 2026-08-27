@@ -19,30 +19,20 @@ typedef struct ether_vlan_hdr {
     uint16_t encap_proto;
 } ether_vlan_hdr;
 
-bool mac_same(const uint8_t* a, const uint8_t* b)
+static bool ether_mac_equal(const uint8_t* a, const uint8_t* b)
 {
 	return memcmp(a, b, ETH_ALEN) == 0;
 }
 
-bool mac_boardcast(const uint8_t* mac)
+static bool ether_mac_is_broadcast(const uint8_t* mac)
 {
     static const uint8_t broadcast_mac[ETH_ALEN] = {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff
     };
-    return mac_same(mac, broadcast_mac);
+    return ether_mac_equal(mac, broadcast_mac);
 }
 
-int ether_up(if_info* info){
-    if (xdp_if_start(info) < 0) {
-        ERR_LOG("ether_up: failed to start XDP on %s", info->name);
-        return -1;
-    }
-    return 0;
-}
-int ether_down(if_info* info){
-    return xdp_if_stop(info);
-}
-static void update_ether_attr(if_info* info, struct nlmsghdr *nlh)
+static void ether_update_attributes(if_info* info, struct nlmsghdr *nlh)
 {
     struct ifinfomsg *ifinfo = (struct ifinfomsg *)NLMSG_DATA(nlh);
     struct rtattr *rta;
@@ -75,6 +65,41 @@ static void update_ether_attr(if_info* info, struct nlmsghdr *nlh)
         }
     }
 }
+
+int ether_create(if_info* info, struct nlmsghdr* nlh)
+{
+    info->l2_addr = malloc(ETH_ALEN);
+    if (!info->l2_addr)
+        return -ENOMEM;
+    info->l2_len = sizeof(ether_hdr);
+    ether_update_attributes(info, nlh);
+    return 0;
+}
+
+void ether_update(if_info* info, struct nlmsghdr* nlh)
+{
+    ether_update_attributes(info, nlh);
+}
+
+void ether_destroy(if_info* info)
+{
+    free(info->l2_addr);
+}
+
+int ether_up(if_info* info)
+{
+    if (xdp_if_start(info) < 0) {
+        ERR_LOG("ether_up: failed to start XDP on %s", info->name);
+        return -1;
+    }
+    return 0;
+}
+
+int ether_down(if_info* info)
+{
+    return xdp_if_stop(info);
+}
+
 int ether_recv(if_info* info, skbuff* skb)
 {
     if (skb_data0_len(skb) < sizeof(ether_hdr))
@@ -84,8 +109,8 @@ int ether_recv(if_info* info, skbuff* skb)
     memcpy(&ether, skb_start(skb), sizeof(ether));
     skb_consume(skb, sizeof(ether), true);
 
-    if (!mac_same(ether.dmac, info->l2_addr) &&
-        !mac_boardcast(ether.dmac))
+    if (!ether_mac_equal(ether.dmac, info->l2_addr) &&
+        !ether_mac_is_broadcast(ether.dmac))
         return -1;
 
     uint16_t ethertype = ntohs(ether.ether_type);
@@ -158,21 +183,6 @@ int ether_send(if_info* info, skbuff* skb)
     skb->ether_hdr = eth;
 
     return xdp_transmit_skb(info, skb);
-}
-void ether_update(if_info* new_info, struct nlmsghdr *nlh){
-    update_ether_attr(new_info, nlh);
-}
-int ether_create(if_info* new_info, struct nlmsghdr *nlh){
-    new_info->l2_addr = malloc(ETH_ALEN);
-    if (!new_info->l2_addr)
-        return -ENOMEM;
-    new_info->l2_len = sizeof(ether_hdr);  /* 14 bytes */
-    update_ether_attr(new_info, nlh);
-
-    return 0;
-}
-void ether_destroy(if_info* info){
-    free(info->l2_addr);
 }
 const if_ops ether_ops={
     .send=ether_send,

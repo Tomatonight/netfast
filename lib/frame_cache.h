@@ -71,17 +71,17 @@ typedef struct data_info {
     uint32_t size;
 } data_info;
 
-void free_data_info(data_info* info);
-data_info* alloc_data_info(uint32_t size);
-data_info* create_data_info(frame_slot* slot, uint32_t start, uint32_t end);
-void copy_data_info(data_info* dst, const data_info* src);
-
-frame_slot* frame_slot_alloc(uint32_t min_data_len);
-uint32_t frame_rx_headroom(void);
-
 void frame_global_cache_init(void);
 void frame_cache_init(frame_cache* cache);
 void frame_cache_reset(frame_cache* cache);
 void frame_global_cache_reset(void);
+
+uint32_t frame_rx_headroom(void);
+frame_slot* frame_slot_alloc(uint32_t min_data_len);
+
+void free_data_info(data_info* info);
+data_info* alloc_data_info(uint32_t size);
+data_info* create_data_info(frame_slot* slot, uint32_t start, uint32_t end);
+void copy_data_info(data_info* dst, const data_info* src);
 
 #endif

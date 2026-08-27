@@ -3,7 +3,6 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <stdint.h>
 
@@ -15,6 +14,8 @@ extern "C" {
 int net_socket(int family, int type, int protocol);
 int net_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int net_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int net_listen(int sockfd, int backlog);
+int net_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int net_write(int sockfd, const void *buf, uint32_t len);
 int net_read(int sockfd, void *buf, uint32_t len);
 int net_sendto(int sockfd, const void *buf, uint32_t len, int flags,
@@ -23,69 +24,131 @@ int net_recvfrom(int sockfd, void *buf, uint32_t len, int flags,
                      struct sockaddr *src_addr, socklen_t *addrlen);
 int net_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int net_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
-int net_close(int fd);
 int net_setsockopt(int sockfd, int level, int optname,
                    const void *optval, socklen_t optlen);
 int net_getsockopt(int sockfd, int level, int optname,
                    void *optval, socklen_t *optlen);
 int net_fcntl(int sockfd, int cmd, ...);
+int net_close(int fd);
 int net_shutdown(int sockfd, int how);
-int net_listen(int sockfd, int backlog);
-int net_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
-
-/* ── epoll API ── */
-int net_epoll_create(void);
-int net_epoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event);
-int net_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
-                   int timeout_ms);
 
 /* ── asynchronous request API ──
  * A successful submit transfers request ownership to the completion queue.
- * net_async_wait() returns ownership to the caller; then inspect the result
- * and call net_async_req_destroy().  A completed request result is
- * non-negative on success and -errno on failure.  All pointed-to buffers must
- * remain valid until completion. */
-typedef enum net_async_op {
-    NET_ASYNC_SOCKET = 1,
-    NET_ASYNC_BIND,
-    NET_ASYNC_CONNECT,
-    NET_ASYNC_LISTEN,
-    NET_ASYNC_ACCEPT,
-    NET_ASYNC_WRITE,
-    NET_ASYNC_READ,
-    NET_ASYNC_SENDTO,
-    NET_ASYNC_RECVFROM,
-    NET_ASYNC_GETSOCKNAME,
-    NET_ASYNC_GETPEERNAME,
-    NET_ASYNC_CLOSE,
-    NET_ASYNC_SHUTDOWN,
-    NET_ASYNC_SETSOCKOPT,
-    NET_ASYNC_GETSOCKOPT,
-    NET_ASYNC_FCNTL,
-} net_async_op;
+ * net_async_wait() returns ownership to the caller; then call
+ * net_async_result() and either resubmit or destroy the request.  A completed
+ * result is non-negative on success and -errno on failure.  All pointed-to
+ * buffers must remain valid until completion. */
+typedef enum req_type {
+    REQ_SOCKET = 1,
+    REQ_BIND,
+    REQ_CONNECT,
+    REQ_LISTEN,
+    REQ_ACCEPT,
+    REQ_WRITE,
+    REQ_READ,
+    REQ_SENDTO,
+    REQ_RECVFROM,
+    REQ_GETSOCKNAME,
+    REQ_GETPEERNAME,
+    REQ_CLOSE,
+    REQ_SHUTDOWN,
+    REQ_SETSOCKOPT,
+    REQ_GETSOCKOPT,
+    REQ_FCNTL,
+    REQ_WORKER_REQ,
+} req_type;
 
-typedef struct net_async_req {
-    int type;       /* net_async_op */
-    int async_fd;   /* fd supplied when the request was created */
-    int ret;        /* non-negative result or -errno after completion */
-} net_async_req;
+typedef struct req req;
 
-net_async_req *net_async_req_create(int fd, int operation, ...);
-void net_async_req_destroy(net_async_req *request);
+/* Arguments retained by a request.  Pointer arguments keep referring to the
+ * caller-owned objects supplied to net_async_req_create(), so those objects
+ * must remain valid until the request completes. */
+typedef union req_argv {
+    struct {
+        int family;
+        int type;
+        int protocol;
+    } Socket;
+    struct {
+        struct sockaddr_storage addr;
+        socklen_t addrlen;
+    } bind;
+    struct {
+        struct sockaddr_storage addr;
+        socklen_t addrlen;
+    } connect;
+    struct {
+        const void *buf;
+        uint32_t len;
+    } write;
+    struct {
+        void *buf;
+        uint32_t len;
+    } read;
+    struct {
+        const void *buf;
+        uint32_t len;
+        int flags;
+        struct sockaddr_storage dest_addr;
+        socklen_t addrlen;
+        uint32_t has_dest_addr;
+    } sendto;
+    struct {
+        void *buf;
+        uint32_t len;
+        int flags;
+        struct sockaddr *src_addr;
+        socklen_t *addrlen;
+    } recvfrom;
+    struct {
+        int backlog;
+    } listen;
+    struct {
+        struct sockaddr *addr;
+        socklen_t *addrlen;
+    } accept;
+    struct {
+        struct sockaddr *addr;
+        socklen_t *addrlen;
+    } getsockname;
+    struct {
+        struct sockaddr *addr;
+        socklen_t *addrlen;
+    } getpeername;
+    struct {
+        int how;
+    } shutdown;
+    struct {
+        int level;
+        int optname;
+        const void *optval;
+        socklen_t optlen;
+    } setsockopt;
+    struct {
+        int level;
+        int optname;
+        void *optval;
+        socklen_t *optlen;
+    } getsockopt;
+    struct {
+        int cmd;
+        int arg;
+    } fcntl;
+    struct {
+        void *argv;
+        int (*cb)(void *);
+    } worker_req;
+} req_argv;
+
 int net_async_create(void);
-int net_async_submit(int cq_fd, net_async_req *request);
-/* Submit requests in array order.  On success, returns the number submitted
- * and transfers ownership of requests[0..return_value) to the CQ.  A short
- * positive return means the first unsubmitted request failed validation;
- * requests at and after that index remain owned by the caller. */
-int net_async_submit_batch(int cq_fd, net_async_req **requests,
-                           uint32_t count);
-/* Wait for min_complete requests and return as many immediately available
- * completions as possible, up to max_complete.  On total timeout, a partial
- * batch is returned.  A negative total_timeout_ms waits indefinitely.
- * Multiple threads may wait on the same CQ; each completion is returned to
- * exactly one waiter. */
-int net_async_wait(int cq_fd, net_async_req **requests,
+req *net_async_req_create(int fd, req_type type, ...);
+void net_async_req_destroy(req *request);
+int net_async_submit(int cq_fd, req *request);
+/* Return the completed operation result and optionally store its type.
+ * Request arguments are available through net_async_argv(). */
+int net_async_result(const req *request, req_type *type);
+req_argv *net_async_argv(req *request);
+int net_async_wait(int cq_fd, req **requests,
 	                   uint32_t min_complete, uint32_t max_complete,
 	                   int total_timeout_ms);
 int net_async_close(int cq_fd);

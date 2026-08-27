@@ -95,8 +95,10 @@ typedef struct if_xdp {
 	bool rx_drop_contd;
 } if_xdp;
 
-int xdp_if_start(struct if_info *info);
+int xdp_init(void);
+void xdp_cleanup_programs(void);
 
+int xdp_if_start(struct if_info *info);
 int xdp_if_stop(struct if_info *info);
 
 void xdp_if_read(struct task *tk);
@@ -104,11 +106,6 @@ void xdp_if_read(struct task *tk);
 int xdp_if_send(struct if_info *info, struct skbuff *skb);
 
 int xdp_transmit_skb(struct if_info *info, struct skbuff *skb);
-
-
-int xdp_init(void);
-
-void xdp_cleanup_programs(void);
 
 
 #endif

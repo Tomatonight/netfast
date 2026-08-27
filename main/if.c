@@ -33,21 +33,6 @@ static const if_l2_ops g_l2_ops[] = {
 static list_node g_if_list;
 pthread_rwlock_t g_if_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
-bool if_has_loopback(void)
-{
-    bool found = false;
-    IF_RDLOCK();
-    if_info* info;
-    FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
-        if (info->ops == &loopback_ops) {
-            found = true;
-            break;
-        }
-    }
-    IF_UNLOCK();
-    return found;
-}
-
 static inline uint32_t if_load_ipv4(const uint8_t* ip)
 {
     uint32_t value;
@@ -66,7 +51,7 @@ static bool if_addr_equal(const if_addr* addr, sa_family_t family,
 }
 
 /* Derive scope from an IP address (simplified, mirrors kernel logic). */
-static uint8_t ip_to_scope(sa_family_t family, const uint8_t* ip)
+static uint8_t if_ip_scope(sa_family_t family, const uint8_t* ip)
 {
     if (family == AF_INET) {
         uint32_t v4 = if_load_ipv4(ip);
@@ -87,7 +72,7 @@ static uint8_t ip_to_scope(sa_family_t family, const uint8_t* ip)
     return ADDR_SCOPE_GLOBAL;
 }
 
-static const if_ops* get_if_ops_by_type(int if_type)
+static const if_ops* if_ops_for_type(int if_type)
 {
     for (uint32_t i = 0; i < sizeof(g_l2_ops) / sizeof(g_l2_ops[0]); ++i) {
         if (g_l2_ops[i].if_type == if_type)
@@ -138,7 +123,7 @@ static void if_update_checksum_features(if_info* info)
               info->hw_rx_checksum_enabled);
 }
 
-static void clear_addr_list(if_info* info)
+static void if_clear_addr_list(if_info* info)
 {
     if_addr* addr;
     list_node* tmp_node;
@@ -218,7 +203,7 @@ bool if_has_addr(if_info* info, sa_family_t family, const uint8_t* ip)
     return found;
 }
 
-static bool is_subnet_match_v4(uint32_t sip, uint32_t prefix_len, uint32_t dip)
+static bool if_subnet_matches_v4(uint32_t sip, uint32_t prefix_len, uint32_t dip)
 {
     if (prefix_len == 0)
         return true;
@@ -226,7 +211,7 @@ static bool is_subnet_match_v4(uint32_t sip, uint32_t prefix_len, uint32_t dip)
     return (ntohl(sip) & mask) == (ntohl(dip) & mask);
 }
 
-static bool is_subnet_match_v6(const uint8_t* sip, uint32_t prefix_len, const uint8_t* dip)
+static bool if_subnet_matches_v6(const uint8_t* sip, uint32_t prefix_len, const uint8_t* dip)
 {
     if (prefix_len > 128)
         return false;
@@ -271,7 +256,7 @@ bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
     if_addr* addr;
     if_addr* best = NULL;
     if_addr* best_fallback = NULL;
-    uint8_t daddr_scope = ip_to_scope(family, daddr);
+    uint8_t daddr_scope = if_ip_scope(family, daddr);
 
     memset(saddr, 0, 16);
 
@@ -284,10 +269,10 @@ bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
         if (family == AF_INET) {
             if (addr->ipv4 == 0 || addr->prefix_len > 32)
                 continue;
-            match = is_subnet_match_v4(addr->ipv4, addr->prefix_len,
+            match = if_subnet_matches_v4(addr->ipv4, addr->prefix_len,
                                        if_load_ipv4(daddr));
         } else {
-            match = is_subnet_match_v6(addr->ipv6, addr->prefix_len, daddr);
+            match = if_subnet_matches_v6(addr->ipv6, addr->prefix_len, daddr);
         }
 
         if (match && if_addr_better(addr, best, daddr_scope)) {
@@ -323,7 +308,7 @@ static int if_down_cb(void* arg)
     return 0;
 }
 
-static void notify_if_change(if_info* info, int (*cb)(void*))
+static void if_notify_change(if_info* info, int (*cb)(void*))
 {
     worker* cur = get_current_worker();
 
@@ -340,20 +325,20 @@ static void if_up(if_info* info)
     if_update_checksum_features(info);
     if (info->ops->up)
         (void)info->ops->up(info);
-    notify_if_change(info, if_up_cb);
+    if_notify_change(info, if_up_cb);
 }
 
 static void if_down(if_info* info)
 {
-    notify_if_change(info, if_down_cb);
+    if_notify_change(info, if_down_cb);
     if (info->ops->down)
         (void)info->ops->down(info);
 }
 
-static if_info* create_if(struct nlmsghdr* nlh)
+static if_info* if_create_from_netlink(struct nlmsghdr* nlh)
 {
     struct ifinfomsg* ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
-    const if_ops* ops = get_if_ops_by_type(ifinfo->ifi_type);
+    const if_ops* ops = if_ops_for_type(ifinfo->ifi_type);
     if_info* info;
 
     if (!ops)
@@ -399,7 +384,7 @@ static int if_update(struct nlmsghdr* nlh, if_info** changed_info,
         }
     }
 
-    info = create_if(nlh);
+    info = if_create_from_netlink(nlh);
     if (!info) {
         IF_UNLOCK();
         return -1;
@@ -437,7 +422,7 @@ static int if_delete(struct nlmsghdr* nlh, if_info** deleted_info,
             *was_up = if_is_up(info->flags);
             remove_list_node(&info->list);
             *deleted_info = info;
-            clear_addr_list(info);
+            if_clear_addr_list(info);
             IF_UNLOCK();
             return 0;
         }
@@ -570,7 +555,22 @@ if_info* search_if_by_index(uint32_t ifindex)
     return NULL;
 }
 
-bool search_addr_exist(sa_family_t family, const uint8_t* ip, uint32_t ifindex)
+bool if_has_loopback(void)
+{
+    bool found = false;
+    IF_RDLOCK();
+    if_info* info;
+    FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
+        if (info->ops == &loopback_ops) {
+            found = true;
+            break;
+        }
+    }
+    IF_UNLOCK();
+    return found;
+}
+
+bool if_address_exists(sa_family_t family, const uint8_t* ip, uint32_t ifindex)
 {
     if_info* info;
     if_addr* addr;

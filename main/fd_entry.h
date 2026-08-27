@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <netinet/in.h>
 #include "list.h"
 #include "base.h"
@@ -47,14 +46,6 @@ typedef struct fd_entry_ops {
                       void *optval, socklen_t *optlen);
     int (*fcntl)(fd_entry* entry, int cmd, int arg);
 
-#ifdef TEST_EPOLL
-    int (*epoll_create)(void);
-    int (*epoll_ctl)(fd_entry* entry, int op, int sockfd,
-                     struct epoll_event *event);
-    int (*epoll_wait)(fd_entry* entry, struct epoll_event *events,
-                      int maxevents, int timeout_ms);
-#endif
-
     int (*close)(fd_entry* entry);
     int (*shutdown)(fd_entry* entry, int how);
 
@@ -84,7 +75,7 @@ fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
                                      worker* w);
 fd_entry* hold_fd_entry(int fd);
 
-fd_entry* get_sock_entry_by_req(const req* r);
+fd_entry* fd_entry_from_request(const req* r);
 
 int fd_table_init(void);
 #endif /* FD_ENTRY_H */

@@ -2,8 +2,7 @@ CC ?= gcc
 CLANG ?= clang
 
 BUILD_DIR := build
-PROFILE ?= debug
-TEST_EPOLL ?= 0
+PROFILE ?= release
 
 PROFILE_CFLAGS_debug := -Og -g3 -DDEBUG
 PROFILE_CFLAGS_release := -O2 -DNDEBUG
@@ -37,7 +36,8 @@ SRC_LIB := \
 	lib/frame_cache.c \
 	lib/thread.c \
 	lib/trie.c \
-	lib/xdp.c
+	lib/xdp.c \
+	lib/rb_tree.c
 SRC_MAIN := \
 	main/ether.c \
 	main/fd_entry.c \
@@ -49,7 +49,6 @@ SRC_MAIN := \
 	main/ipv6.c \
 	main/ipv6_ext.c \
 	main/loopback.c \
-	main/req_epoll.c \
 	main/netlink.c \
 	main/req.c \
 	main/req_async.c \
@@ -61,6 +60,7 @@ SRC_MAIN := \
 	main/tcp.c \
 	main/tcp_congestion.c \
 	main/tcp_metrics.c \
+	main/tcp_sack.c \
 	main/udp.c \
 	main/worker.c
 SRCS := $(SRC_LIB) $(SRC_MAIN)
@@ -70,10 +70,6 @@ BPF_ARCH ?= $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
 
 CFLAGS ?= $(PROFILE_CFLAGS) -Wall -Wextra -MMD -MP -D_GNU_SOURCE
 CFLAGS += -I. -Ilib -Imain -pthread -fPIC
-
-ifeq ($(TEST_EPOLL),1)
-CFLAGS += -DTEST_EPOLL
-endif
 
 # 处理大静态数据/.bss 场景下的重定位溢出
 CFLAGS += -mcmodel=large
@@ -94,11 +90,11 @@ BPF_INSTALL_DIR ?= $(PREFIX)/lib/bpf
 CONFIG_DIR ?= $(PREFIX)/etc/netfast
 CONFIG_FILE ?= $(firstword $(wildcard netfast_config.json) config.example.json)
 
-.DEFAULT_GOAL := debug
+.DEFAULT_GOAL := release
 
 .PHONY: all build clean bpf install uninstall debug release relwithdebinfo ftp-async http-async FORCE
 
-all: debug
+all: release
 
 build: $(LIB) $(BPF_OBJ) $(HEADER)
 
@@ -127,7 +123,7 @@ $(BUILD_DIR)/%.o: %.c $(PROFILE_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BPF_DIR)/xdp_redirect.bpf.o: lib/xdp_redirect.bpf.c $(PROFILE_STAMP)
+$(BPF_DIR)/xdp_redirect.bpf.o: lib/xdp_redirect.bpf.c lib/xdp_redirect_config.h $(PROFILE_STAMP)
 	@mkdir -p $(BPF_DIR)
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 

@@ -11,15 +11,6 @@
 #include "worker.h"
 #include "netfast.h"
 
-_Static_assert((int)NET_ASYNC_SOCKET == (int)REQ_SOCKET &&
-               (int)NET_ASYNC_FCNTL == (int)REQ_FCNTL,
-               "public async operations must match internal request types");
-
-static inline req* async_req_from_public(net_async_req* request)
-{
-    return (req*)((uint8_t*)request - offsetof(req, public));
-}
-
 typedef struct async_waiter {
     struct async_waiter* next;
     uint32_t need;
@@ -65,14 +56,16 @@ static void async_notify_ready_waiters(async_cq* cq)
 
 static void async_req_free(req* r)
 {
-    assert(!r->async.entry);
+    fd_entry* entry = r->entry;
+    r->entry = NULL;
+    PUT_REF(entry);
     pthread_cond_destroy(&r->done_cv);
     pthread_mutex_destroy(&r->done_wait_mtx);
     (void)pthread_spin_destroy(&r->done_mtx);
     free(r);
 }
 
-static void destroy_async_cq(async_cq* cq)
+static void async_cq_destroy(async_cq* cq)
 {
     assert(!cq->waiters);
     notify_queue_close(&cq->completions);
@@ -91,7 +84,8 @@ static req* async_cq_pop(async_cq* cq)
     (void)old;
     assert(old != 0);
 
-    req* r = (req*)((uint8_t*)node - offsetof(req, async.completion_node));
+    req* r = (req*)((uint8_t*)node -
+                    offsetof(req, async.completion_node));
     assert(LIST_ATTACHED(&r->async.submit_node));
     remove_list_node(&r->async.submit_node);
 
@@ -101,45 +95,8 @@ static req* async_cq_pop(async_cq* cq)
     return r;
 }
 
-static int async_submit_batch(fd_entry* entry, net_async_req** requests,
-                              uint32_t count);
-static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
-                      uint32_t max, int total_timeout_ms);
-static int async_close(fd_entry* entry);
-
-static const fd_entry_ops async_fd_ops = {
-    .close = async_close,
-};
-
-int net_async_create(void)
-{
-    CREATE_REF(async_cq, cq, destroy_async_cq);
-    if (!cq) {
-        errno = ENOMEM;
-        return -1;
-    }
-
-    cq->completions.efd = -1;
-    atomic_init(&cq->complete_count, 0);
-    atomic_init(&cq->wait_need, UINT_MAX);
-    mutex_init(&cq->waiters_mtx);
-    if (notify_queue_init(&cq->completions) < 0) {
-        if (errno == 0)
-            errno = EIO;
-        PUT_REF(cq);
-        return -1;
-    }
-
-    fd_entry* entry = alloc_fd_entry_with_worker(cq, &async_fd_ops, NULL);
-    if (!entry) {
-        errno = EMFILE;
-        PUT_REF(cq);
-        return -1;
-    }
-    return entry->fd;
-}
-
-static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
+static int async_submit_one(async_cq* cq, req* r,
+                            uint64_t* worker_mask)
 {
     if (!r) {
         errno = EINVAL;
@@ -147,7 +104,7 @@ static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
     }
 
     spin_lock(&r->done_mtx);
-    if (r->done || r->async.cq) {
+    if (r->async.cq) {
         spin_unlock(&r->done_mtx);
         errno = EBUSY;
         return -1;
@@ -155,9 +112,9 @@ static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
 
     worker* aim_worker;
     if (r->type == REQ_SOCKET) {
-        aim_worker = random_worker();
-    } else if (r->async.entry) {
-        aim_worker = fd_entry_get_worker(r->async.entry);
+        aim_worker = worker_select_random();
+    } else if (r->entry) {
+        aim_worker = fd_entry_get_worker(r->entry);
     } else {
         aim_worker = NULL;
     }
@@ -165,6 +122,18 @@ static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
         spin_unlock(&r->done_mtx);
         errno = EBADF;
         return -1;
+    }
+
+    if (r->done) {
+        assert(!LIST_ATTACHED(&r->pn.node));
+        assert(!r->timeout_task);
+        r->ret = 0;
+        r->status = REQ_IN_PROGRESS;
+        r->wait_sock = NULL;
+        r->pn.value = NULL;
+        r->pn.cb = NULL;
+        r->flag.async_cancel = 0;
+        r->done = 0;
     }
 
     assert(!LIST_ATTACHED(&r->async.submit_node));
@@ -176,38 +145,6 @@ static int async_submit_one(async_cq* cq, req* r, uint64_t* worker_mask)
     *worker_mask |= UINT64_C(1) << (uint32_t)(aim_worker - g_workers);
     spin_unlock(&r->done_mtx);
     return 0;
-}
-
-static int async_submit_batch(fd_entry* entry, net_async_req** requests,
-                              uint32_t count)
-{
-    if (!requests || count == 0 || count > INT_MAX) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    mutex_lock(&entry->mtx);
-    async_cq* cq = (async_cq*)entry->value;
-    if (!cq) {
-        mutex_unlock(&entry->mtx);
-        errno = EBADF;
-        return -1;
-    }
-
-    uint64_t worker_mask = 0;
-    uint32_t submitted = 0;
-    while (submitted < count &&
-           async_submit_one(cq, async_req_from_public(requests[submitted]),
-                            &worker_mask) == 0) {
-        submitted++;
-    }
-
-    for (int i = 0; i < g_worker_num; i++) {
-        if (worker_mask & (UINT64_C(1) << (uint32_t)i))
-            notify_queue_notify(&g_workers[i].stack.req_msg);
-    }
-    mutex_unlock(&entry->mtx);
-    return submitted ? (int)submitted : -1;
 }
 
 static uint64_t async_now_ns(void)
@@ -223,7 +160,7 @@ static uint64_t async_add_ns(uint64_t now, uint64_t delta)
     return UINT64_MAX - now < delta ? UINT64_MAX : now + delta;
 }
 
-static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
+static int async_wait(fd_entry* entry, req** requests, uint32_t min,
                       uint32_t max, int total_timeout_ms)
 {
     if (!requests || min == 0 || max < min || max > INT_MAX) {
@@ -252,7 +189,7 @@ static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
             req* r = async_cq_pop(cq);
             if (!r)
                 break;
-            requests[count++] = &r->public;
+            requests[count++] = r;
         }
 
         if ((uint32_t)count >= min)
@@ -323,18 +260,19 @@ static int async_wait(fd_entry* entry, net_async_req** requests, uint32_t min,
     }
 
     mutex_unlock(&entry->mtx);
-    PUT_REF(cq); /* wait reference: keeps eventfd alive across poll() */
+    PUT_REF(cq); /* Wait reference: keeps eventfd alive across poll(). */
     if (count < 0)
         errno = saved_errno ? saved_errno : EIO;
     return count;
 }
 
-static int cancel_worker_reqs(void* argv)
+static int async_cancel_worker_requests(void* argv)
 {
     async_cq* cq = (async_cq*)argv;
     req* r;
 
-    FOR_EACH_LIST_OFFSET(&cq->submit_reqs, r, req, async.submit_node) {
+    FOR_EACH_LIST_OFFSET(&cq->submit_reqs, r, req,
+                         async.submit_node) {
         if (r->worker != get_current_worker())
             continue;
 
@@ -345,7 +283,7 @@ static int cancel_worker_reqs(void* argv)
         spin_unlock(&r->done_mtx);
 
         if (cancel)
-            process_request(r);
+            stack_process_request(r);
     }
     return 0;
 }
@@ -369,7 +307,7 @@ static int async_close(fd_entry* entry)
     bool all_done;
     do {
         for (int i = 0; i < g_worker_num; i++)
-            submit_req_2_worker(&g_workers[i], cq, cancel_worker_reqs, true);
+            submit_req_2_worker(&g_workers[i], cq, async_cancel_worker_requests, true);
 
         /* A request can migrate from a worker visited later in this pass to
          * one visited earlier.  In that case the next pass orders a cancel
@@ -393,15 +331,47 @@ static int async_close(fd_entry* entry)
         async_req_free(r);
 
     assert(cq->submit_reqs.next == NULL);
-    DESTROY_REF(cq); /* release fd entry ownership; wait refs may remain */
+    DESTROY_REF(cq); /* Release fd ownership; waiter references may remain. */
     mutex_unlock(&entry->mtx);
     PUT_REF(entry); /* release the fd table's ownership */
     return 0;
 }
 
+static const fd_entry_ops async_cq_fd_ops = {
+    .close = async_close,
+};
+
+int net_async_create(void)
+{
+    CREATE_REF(async_cq, cq, async_cq_destroy);
+    if (!cq) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    cq->completions.efd = -1;
+    atomic_init(&cq->complete_count, 0);
+    atomic_init(&cq->wait_need, UINT_MAX);
+    mutex_init(&cq->waiters_mtx);
+    if (notify_queue_init(&cq->completions) < 0) {
+        if (errno == 0)
+            errno = EIO;
+        PUT_REF(cq);
+        return -1;
+    }
+
+    fd_entry* entry = alloc_fd_entry_with_worker(cq, &async_cq_fd_ops, NULL);
+    if (!entry) {
+        errno = EMFILE;
+        PUT_REF(cq);
+        return -1;
+    }
+    return entry->fd;
+}
+
 /* ---- request construction ---- */
 
-static int copy_sockaddr(struct sockaddr_storage* dst,
+static int async_copy_sockaddr(struct sockaddr_storage* dst,
                          const struct sockaddr* src, socklen_t len)
 {
     if (!src) {
@@ -417,7 +387,7 @@ static int copy_sockaddr(struct sockaddr_storage* dst,
     return 0;
 }
 
-static req* create_async_req_va(int fd, req_type type, va_list ap)
+static req* async_create_request_va(int fd, req_type type, va_list ap)
 {
     fd_entry* entry = NULL;
     if (type != REQ_SOCKET) {
@@ -434,8 +404,7 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
         return NULL;
     }
     r->type = type;
-    r->async.entry = entry;
-    r->async_fd = fd;
+    r->entry = entry;
 
     bool valid = true;
     switch (type) {
@@ -447,43 +416,37 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
     case REQ_BIND: {
         const struct sockaddr* addr = va_arg(ap, const struct sockaddr*);
         socklen_t len = va_arg(ap, socklen_t);
-        r->argv.bind.entry = entry;
         r->argv.bind.addrlen = len;
-        valid = copy_sockaddr(&r->argv.bind.addr, addr, len) == 0;
+        valid = async_copy_sockaddr(&r->argv.bind.addr, addr, len) == 0;
         break;
     }
     case REQ_CONNECT: {
         const struct sockaddr* addr = va_arg(ap, const struct sockaddr*);
         socklen_t len = va_arg(ap, socklen_t);
-        r->argv.connect.entry = entry;
         r->argv.connect.addrlen = len;
-        valid = copy_sockaddr(&r->argv.connect.addr, addr, len) == 0;
+        valid = async_copy_sockaddr(&r->argv.connect.addr, addr, len) == 0;
         break;
     }
     case REQ_LISTEN:
         r->argv.listen = (typeof(r->argv.listen)){
-            .entry = entry, .backlog = va_arg(ap, int)};
+            .backlog = va_arg(ap, int)};
         break;
     case REQ_ACCEPT:
         r->argv.accept = (typeof(r->argv.accept)){
-            .entry = entry,
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_WRITE:
         r->argv.write = (typeof(r->argv.write)){
-            .entry = entry,
             .buf = va_arg(ap, const void*),
             .len = va_arg(ap, uint32_t)};
         break;
     case REQ_READ:
         r->argv.read = (typeof(r->argv.read)){
-            .entry = entry,
             .buf = va_arg(ap, void*),
             .len = va_arg(ap, uint32_t)};
         break;
     case REQ_SENDTO: {
-        r->argv.sendto.entry = entry;
         r->argv.sendto.buf = va_arg(ap, const void*);
         r->argv.sendto.len = va_arg(ap, uint32_t);
         r->argv.sendto.flags = va_arg(ap, int);
@@ -492,7 +455,7 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
         r->argv.sendto.addrlen = len;
         if (addr) {
             r->argv.sendto.has_dest_addr = 1;
-            valid = copy_sockaddr(&r->argv.sendto.dest_addr, addr, len) == 0;
+            valid = async_copy_sockaddr(&r->argv.sendto.dest_addr, addr, len) == 0;
         } else if (len != 0) {
             errno = EINVAL;
             valid = false;
@@ -501,7 +464,6 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
     }
     case REQ_RECVFROM:
         r->argv.recvfrom = (typeof(r->argv.recvfrom)){
-            .entry = entry,
             .buf = va_arg(ap, void*),
             .len = va_arg(ap, uint32_t),
             .flags = va_arg(ap, int),
@@ -510,26 +472,22 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
         break;
     case REQ_GETSOCKNAME:
         r->argv.getsockname = (typeof(r->argv.getsockname)){
-            .entry = entry,
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_GETPEERNAME:
         r->argv.getpeername = (typeof(r->argv.getpeername)){
-            .entry = entry,
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_CLOSE:
-        r->argv.close.entry = entry;
         break;
     case REQ_SHUTDOWN:
         r->argv.shutdown = (typeof(r->argv.shutdown)){
-            .entry = entry, .how = va_arg(ap, int)};
+            .how = va_arg(ap, int)};
         break;
     case REQ_SETSOCKOPT:
         r->argv.setsockopt = (typeof(r->argv.setsockopt)){
-            .entry = entry,
             .level = va_arg(ap, int),
             .optname = va_arg(ap, int),
             .optval = va_arg(ap, const void*),
@@ -537,7 +495,6 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
         break;
     case REQ_GETSOCKOPT:
         r->argv.getsockopt = (typeof(r->argv.getsockopt)){
-            .entry = entry,
             .level = va_arg(ap, int),
             .optname = va_arg(ap, int),
             .optval = va_arg(ap, void*),
@@ -545,15 +502,8 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
         break;
     case REQ_FCNTL:
         r->argv.fcntl = (typeof(r->argv.fcntl)){
-            .entry = entry,
             .cmd = va_arg(ap, int),
             .arg = va_arg(ap, int)};
-        break;
-    case REQ_POLL:
-        r->argv.poll.entry = entry;
-        r->argv.poll.poll_cb =
-            va_arg(ap, void (*)(Socket*, uint32_t, void*));
-        r->argv.poll.cb_argv = va_arg(ap, void*);
         break;
     default:
         errno = EINVAL;
@@ -562,27 +512,27 @@ static req* create_async_req_va(int fd, req_type type, va_list ap)
     }
     if (!valid) {
         int saved_errno = errno;
-        net_async_req_destroy(&r->public);
+        net_async_req_destroy(r);
         errno = saved_errno;
         return NULL;
     }
     return r;
 }
 
-net_async_req* net_async_req_create(int fd, int operation, ...)
+req* net_async_req_create(int fd, req_type type, ...)
 {
     va_list ap;
-    va_start(ap, operation);
-    req* r = create_async_req_va(fd, (req_type)operation, ap);
+    va_start(ap, type);
+    req* r = async_create_request_va(fd, type, ap);
     va_end(ap);
-    return r ? &r->public : NULL;
+    return r;
 }
 
-void net_async_req_destroy(net_async_req* request)
+void net_async_req_destroy(req* request)
 {
     if (!request)
         return;
-    req* r = async_req_from_public(request);
+    req* r = request;
 
     spin_lock(&r->done_mtx);
     if (r->async.cq) {
@@ -590,20 +540,17 @@ void net_async_req_destroy(net_async_req* request)
         errno = EBUSY;
         return;
     }
-    fd_entry* entry = r->async.entry;
-    r->async.entry = NULL;
     spin_unlock(&r->done_mtx);
 
-    PUT_REF(entry); /* release net_async_req_create()'s hold */
     async_req_free(r);
 }
 
 /* ---- public fd-based wrappers ---- */
 
-static fd_entry* hold_async_entry(int fd)
+static fd_entry* async_hold_entry(int fd)
 {
     fd_entry* entry = hold_fd_entry(fd);
-    if (entry && entry->ops == &async_fd_ops)
+    if (entry && entry->ops == &async_cq_fd_ops)
         return entry;
 
     PUT_REF(entry);
@@ -611,31 +558,64 @@ static fd_entry* hold_async_entry(int fd)
     return NULL;
 }
 
-int net_async_submit(int cq_fd, net_async_req* request)
+int net_async_submit(int cq_fd, req* request)
 {
-    fd_entry* entry = hold_async_entry(cq_fd);
-    if (!entry)
+    if (!request) {
+        errno = EINVAL;
         return -1;
-    int ret = async_submit_batch(entry, &request, 1);
-    PUT_REF(entry);
-    return ret == 1 ? 0 : -1;
-}
+    }
 
-int net_async_submit_batch(int cq_fd, net_async_req** requests,
-                           uint32_t count)
-{
-    fd_entry* entry = hold_async_entry(cq_fd);
+    fd_entry* entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
-    int ret = async_submit_batch(entry, requests, count);
+
+    mutex_lock(&entry->mtx);
+    async_cq* cq = (async_cq*)entry->value;
+    if (!cq) {
+        mutex_unlock(&entry->mtx);
+        PUT_REF(entry);
+        errno = EBADF;
+        return -1;
+    }
+
+    uint64_t worker_mask = 0;
+    int ret = async_submit_one(cq, request, &worker_mask);
+    if (ret == 0) {
+        for (int i = 0; i < g_worker_num; i++) {
+            if (worker_mask & (UINT64_C(1) << (uint32_t)i))
+                notify_queue_notify(&g_workers[i].stack.req_msg);
+        }
+    }
+    mutex_unlock(&entry->mtx);
     PUT_REF(entry);
     return ret;
 }
 
-int net_async_wait(int cq_fd, net_async_req** requests, uint32_t min,
+int net_async_result(const req* request, req_type* type)
+{
+    if (!request) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (type)
+        *type = request->type;
+    return request->ret;
+}
+
+req_argv* net_async_argv(req* request)
+{
+    if (!request) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return &request->argv;
+}
+
+int net_async_wait(int cq_fd, req** requests, uint32_t min,
                    uint32_t max, int total_timeout_ms)
 {
-    fd_entry* entry = hold_async_entry(cq_fd);
+    fd_entry* entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
     int ret = async_wait(entry, requests, min, max, total_timeout_ms);
@@ -645,7 +625,7 @@ int net_async_wait(int cq_fd, net_async_req** requests, uint32_t min,
 
 int net_async_close(int cq_fd)
 {
-    fd_entry* entry = hold_async_entry(cq_fd);
+    fd_entry* entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
     int ret = async_close(entry);

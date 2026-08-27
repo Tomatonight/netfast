@@ -8,6 +8,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#include "xdp_redirect_config.h"
+
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 64);
@@ -15,7 +17,18 @@ struct {
     __type(value, __u32);
 } xsks_map SEC(".maps");
 
-static __always_inline int parse_eth_proto(void **data, void *data_end, __u16 *eth_proto)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, netfast_xdp_config);
+} netfast_cfg SEC(".maps");
+
+#define IPV4_FRAG_MORE        0x2000U
+#define IPV4_FRAG_OFFSET      0x1fffU
+
+static __always_inline int xdp_parse_ethernet_protocol(
+    void** data, void* data_end, __u16* eth_proto)
 {
     struct ethhdr *eth = *data;
     if ((void *)(eth + 1) > data_end)
@@ -40,22 +53,38 @@ static __always_inline int parse_eth_proto(void **data, void *data_end, __u16 *e
     return 0;
 }
 
-static __always_inline int ipv6_l4_is_userspace(__u8 protocol, __u8 *cursor,
-                                                void *data_end)
+static __always_inline int xdp_l4_destination_is_userspace(
+    __u8 protocol, __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
 {
-    if (protocol == IPPROTO_UDP || protocol == IPPROTO_TCP)
-        return 1;
-    if (protocol != IPPROTO_ICMPV6 || cursor + 1 > (__u8 *)data_end)
+    __u16 destination;
+    if (protocol == IPPROTO_TCP) {
+        struct tcphdr* tcp = (void*)cursor;
+        if ((void*)(tcp + 1) > data_end)
+            return 0;
+        destination = bpf_ntohs(tcp->dest);
+    } else if (protocol == IPPROTO_UDP) {
+        struct udphdr* udp = (void*)cursor;
+        if ((void*)(udp + 1) > data_end)
+            return 0;
+        destination = bpf_ntohs(udp->dest);
+    } else {
         return 0;
-
-    /* Only ICMPv6 errors belong to the userspace socket error path.
-     * Echo and Neighbor Discovery must remain available to the kernel. */
-    return cursor[0] >= 1 && cursor[0] <= 4;
+    }
+    return destination >= config->source_port_first &&
+           destination <= config->source_port_last;
 }
 
-/* Return true when an IPv6 packet's extension-header chain identifies a
- * transport packet or an ICMPv6 error handled by the userspace stack. */
-static __always_inline int ipv6_is_userspace_transport(void *data, void *data_end)
+static __always_inline int xdp_redirect_current_queue(struct xdp_md* ctx)
+{
+    __u32 qid = ctx->rx_queue_index;
+    if (!bpf_map_lookup_elem(&xsks_map, &qid))
+        return XDP_PASS;
+    return bpf_redirect_map(&xsks_map, qid, 0);
+}
+
+static __always_inline int xdp_ipv6_should_redirect(
+    void* data, void* data_end, const netfast_xdp_config* config)
 {
     struct ipv6hdr *ip6 = data;
     if ((void *)(ip6 + 1) > data_end)
@@ -68,20 +97,10 @@ static __always_inline int ipv6_is_userspace_transport(void *data, void *data_en
      * verifier state space produced by an unrolled extension-header loop.
      * The common one-extension and Fragment-header forms are covered; other
      * chains safely fall back to the kernel. */
-    if (ipv6_l4_is_userspace(nh, cursor, data_end))
-        return 1;
-
-    if (nh == IPPROTO_FRAGMENT) {
-        struct {
-            __u8 nexthdr;
-            __u8 reserved;
-            __u16 frag_off;
-            __u32 identification;
-        } *fh = (void *)cursor;
-        if ((void *)(fh + 1) > data_end)
-            return 0;
-        return fh->nexthdr == IPPROTO_UDP || fh->nexthdr == IPPROTO_TCP;
-    }
+    if (nh == IPPROTO_FRAGMENT)
+        return config->redirect_fragments;
+    if (nh == IPPROTO_UDP || nh == IPPROTO_TCP)
+        return xdp_l4_destination_is_userspace(nh, cursor, data_end, config);
 
     if (nh != IPPROTO_HOPOPTS && nh != IPPROTO_ROUTING &&
         nh != IPPROTO_DSTOPTS)
@@ -94,20 +113,9 @@ static __always_inline int ipv6_is_userspace_transport(void *data, void *data_en
     if (hdr_len < 8u || cursor + hdr_len > (__u8 *)data_end)
         return 0;
     cursor += hdr_len;
-    if (ipv6_l4_is_userspace(next, cursor, data_end))
-        return 1;
-    if (next != IPPROTO_FRAGMENT)
-        return 0;
-
-    struct {
-        __u8 nexthdr;
-        __u8 reserved;
-        __u16 frag_off;
-        __u32 identification;
-    } *fh = (void *)cursor;
-    if ((void *)(fh + 1) > data_end)
-        return 0;
-    return fh->nexthdr == IPPROTO_UDP || fh->nexthdr == IPPROTO_TCP;
+    if (next == IPPROTO_FRAGMENT)
+        return config->redirect_fragments;
+    return xdp_l4_destination_is_userspace(next, cursor, data_end, config);
 }
 
 /* This program is used with AF_XDP multi-buffer receive enabled.  The
@@ -116,44 +124,47 @@ static __always_inline int ipv6_is_userspace_transport(void *data, void *data_en
 SEC("xdp.frags")
 int xdp_redirect(struct xdp_md *ctx)
 {
+    __u32 config_key = NETFAST_XDP_CONFIG_KEY;
+    const netfast_xdp_config* config =
+        bpf_map_lookup_elem(&netfast_cfg, &config_key);
+    if (!config)
+        return XDP_PASS;
+
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u16 eth_proto = 0;
-    if (parse_eth_proto(&data, data_end, &eth_proto) != 0)
+    if (xdp_parse_ethernet_protocol(&data, data_end, &eth_proto) != 0)
         return XDP_PASS;
 
-	/* IPv6 TCP/UDP and ICMPv6 errors are handled by userspace.  ICMPv6
-	 * informational traffic, including NDP and echo, remains in the kernel. */
-	if (eth_proto == ETH_P_IPV6) {
-		if (!ipv6_is_userspace_transport(data, data_end))
-			return XDP_PASS;
-		__u32 qid = ctx->rx_queue_index;
-		if (!bpf_map_lookup_elem(&xsks_map, &qid))
-			return XDP_PASS;
-		return bpf_redirect_map(&xsks_map, qid, 0);
-	}
-	if (eth_proto != ETH_P_IP)
-		return XDP_PASS;
-	struct iphdr *ip = data;
-	if ((void *)(ip + 1) > data_end)
-		return XDP_PASS;
-	if (ip->ihl < 5 || (void *)ip + ((__u32)ip->ihl * 4u) > data_end)
-		return XDP_PASS;
-
-	/* IPv4 multicast is handled by the normal kernel path.  Do not
-	 * redirect it to AF_XDP; otherwise multicast destination MACs (01:00:5e)
-	 * reach userspace and are rejected later by ether_recv(). */
-	if ((bpf_ntohl(ip->daddr) & 0xf0000000U) == 0xe0000000U)
-		return XDP_PASS;
-
-    /* UDP/TCP/ICMP are handled by the current userspace stack. */
-    if (ip->protocol == IPPROTO_UDP || ip->protocol == IPPROTO_TCP ||
-        ip->protocol == IPPROTO_ICMP) {
-        __u32 qid = ctx->rx_queue_index;
-        if (!bpf_map_lookup_elem(&xsks_map, &qid))
+    /* Only configured transport ports (and optionally fragments) are owned. */
+    if (eth_proto == ETH_P_IPV6) {
+        if (!xdp_ipv6_should_redirect(data, data_end, config))
             return XDP_PASS;
-        return bpf_redirect_map(&xsks_map, qid, 0);
+        return xdp_redirect_current_queue(ctx);
     }
+    if (eth_proto != ETH_P_IP)
+        return XDP_PASS;
+
+    struct iphdr* ip = data;
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    if (ip->ihl < 5 || (void*)ip + ((__u32)ip->ihl * 4u) > data_end)
+        return XDP_PASS;
+
+    /* IPv4 multicast is handled by the normal kernel path.  Do not
+     * redirect it to AF_XDP; otherwise multicast destination MACs (01:00:5e)
+     * reach userspace and are rejected later by ether_recv(). */
+    if ((bpf_ntohl(ip->daddr) & 0xf0000000U) == 0xe0000000U)
+        return XDP_PASS;
+
+    __u16 frag_off = bpf_ntohs(ip->frag_off);
+    if (frag_off & (IPV4_FRAG_MORE | IPV4_FRAG_OFFSET))
+        return config->redirect_fragments
+            ? xdp_redirect_current_queue(ctx) : XDP_PASS;
+
+    __u8* l4 = (__u8*)ip + ((__u32)ip->ihl * 4u);
+    if (xdp_l4_destination_is_userspace(ip->protocol, l4, data_end, config))
+        return xdp_redirect_current_queue(ctx);
 
 
     /* other protocols: pass */

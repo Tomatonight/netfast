@@ -16,14 +16,14 @@ static uint32_t g_free_n;
 static spin_rwlock_t g_fd_locks[FD_LOCK_COUNT];
 static spin_rwlock_t g_free_lock;
 
-static inline int fd_to_slot(int fd)
+static inline int fd_entry_slot(int fd)
 {
     if (fd < FD_START)
         return -1;
     return fd - FD_START;
 }
 
-static inline uint32_t fd_lock_idx(uint32_t slot)
+static inline uint32_t fd_entry_lock_index(uint32_t slot)
 {
     return slot & (FD_LOCK_COUNT - 1U);
 }
@@ -50,11 +50,11 @@ int fd_table_init(void)
     return 0;
 }
 
-static void destroy_fd_entry(fd_entry* entry)
+static void fd_entry_destroy(fd_entry* entry)
 {
-    int slot = fd_to_slot(entry->fd);
+    int slot = fd_entry_slot(entry->fd);
     if (slot >= 0) {
-        uint32_t idx = fd_lock_idx((uint32_t)slot);
+        uint32_t idx = fd_entry_lock_index((uint32_t)slot);
         spin_rwlock_wrlock(&g_fd_locks[idx]);
         g_fd_table[slot] = NULL;
         spin_rwlock_unlock(&g_fd_locks[idx]);
@@ -71,7 +71,7 @@ static void destroy_fd_entry(fd_entry* entry)
 fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
                                      worker* w)
 {
-    CREATE_REF(fd_entry, entry, destroy_fd_entry);
+    CREATE_REF(fd_entry, entry, fd_entry_destroy);
     if (!entry)
         return NULL;
 
@@ -93,7 +93,7 @@ fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
 
     entry->fd = FD_START + (int)slot;
 
-    uint32_t idx = fd_lock_idx(slot);
+    uint32_t idx = fd_entry_lock_index(slot);
     spin_rwlock_wrlock(&g_fd_locks[idx]);
     g_fd_table[slot] = entry;
     spin_rwlock_unlock(&g_fd_locks[idx]);
@@ -102,11 +102,11 @@ fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
 
 fd_entry* hold_fd_entry(int fd)
 {
-    int slot = fd_to_slot(fd);
+    int slot = fd_entry_slot(fd);
     if (slot < 0 || (uint32_t)slot >= FD_TABLE_CAP)
         return NULL;
 
-    uint32_t idx = fd_lock_idx((uint32_t)slot);
+    uint32_t idx = fd_entry_lock_index((uint32_t)slot);
     spin_rwlock_rdlock(&g_fd_locks[idx]);
     fd_entry* entry = g_fd_table[slot];
     if (entry && !INC_REF_NOT_ZERO(entry))
@@ -115,29 +115,7 @@ fd_entry* hold_fd_entry(int fd)
     return entry;
 }
 
-fd_entry* get_sock_entry_by_req(const req* r)
+fd_entry* fd_entry_from_request(const req* r)
 {
-
-    switch (r->type) {
-    case REQ_BIND:         return r->argv.bind.entry;
-    case REQ_CONNECT:      return r->argv.connect.entry;
-    case REQ_LISTEN:       return r->argv.listen.entry;
-    case REQ_ACCEPT:       return r->argv.accept.entry;
-    case REQ_WRITE:        return r->argv.write.entry;
-    case REQ_READ:         return r->argv.read.entry;
-    case REQ_SENDTO:       return r->argv.sendto.entry;
-    case REQ_RECVFROM:     return r->argv.recvfrom.entry;
-    case REQ_GETSOCKNAME:  return r->argv.getsockname.entry;
-    case REQ_GETPEERNAME:  return r->argv.getpeername.entry;
-    case REQ_CLOSE:        return r->argv.close.entry;
-    case REQ_SHUTDOWN:     return r->argv.shutdown.entry;
-    case REQ_SETSOCKOPT:   return r->argv.setsockopt.entry;
-    case REQ_GETSOCKOPT:   return r->argv.getsockopt.entry;
-    case REQ_FCNTL:        return r->argv.fcntl.entry;
-    case REQ_POLL:        return r->argv.poll.entry;
-#ifdef TEST_EPOLL
-    case REQ_EPOLL_CTL:  return r->argv.epoll_ctl.entry;
-#endif
-    default:               return NULL;
-    }
+    return r->entry;
 }

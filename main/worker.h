@@ -1,51 +1,53 @@
 #ifndef WORKER_H
 #define WORKER_H
-#include"queue.h"
-#include"req.h"
-#include"stack.h"
-#include"base.h"
-#include"rss.h"
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
 
-typedef struct worker{
-	thread* master;
-	pthread_t master_tid;
-	stack_instance stack;
-	/* loop_started publishes that startup finished; loop_success is result. */
-	atomic_bool loop_started;
-	atomic_bool loop_success;
+#include "req.h"
+#include "stack.h"
+
+typedef enum worker_startup_state {
+    WORKER_STARTUP_PENDING = 0,
+    WORKER_STARTUP_READY,
+    WORKER_STARTUP_FAILED,
+} worker_startup_state;
+
+typedef struct worker {
+    thread* master;
+    pthread_t master_tid;
+    stack_instance stack;
+    /* 单个原子状态同时发布启动完成与启动结果。 */
+    _Atomic worker_startup_state startup_state;
 } worker;
-typedef struct worker_req{
-	void* argv;
-	int (*cb)(void*);
-}worker_req;
+
+typedef struct worker_req {
+    void* argv;
+    int (*cb)(void*);
+} worker_req;
 
 extern worker* main_worker;
 extern worker* g_workers;
 extern int g_worker_num;
 
-/* TLS current worker (set in worker thread entry) */
+/* 当前线程所属的 worker；由 worker 线程入口设置。 */
 worker* get_current_worker(void);
 void set_current_worker(worker* w);
 
-int worker_detach_all(void);
-
-/* bind worker thread to cpu core (best effort) */
+/* 尽力将 worker 线程绑定到指定 CPU。 */
 int worker_bind_cpu(pthread_t tid, int cpu);
-
 int worker_init(worker* w);
-int worker_detach(worker* w);
+int worker_start_all(void);
 
-worker* random_worker(void);
+worker* worker_select_random(void);
 
-void change_req_worker(req* req, worker* new_worker);
+void worker_move_request(req* req, worker* new_worker);
 
-void transmit_skb_2_worker(struct worker* w, skbuff* skb, int (*skb_process)(skbuff* skb));
+void worker_enqueue_skb(worker* w, skbuff* skb,
+                        int (*skb_process)(skbuff* skb));
+void submit_req_2_worker(worker* w, void* argv, int (*cb)(void*), bool wait);
+void worker_process_submitted_request(req* r);
 
-
-void submit_req_2_worker(struct worker* w, void* argv, int (*cb)(void*), bool wait);
-void process_submit_req(req* r);
 #endif

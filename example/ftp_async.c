@@ -111,7 +111,7 @@ struct ftp_session {
 
 struct ftp_op {
     ftp_op *next;
-    net_async_req *request;
+    req *request;
     ftp_op_kind kind;
     ftp_session *session;
     int fd;
@@ -195,7 +195,7 @@ static void op_unlink(ftp_op *op)
     op->next = NULL;
 }
 
-static ftp_op *op_find(net_async_req *request)
+static ftp_op *op_find(req *request)
 {
     for (ftp_op *op = g_ops; op; op = op->next) {
         if (op->request == request)
@@ -212,59 +212,59 @@ static int submit_operation(ftp_op *op)
     switch (op->kind) {
     case FTP_OP_SERVER_SOCKET:
     case FTP_OP_DATA_SOCKET:
-        op->request = net_async_req_create(-1, NET_ASYNC_SOCKET, AF_INET,
+        op->request = net_async_req_create(-1, REQ_SOCKET, AF_INET,
                                             SOCK_STREAM, IPPROTO_TCP);
         break;
     case FTP_OP_SERVER_REUSEADDR:
     case FTP_OP_DATA_REUSEADDR:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_SETSOCKOPT,
+        op->request = net_async_req_create(op->fd, REQ_SETSOCKOPT,
                                             SOL_SOCKET, SO_REUSEADDR,
                                             &server->reuseaddr,
                                             (socklen_t)sizeof(server->reuseaddr));
         break;
     case FTP_OP_SERVER_BIND:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_BIND,
+        op->request = net_async_req_create(op->fd, REQ_BIND,
                                             (const struct sockaddr *)&server->listen_addr,
                                             (socklen_t)sizeof(server->listen_addr));
         break;
     case FTP_OP_SERVER_LISTEN:
     case FTP_OP_DATA_LISTEN:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_LISTEN, 8);
+        op->request = net_async_req_create(op->fd, REQ_LISTEN, 8);
         break;
     case FTP_OP_CONTROL_ACCEPT:
     case FTP_OP_DATA_ACCEPT:
         op->peer_addr_len = sizeof(op->peer_addr);
-        op->request = net_async_req_create(op->fd, NET_ASYNC_ACCEPT,
+        op->request = net_async_req_create(op->fd, REQ_ACCEPT,
                                             (struct sockaddr *)&op->peer_addr,
                                             &op->peer_addr_len);
         break;
     case FTP_OP_CONTROL_READ:
-        op->request = net_async_req_create(session->control_fd, NET_ASYNC_READ,
+        op->request = net_async_req_create(session->control_fd, REQ_READ,
                                             op->buffer, (uint32_t)op->length);
         break;
     case FTP_OP_CONTROL_WRITE:
     case FTP_OP_RETR_WRITE:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_WRITE,
+        op->request = net_async_req_create(op->fd, REQ_WRITE,
                                             op->buffer + op->offset,
                                             (uint32_t)(op->length - op->offset));
         break;
     case FTP_OP_STOR_READ:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_READ,
+        op->request = net_async_req_create(op->fd, REQ_READ,
                                             op->buffer, (uint32_t)op->length);
         break;
     case FTP_OP_DATA_BIND:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_BIND,
+        op->request = net_async_req_create(op->fd, REQ_BIND,
                                             (const struct sockaddr *)&session->pasv_addr,
                                             (socklen_t)sizeof(session->pasv_addr));
         break;
     case FTP_OP_DATA_GETSOCKNAME:
         session->pasv_addr_len = sizeof(session->pasv_addr);
-        op->request = net_async_req_create(op->fd, NET_ASYNC_GETSOCKNAME,
+        op->request = net_async_req_create(op->fd, REQ_GETSOCKNAME,
                                             (struct sockaddr *)&session->pasv_addr,
                                             &session->pasv_addr_len);
         break;
     case FTP_OP_CLOSE:
-        op->request = net_async_req_create(op->fd, NET_ASYNC_CLOSE);
+        op->request = net_async_req_create(op->fd, REQ_CLOSE);
         break;
     }
 
@@ -943,7 +943,7 @@ static void complete_control_accept(ftp_op *op, int result, int saved_errno)
         g_server.stop = true;
 }
 
-static void dispatch_completion(net_async_req *request)
+static void dispatch_completion(req *request)
 {
     ftp_op *op = op_find(request);
     if (!op) {
@@ -952,7 +952,7 @@ static void dispatch_completion(net_async_req *request)
         g_server.stop = true;
         return;
     }
-    int result = request->ret;
+    int result = net_async_result(request, NULL);
     int saved_errno = result < 0 ? -result : 0;
     op_unlink(op);
     op->request = NULL;
@@ -1067,7 +1067,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     while (!g_server.stop) {
-        net_async_req *completed[32];
+        req *completed[32];
         int count = net_async_wait(g_server.cq_fd, completed, 1, 32, 1000);
         if (count < 0) {
             perror("net_async_wait");

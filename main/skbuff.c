@@ -47,17 +47,12 @@ uint32_t skb_consume(skbuff* skb, uint32_t size, bool linear)
 	if (linear) {
 		consumed = min(consumed, skb_data0_len(skb));
 		skb->data0.start += consumed;
-		if (!skb_data0_len(skb)) {
+		if (!skb_data0_len(skb) && skb->data_num > 1) {
 			frame_slot* old_slot = skb->data0.slot;
-			if (skb->data_num > 1) {
-				data_info* next = skb->data0.next;
-				skb->data0 = *next;
-				free(next);
-				skb->data_num--;
-			} else {
-				memset(&skb->data0, 0, sizeof(skb->data0));
-				skb->data_num = 0;
-			}
+			data_info* next = skb->data0.next;
+			skb->data0 = *next;
+			free(next);
+			skb->data_num--;
 			PUT_REF(old_slot);
 		}
 		skb->data_total_len -= consumed;
@@ -74,9 +69,9 @@ uint32_t skb_consume(skbuff* skb, uint32_t size, bool linear)
 		remaining -= len;
 		frame_slot* old_slot = skb->data0.slot;
 		if (skb->data_num == 1) {
-			memset(&skb->data0, 0, sizeof(skb->data0));
-			skb->data_num = 0;
-			PUT_REF(old_slot);
+			/* Keep one empty data_info/frame_slot so the skb can be reused
+			 * for header prepend or cloned after all payload is consumed. */
+			skb->data0.start = skb->data0.end;
 			break;
 		}
 		data_info* next = skb->data0.next;

@@ -9,11 +9,11 @@
 #include "skbuff.h"
 #include "worker.h"
 
-static inline hash* get_ipq_hash(void)
+static inline hash* ipv4_frag_queue_table(void)
 {
     return get_current_worker()->stack.ipq_hash;
 }
-static inline void update_ipq_timer(ipq* queue)
+static inline void ipv4_frag_update_timer(ipq* queue)
 {
     queue->last_update_time = (uint32_t)get_current_time_ms();
 }
@@ -38,8 +38,8 @@ static inline uint16_t ipv4_get_frag_offset(const ipv4_hdr* ip)
     return ipv4_frag_field_get_host(ip) & IPV4_FRAG_OFF_MASK;
 }
 
-static ipq* create_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t protocol){
-    hash* h = get_ipq_hash();
+static ipq* ipv4_frag_queue_create(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t protocol){
+    hash* h = ipv4_frag_queue_table();
 
     ipq* new_ipq=calloc(1,sizeof(ipq));
     if(!new_ipq){
@@ -52,15 +52,15 @@ static ipq* create_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t proto
     new_ipq->key.dst_ip=dst_ip;
     new_ipq->key.protocol=protocol;
 
-    update_ipq_timer(new_ipq);
+    ipv4_frag_update_timer(new_ipq);
     if (!hash_add_node(h, &new_ipq->hash_node)) {
         free(new_ipq);
         return NULL;
     }
     return new_ipq;
 }
-static void destroy_ipq(ipq* ipq){
-    hash* h = get_ipq_hash();
+static void ipv4_frag_queue_destroy(ipq* ipq){
+    hash* h = ipv4_frag_queue_table();
 
     //DEBUG_LOG("Destroying IPQ: id=%u src=" IP_STR " dst=" IP_STR " proto=%u", ipq->key.id, IP_ARG(ipq->key.src_ip), IP_ARG(ipq->key.dst_ip), ipq->key.protocol);
     hash_del_node(h, &ipq->hash_node);
@@ -73,8 +73,8 @@ static void destroy_ipq(ipq* ipq){
     }
     free(ipq);
 }
-static ipq* search_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t protocol){
-    hash* h = get_ipq_hash();
+static ipq* ipv4_frag_queue_find(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t protocol){
+    hash* h = ipv4_frag_queue_table();
 
     ipq_key key;
     /* ipq_key has padding; ensure deterministic bytes */
@@ -90,7 +90,7 @@ static ipq* search_ipq(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t proto
 
 
 void ipq_timer(task* tk){
-    hash* h = get_ipq_hash();
+    hash* h = ipv4_frag_queue_table();
 
     for (uint32_t i = 0; i < h->size; i++) {
         hash_node* node = h->buckets[i];
@@ -99,7 +99,7 @@ void ipq_timer(task* tk){
             ipq* queue = HASH_CONTAINER_OF(node, ipq, hash_node);
             if ((uint32_t)(get_current_time_ms() - queue->last_update_time) >
                 IPQ_TIMEOUT)
-                destroy_ipq(queue);
+                ipv4_frag_queue_destroy(queue);
             node = next;
         }
     }
@@ -110,7 +110,7 @@ bool ipv4_is_frag(const ipv4_hdr* ip){
     uint16_t f = ipv4_frag_field_get_host(ip);
     return ((f & 0x1FFFu) != 0) || ((f & 0x2000u) != 0);
 }
-static int skb_offset_cmp(list_node* a, list_node* b){
+static int ipv4_frag_compare_offset(list_node* a, list_node* b){
     skbuff* skb_a = (skbuff*)((uint8_t*)a - offsetof(skbuff, frag_list));
     skbuff* skb_b = (skbuff*)((uint8_t*)b - offsetof(skbuff, frag_list));
     uint32_t a_offset = ipv4_get_frag_offset(skb_a->ipv4_hdr);
@@ -135,9 +135,9 @@ skbuff* ipv4_defrag(skbuff* skb){
         return NULL;
     }
 
-    ipq* q = search_ipq(id, src, dst, proto);
+    ipq* q = ipv4_frag_queue_find(id, src, dst, proto);
     if(!q){
-        q = create_ipq(id, src, dst, proto);
+        q = ipv4_frag_queue_create(id, src, dst, proto);
         if(!q){
             WARN_LOG("Failed to create IPQ for fragment");
             return NULL;
@@ -145,7 +145,7 @@ skbuff* ipv4_defrag(skbuff* skb){
     }
 
     INC_REF(skb);
-    if(add_list_node_compare(&q->frag_head, &skb->frag_list, skb_offset_cmp) < 0){
+    if(add_list_node_compare(&q->frag_head, &skb->frag_list, ipv4_frag_compare_offset) < 0){
         PUT_REF(skb);
         return NULL;
     }
@@ -164,7 +164,7 @@ skbuff* ipv4_defrag(skbuff* skb){
         return NULL;
     }
     if(q->received_len != q->total_len){
-        destroy_ipq(q);
+        ipv4_frag_queue_destroy(q);
         return NULL;
     }
 
@@ -184,7 +184,7 @@ skbuff* ipv4_defrag(skbuff* skb){
                     expect_offset, ipv4_get_frag_offset(frag->ipv4_hdr));
                 PUT_REF(frag);
                 PUT_REF(reassembled);
-                destroy_ipq(q);
+                ipv4_frag_queue_destroy(q);
                 return NULL;
             }
             ipv4_hdr* frag_ip = frag->ipv4_hdr;
@@ -195,7 +195,7 @@ skbuff* ipv4_defrag(skbuff* skb){
                 DEBUG_LOG("Too many fragments to reassemble");
                 PUT_REF(frag);
                 PUT_REF(reassembled);
-                destroy_ipq(q);
+                ipv4_frag_queue_destroy(q);
                 return NULL;
             }
             data_info* tail = skb_end_data_info(reassembled);
@@ -205,7 +205,7 @@ skbuff* ipv4_defrag(skbuff* skb){
                 if (!copied) {
                     PUT_REF(frag);
                     PUT_REF(reassembled);
-                    destroy_ipq(q);
+                    ipv4_frag_queue_destroy(q);
                     return NULL;
                 }
                 copy_data_info(copied, source);
@@ -222,7 +222,7 @@ skbuff* ipv4_defrag(skbuff* skb){
 
     /* Reconstruct IP header */
     if (!reassembled) {
-        destroy_ipq(q);
+        ipv4_frag_queue_destroy(q);
         return NULL;
     }
 
@@ -236,7 +236,7 @@ skbuff* ipv4_defrag(skbuff* skb){
     reassembled->protocol = new_ip->protocol;
     reassembled->flag.is_defrag = 1;
 
-    destroy_ipq(q);
+    ipv4_frag_queue_destroy(q);
     return reassembled;
 }
 

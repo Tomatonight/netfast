@@ -81,14 +81,14 @@ typedef struct stack_instance{
 
 } stack_instance;
 
-void process_request(req *r);
+void stack_process_request(req *r);
 int stack_instance_init(stack_instance* s, thread* master);
 /* Only call after the worker has stopped (or before it has started). */
 
 
-void wait(Socket* sock, req* req, req_status status);
-void wait_timeout_cb(task* tk);
-void wait_until(Socket* sock, req* req, req_status status, uint64_t expire);
+void stack_wait_request(Socket* sock, req* req, req_status status);
+void stack_wait_timeout_cb(task* tk);
+void stack_wait_request_until(Socket* sock, req* req, req_status status, uint64_t expire);
 
-void req_pending_cb(Socket* sock, void* value, enum notify_event event);
+void stack_request_pending_cb(Socket* sock, void* value, enum notify_event event);
 #endif

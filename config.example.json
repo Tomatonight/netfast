@@ -6,5 +6,7 @@
       "queues": 2
     }
   ],
+  "source_port_range": [1024, 2000],
+  "redirect_fragments": false,
   "logfile": "/tmp/user_stack.log"
 }

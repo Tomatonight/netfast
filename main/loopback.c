@@ -1,6 +1,7 @@
 #include "loopback.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,13 +10,7 @@
 #include "log.h"
 #include "route_arp_ndp.h"
 #include "skbuff.h"
-
-int loopback_send(if_info* info, skbuff* skb)
-{
-    (void)info;
-    skb->flag.is_forward = 0;
-    return skb->family == AF_INET6 ? ipv6_recv(skb) : ipv4_recv(skb);
-}
+#include "worker.h"
 
 int loopback_create(if_info* info, struct nlmsghdr *nlh)
 {
@@ -36,12 +31,27 @@ void loopback_update(if_info* info, struct nlmsghdr *nlh)
     info->flags = ifinfo->ifi_flags;
 }
 
-const if_ops loopback_ops = {
-    .recv = loopback_send,
-    .send = loopback_send,
-    .update = loopback_update,
-    .create = loopback_create,
-};
+static int loopback_recv_skb(skbuff* skb)
+{
+    return skb->family == AF_INET6 ? ipv6_recv(skb) : ipv4_recv(skb);
+}
+
+int loopback_send(if_info* info, skbuff* skb)
+{
+    (void)info;
+    worker* rx_worker = get_current_worker();
+    if (!rx_worker) {
+        errno = ENETDOWN;
+        return -ENETDOWN;
+    }
+
+    skb->flag.is_forward = 0;
+
+    /* 与物理网卡接收路径保持相同的任务边界。入队会持有 skb 引用，
+     * IP 层由当前 worker 的 packet task 稍后执行，避免发送栈同步重入。 */
+    worker_enqueue_skb(rx_worker, skb, loopback_recv_skb);
+    return 0;
+}
 
 int loopback_init(void)
 {
@@ -112,3 +122,10 @@ int loopback_init(void)
 
     return 0;
 }
+
+const if_ops loopback_ops = {
+    .recv = loopback_send,
+    .send = loopback_send,
+    .update = loopback_update,
+    .create = loopback_create,
+};

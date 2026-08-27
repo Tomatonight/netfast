@@ -15,62 +15,62 @@
 #include "skbuff.h"
 #include "socket.h"
 
-/* ── ARP ping rate limiting ───────────────────────────────────
- * Don't ping the same (ip, ifindex) more than once per cooldown
+/* ── ARP 邻居探测限速 ─────────────────────────────────────
+ * Don't probe the same (ip, ifindex) more than once per cooldown
  * interval.  Uses a small fixed-size cache per worker. */
-#define ARP_PING_COOLDOWN_MS  1000
-#define ARP_PING_CACHE_SIZE   16
-#define NDP_PING_COOLDOWN_MS  1000
-#define NDP_PING_CACHE_SIZE   16
+#define ARP_PROBE_COOLDOWN_MS  1000
+#define ARP_PROBE_CACHE_SIZE   16
+#define NDP_PROBE_COOLDOWN_MS  1000
+#define NDP_PROBE_CACHE_SIZE   16
 
 static _Thread_local struct {
     uint32_t ip;
     uint32_t ifindex;
     uint64_t last_ms;
-} g_arp_ping_cache[ARP_PING_CACHE_SIZE];
-static _Thread_local uint32_t g_arp_ping_cache_idx;
+} g_arp_probe_cache[ARP_PROBE_CACHE_SIZE];
+static _Thread_local uint32_t g_arp_probe_cache_index;
 
-static bool arp_ping_allowed(uint32_t ip, uint32_t ifindex, uint64_t now_ms)
+static bool arp_probe_allowed(uint32_t ip, uint32_t ifindex, uint64_t now_ms)
 {
-    for (int i = 0; i < ARP_PING_CACHE_SIZE; i++) {
-        if (g_arp_ping_cache[i].ip == ip &&
-            g_arp_ping_cache[i].ifindex == ifindex) {
-            if (now_ms - g_arp_ping_cache[i].last_ms < ARP_PING_COOLDOWN_MS)
+    for (int i = 0; i < ARP_PROBE_CACHE_SIZE; i++) {
+        if (g_arp_probe_cache[i].ip == ip &&
+            g_arp_probe_cache[i].ifindex == ifindex) {
+            if (now_ms - g_arp_probe_cache[i].last_ms < ARP_PROBE_COOLDOWN_MS)
                 return false;
-            g_arp_ping_cache[i].last_ms = now_ms;
+            g_arp_probe_cache[i].last_ms = now_ms;
             return true;
         }
     }
-    uint32_t idx = g_arp_ping_cache_idx++ % ARP_PING_CACHE_SIZE;
-    g_arp_ping_cache[idx].ip      = ip;
-    g_arp_ping_cache[idx].ifindex = ifindex;
-    g_arp_ping_cache[idx].last_ms = now_ms;
+    uint32_t idx = g_arp_probe_cache_index++ % ARP_PROBE_CACHE_SIZE;
+    g_arp_probe_cache[idx].ip      = ip;
+    g_arp_probe_cache[idx].ifindex = ifindex;
+    g_arp_probe_cache[idx].last_ms = now_ms;
     return true;
 }
 
-/* ── NDP ping rate limiting (IPv6) ──────────────────────────── */
+/* ── NDP 邻居探测限速（IPv6）────────────────────────────── */
 static _Thread_local struct {
     uint8_t  ip[16];
     uint32_t ifindex;
     uint64_t last_ms;
-} g_ndp_ping_cache[NDP_PING_CACHE_SIZE];
-static _Thread_local uint32_t g_ndp_ping_cache_idx;
+} g_ndp_probe_cache[NDP_PROBE_CACHE_SIZE];
+static _Thread_local uint32_t g_ndp_probe_cache_index;
 
-static bool ndp_ping_allowed(const uint8_t* ip, uint32_t ifindex, uint64_t now_ms)
+static bool ndp_probe_allowed(const uint8_t* ip, uint32_t ifindex, uint64_t now_ms)
 {
-    for (int i = 0; i < NDP_PING_CACHE_SIZE; i++) {
-        if (memcmp(g_ndp_ping_cache[i].ip, ip, 16) == 0 &&
-            g_ndp_ping_cache[i].ifindex == ifindex) {
-            if (now_ms - g_ndp_ping_cache[i].last_ms < NDP_PING_COOLDOWN_MS)
+    for (int i = 0; i < NDP_PROBE_CACHE_SIZE; i++) {
+        if (memcmp(g_ndp_probe_cache[i].ip, ip, 16) == 0 &&
+            g_ndp_probe_cache[i].ifindex == ifindex) {
+            if (now_ms - g_ndp_probe_cache[i].last_ms < NDP_PROBE_COOLDOWN_MS)
                 return false;
-            g_ndp_ping_cache[i].last_ms = now_ms;
+            g_ndp_probe_cache[i].last_ms = now_ms;
             return true;
         }
     }
-    uint32_t idx = g_ndp_ping_cache_idx++ % NDP_PING_CACHE_SIZE;
-    memcpy(g_ndp_ping_cache[idx].ip, ip, 16);
-    g_ndp_ping_cache[idx].ifindex = ifindex;
-    g_ndp_ping_cache[idx].last_ms = now_ms;
+    uint32_t idx = g_ndp_probe_cache_index++ % NDP_PROBE_CACHE_SIZE;
+    memcpy(g_ndp_probe_cache[idx].ip, ip, 16);
+    g_ndp_probe_cache[idx].ifindex = ifindex;
+    g_ndp_probe_cache[idx].last_ms = now_ms;
     return true;
 }
 
@@ -84,7 +84,7 @@ static bool ndp_entry_usable(const ndp_info* entry)
                             NUD_PROBE | NUD_PERMANENT | NUD_NOARP)) != 0;
 }
 
-static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
+static void neighbor_trigger_probe(sa_family_t family, const uint8_t* ip,
                                    uint32_t ifindex)
 {
     if_info* info = search_if_by_index(ifindex);
@@ -94,11 +94,11 @@ static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
     uint64_t now_ms = get_current_time_ms();
     bool allowed;
     if (family == AF_INET6) {
-        allowed = ndp_ping_allowed(ip, ifindex, now_ms);
+        allowed = ndp_probe_allowed(ip, ifindex, now_ms);
     } else {
         uint32_t ip4;
         memcpy(&ip4, ip, sizeof(ip4));
-        allowed = arp_ping_allowed(ip4, ifindex, now_ms);
+        allowed = arp_probe_allowed(ip4, ifindex, now_ms);
     }
 
     if (allowed) {
@@ -119,123 +119,16 @@ static void trigger_neighbor_probe(sa_family_t family, const uint8_t* ip,
     PUT_REF(info);
 }
 
-static void free_route_info(void* ptr);
-
-static int route4_add_cb(trie_node* node, uint64_t info);
-static int route4_delete_cb(trie_node* node, uint64_t info);
-static uint64_t route4_search_cb(trie_node* node, void* argv);
-static int route6_add_cb(trie_node* node, uint64_t info);
-static int route6_delete_cb(trie_node* node, uint64_t info);
-static uint64_t route6_search_cb(trie_node* node, void* argv);
-static int arp_add_cb(trie_node* node, uint64_t info);
-static int arp_delete_cb(trie_node* node, uint64_t info);
-static uint64_t arp_search_cb(trie_node* node, void* argv);
-static int ndp_add_cb(trie_node* node, uint64_t info);
-static int ndp_delete_cb(trie_node* node, uint64_t info);
-static uint64_t ndp_search_cb(trie_node* node, void* argv);
-
-DEFINE_TRIE(ipv4_route_table, TRIE_IPV4, route4_add_cb, route4_delete_cb, route4_search_cb, true);
-DEFINE_TRIE(ipv6_route_table, TRIE_IPV6, route6_add_cb, route6_delete_cb, route6_search_cb, true);
-
-DEFINE_TRIE(arp_table,  TRIE_IPV4, arp_add_cb,  arp_delete_cb,  arp_search_cb,  true);
-DEFINE_TRIE(ndp_table, TRIE_IPV6, ndp_add_cb, ndp_delete_cb, ndp_search_cb, true);
-
-
-int route_init(void)
+static void route_info_destroy(void* ptr)
 {
-    return 0;
+    route_info* info = (route_info*)ptr;
+    PUT_REF(info->if_info);
+    free(info);
 }
 
-route_info* search_route_table(const route_key* key)
+static route_info* route_info_create(const route_info* info)
 {
-    if (key->ip_family == AF_INET6) {
-        uint64_t ret = search_trie_element(&ipv6_route_table,
-            (uint64_t)(uintptr_t)key->dip, 128, true, (void*)key);
-        return (route_info*)ret;
-    }
-
-    uint32_t dest_ip;
-    memcpy(&dest_ip, key->dip, sizeof(dest_ip));
-    uint64_t ret = search_trie_element(&ipv4_route_table, dest_ip, 32, true, (void*)key);
-    return (route_info*)ret;
-}
-
-/* ── 统一设置 skb 路由（v4 / v6）──────────────────────── */
-int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
-{
-    route_info* route = skb->route;
-    if (route_info_check(route))
-        return 0;
-    if (route) {
-        PUT_REF(skb->route);
-        skb->route = NULL;
-        route = NULL;
-    }
-
-    route_key key = { .ip_family = family };
-
-    if (family == AF_INET6) {
-        if (skb->sock)
-            key.ifindex = skb->sock->dip6_scope_id;
-        memcpy(key.dip, dip, 16);
-    } else {
-        memcpy(key.dip, dip, 4);
-    }
-
-    route = search_route_table(&key);
-    if (!route) {
-        DEBUG_LOG("No route found");
-        return -1;
-    }
-    skb->route = route;
-    return 0;
-}
-
-ndp_info* search_ndp_table(const ndp_key* key)
-{
-    uint64_t ret;
-    if (key->ip_family == AF_INET6) {
-        ret = search_trie_element(&ndp_table,
-            (uint64_t)(uintptr_t)key->neigh_ip, 128, false, (void*)key);
-    } else if (key->ip_family == AF_INET) {
-        uint32_t ip;
-        memcpy(&ip, key->neigh_ip, sizeof(ip));
-        ret = search_trie_element(&arp_table, ip, 32, false, (void*)key);
-    } else {
-        return NULL;
-    }
-
-    return (ndp_info*)ret;
-}
-
-int resolve_neighbor_entry(const ndp_key* key, ndp_info** result)
-{
-    if (result)
-        *result = NULL;
-
-    ndp_info* entry = search_ndp_table(key);
-    if (entry && (entry->state & NUD_FAILED)) {
-        PUT_REF(entry);
-        return -EHOSTUNREACH;
-    }
-
-    if (ndp_entry_usable(entry)) {
-        if (result)
-            *result = entry;
-        else
-            PUT_REF(entry);
-        return 0;
-    }
-
-    PUT_REF(entry);
-    if (key->ifindex)
-        trigger_neighbor_probe(key->ip_family, key->neigh_ip, key->ifindex);
-    return -EINPROGRESS;
-}
-
-static route_info* create_route_info(const route_info* info)
-{
-    CREATE_REF(route_info, route, free_route_info);
+    CREATE_REF(route_info, route, route_info_destroy);
     if (!route)
         return NULL;
 
@@ -260,24 +153,17 @@ static route_info* create_route_info(const route_info* info)
     return route;
 }
 
-static void free_route_info(void* ptr)
-{
-    route_info* info = (route_info*)ptr;
-    PUT_REF(info->if_info);
-    free(info);
-}
-
-static void free_ndp_info(void* ptr)
+static void ndp_info_destroy(void* ptr)
 {
     ndp_info* info = (ndp_info*)ptr;
     free(info);
 }
 
-static ndp_info* create_ndp_info(const ndp_info* in)
+static ndp_info* ndp_info_create(const ndp_info* in)
 {
     if (!in)
         return NULL;
-    CREATE_REF(ndp_info, ndp, free_ndp_info);
+    CREATE_REF(ndp_info, ndp, ndp_info_destroy);
     if (!ndp)
         return NULL;
     uint32_t copy_size = offsetof(ndp_info, ref);
@@ -285,7 +171,7 @@ static ndp_info* create_ndp_info(const ndp_info* in)
     return ndp;
 }
 
-static bool route_same(const route_info* a, const route_info* b)
+static bool route_info_equal(const route_info* a, const route_info* b)
 {
     if (a == b)
         return true;
@@ -341,13 +227,13 @@ static int route4_add_cb(trie_node* node, uint64_t info)
     list_node* head = (list_node*)node->element;
     route_info* it;
     FOR_EACH_LIST_OFFSET(head, it, route_info, list) {
-        if (route_same(it, in)) {
+        if (route_info_equal(it, in)) {
             route_copy_attr(it, in);
             return 0;
         }
     }
 
-    route_info* route = create_route_info(in);
+    route_info* route = route_info_create(in);
     if (!route) {
         if (created_head) {
             destroy_list_node(head, NULL);
@@ -370,7 +256,7 @@ static int route4_delete_cb(trie_node* node, uint64_t info)
     route_info* it;
     list_node* tmp_node;
     FOR_EACH_LIST_SAFE_OFFSET(head, it, tmp_node, route_info, list) {
-        if (route_same(it, in)) {
+        if (route_info_equal(it, in)) {
             remove_list_node(&it->list);
             DESTROY_REF(it);
             break;
@@ -450,7 +336,7 @@ static int arp_add_cb(trie_node* node, uint64_t info)
         }
     }
 
-    ndp_info* new_entry = create_ndp_info(in);
+    ndp_info* new_entry = ndp_info_create(in);
     if (!new_entry) {
         if (created_head) {
             destroy_list_node(head, NULL);
@@ -502,7 +388,7 @@ static uint64_t arp_search_cb(trie_node* node, void* argv)
     return 0;
 }
 
-/* ── IPv6 callback stubs (identical logic, different trie type) ── */
+/* IPv6 trie 复用相同的条目管理逻辑，只替换地址查找实现。 */
 static int ndp_add_cb(trie_node* node, uint64_t info)
     { return arp_add_cb(node, info); }
 static int ndp_delete_cb(trie_node* node, uint64_t info)
@@ -516,6 +402,106 @@ static int route6_delete_cb(trie_node* node, uint64_t info)
     { return route4_delete_cb(node, info); }
 static uint64_t route6_search_cb(trie_node* node, void* argv)
     { return route6_search_cb_impl(node, argv); }
+
+DEFINE_TRIE(ipv4_route_table, TRIE_IPV4, route4_add_cb, route4_delete_cb, route4_search_cb, true);
+DEFINE_TRIE(ipv6_route_table, TRIE_IPV6, route6_add_cb, route6_delete_cb, route6_search_cb, true);
+
+DEFINE_TRIE(arp_table,  TRIE_IPV4, arp_add_cb,  arp_delete_cb,  arp_search_cb,  true);
+DEFINE_TRIE(ndp_table, TRIE_IPV6, ndp_add_cb, ndp_delete_cb, ndp_search_cb, true);
+
+
+int route_init(void)
+{
+    return 0;
+}
+
+route_info* search_route_table(const route_key* key)
+{
+    if (key->ip_family == AF_INET6) {
+        uint64_t ret = search_trie_element(&ipv6_route_table,
+            (uint64_t)(uintptr_t)key->dip, 128, true, (void*)key);
+        return (route_info*)ret;
+    }
+
+    uint32_t dest_ip;
+    memcpy(&dest_ip, key->dip, sizeof(dest_ip));
+    uint64_t ret = search_trie_element(&ipv4_route_table, dest_ip, 32, true, (void*)key);
+    return (route_info*)ret;
+}
+
+/* ── 统一设置 skb 路由（v4 / v6）──────────────────────── */
+int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
+{
+    route_info* route = skb->route;
+    if (route_info_is_valid(route))
+        return 0;
+    if (route) {
+        PUT_REF(skb->route);
+        skb->route = NULL;
+        route = NULL;
+    }
+
+    route_key key = { .ip_family = family };
+
+    if (family == AF_INET6) {
+        if (skb->sock)
+            key.ifindex = skb->sock->dip6_scope_id;
+        memcpy(key.dip, dip, 16);
+    } else {
+        memcpy(key.dip, dip, 4);
+    }
+
+    route = search_route_table(&key);
+    if (!route) {
+        DEBUG_LOG("No route found");
+        return -1;
+    }
+    skb->route = route;
+    return 0;
+}
+
+ndp_info* search_ndp_table(const ndp_key* key)
+{
+    uint64_t ret;
+    if (key->ip_family == AF_INET6) {
+        ret = search_trie_element(&ndp_table,
+            (uint64_t)(uintptr_t)key->neigh_ip, 128, false, (void*)key);
+    } else if (key->ip_family == AF_INET) {
+        uint32_t ip;
+        memcpy(&ip, key->neigh_ip, sizeof(ip));
+        ret = search_trie_element(&arp_table, ip, 32, false, (void*)key);
+    } else {
+        return NULL;
+    }
+
+    return (ndp_info*)ret;
+}
+
+int resolve_neighbor_entry(const ndp_key* key, ndp_info** result)
+{
+    if (result)
+        *result = NULL;
+
+    ndp_info* entry = search_ndp_table(key);
+    if (entry && (entry->state & NUD_FAILED)) {
+        PUT_REF(entry);
+        return -EHOSTUNREACH;
+    }
+
+    if (ndp_entry_usable(entry)) {
+        if (result)
+            *result = entry;
+        else
+            PUT_REF(entry);
+        return 0;
+    }
+
+    PUT_REF(entry);
+    if (key->ifindex)
+        neighbor_trigger_probe(key->ip_family, key->neigh_ip, key->ifindex);
+    return -EINPROGRESS;
+}
+
 
 int ndp_add_entry(const ndp_info* info)
 {
@@ -559,7 +545,7 @@ int route_delete_entry(const route_info* info)
     return delete_trie_element(&ipv4_route_table, dst, info->dst_mask, (uint64_t)info);
 }
 
-static void parse_route_metrics(route_info* info, const struct rtattr* metrics)
+static void route_parse_metrics(route_info* info, const struct rtattr* metrics)
 {
     int len = RTA_PAYLOAD(metrics);
     struct rtattr* attr = RTA_DATA(metrics);
@@ -604,7 +590,7 @@ int parse_route_event(struct nlmsghdr *nlh)
             if (RTA_PAYLOAD(rta) >= 4) {
                 memcpy(&info.ifindex, RTA_DATA(rta), 4);
                 if_indextoname(info.ifindex, info.if_name);
-                if (filter_ifname(info.if_name))
+                if (config_interface_is_filtered(info.if_name))
                     return 0;
             }
             break;
@@ -617,7 +603,7 @@ int parse_route_event(struct nlmsghdr *nlh)
                    RTA_PAYLOAD(rta) < 16 ? RTA_PAYLOAD(rta) : 16);
             break;
         case RTA_METRICS:
-            parse_route_metrics(&info, rta);
+            route_parse_metrics(&info, rta);
             break;
         }
     }
@@ -679,7 +665,7 @@ int parse_neighbor_event(struct nlmsghdr *nlh)
     return ndp_delete_entry(&info);
 }
 
-bool route_info_check(const route_info* info)
+bool route_info_is_valid(const route_info* info)
 {
     return REF_USABLE(info) && REF_USABLE(info->if_info);
 }
@@ -718,7 +704,7 @@ bool search_best_saddr_by_daddr(const route_key* key, route_key* answer)
     return found;
 }
 
-static void free_route_element(uint64_t element)
+static void route_element_destroy(uint64_t element)
 {
     list_node* head = (list_node*)element;
 
@@ -731,7 +717,7 @@ static void free_route_element(uint64_t element)
     destroy_list_node(head, NULL);
 }
 
-static void free_arp_element(uint64_t element)
+static void arp_element_destroy(uint64_t element)
 {
     list_node* head = (list_node*)element;
     ndp_info* entry;
@@ -745,10 +731,10 @@ static void free_arp_element(uint64_t element)
 
 void route_arp_clear_tables(void)
 {
-    trie_clear(&ipv4_route_table, free_route_element);
-    trie_clear(&ipv6_route_table, free_route_element);
-    trie_clear(&arp_table, free_arp_element);
-    trie_clear(&ndp_table, free_arp_element);
+    trie_clear(&ipv4_route_table, route_element_destroy);
+    trie_clear(&ipv6_route_table, route_element_destroy);
+    trie_clear(&arp_table, arp_element_destroy);
+    trie_clear(&ndp_table, arp_element_destroy);
 }
 
 uint32_t get_route_mtu(const route_info* info)

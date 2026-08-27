@@ -23,8 +23,9 @@ AF_XDP 提供了另一种路径：XDP 程序可以把网卡收到的数据包重
 RX ring，应用通过 UMEM 管理数据包内存，再通过 TX ring 发回网卡。这样既保留
 Linux 提供的驱动和 XDP 基础设施，又能在用户态实现传输层和 socket 语义。
 
-NetFast 会在配置的接口上挂载 XDP。挂载后，该接口上的全部 TCP 和 UDP 流量
-由 NetFast 接管，不再交给内核 TCP/IP 数据路径处理。
+NetFast 会在配置的接口上挂载 XDP。挂载后，目的端口落在配置
+`source_port_range` 内的 TCP 和 UDP 流量由 NetFast 接管；分片报文是否接管
+由 `redirect_fragments` 配置，不符合条件的流量继续交给内核协议栈。
 
 ## NetFast 现在包含什么
 
@@ -78,31 +79,31 @@ NetFast 的数据路径可以概括为：
 
 ## 为什么又设计了一套异步 API
 
-同步接口很容易使用，但一次调用通常只描述一个操作。高并发服务更希望一次
-提交多个 accept、read、write，再批量取得已经完成的请求。
+同步接口很容易使用，但一次调用通常只描述一个操作。高并发服务更希望同时
+保持多个 accept、read、write 在途，再批量取得已经完成的请求。
 
 NetFast 的异步接口围绕完成队列工作：
 
 1. 使用 `net_async_create()` 创建 CQ；
 2. 使用 `net_async_req_create()` 描述操作；
-3. 使用 `net_async_submit()` 或 `net_async_submit_batch()` 提交；
+3. 使用 `net_async_submit()` 逐个提交；
 4. 使用 `net_async_wait()` 批量取得完成请求；
-5. 直接读取 `req->type`、`req->async_fd` 和 `req->ret`；
-6. 使用 `net_async_req_destroy()` 释放请求。
+5. 使用 `net_async_result()` 读取结果和操作类型，或通过
+   `net_async_argv()` 访问请求参数；
+6. 将取回的请求再次提交，或使用 `net_async_req_destroy()` 释放。
 
 下面是一次最小的异步写入：
 
 ```c
-net_async_req *request = net_async_req_create(
-    socket_fd, NET_ASYNC_WRITE, buffer, length);
+req *request = net_async_req_create(
+    socket_fd, REQ_WRITE, buffer, length);
 
 net_async_submit(cq_fd, request);
 
-net_async_req *completed = NULL;
+req *completed = NULL;
 if (net_async_wait(cq_fd, &completed, 1, 1, -1) == 1) {
-    int operation = completed->type;
-    int fd = completed->async_fd;
-    int result = completed->ret;
+    req_type operation;
+    int result = net_async_result(completed, &operation);
 
     /* result 成功时为写入字节数，失败时为 -errno。 */
     net_async_req_destroy(completed);
@@ -116,54 +117,22 @@ if (net_async_wait(cq_fd, &completed, 1, 1, -1) == 1) {
 异步 HTTP Server 使用的就是这套模型。从 socket、bind、listen、accept，到
 read、write 和 close，全部作为异步请求提交，主循环只负责批量处理完成项。
 
-## 实现过程中最容易出错的地方
-
-真正实现协议栈后，我发现困难往往不在“能不能收到 SYN”，而在各种边界语义。
-
-### 1. TCP 不是简单的序号递增
-
-TCP 序号是 32 位的，长连接传输超过 4 GiB 后会发生回绕。比较 ACK、判断重传
-区间、释放发送队列时都不能直接使用普通整数大小关系。FTP 大文件测试很适合
-发现这类问题，因为数据正确性和最终文件长度都可以直接校验。
-
-### 2. write 完成不等于数据已经被 ACK
-
-应用写入、协议栈接收数据、报文发到网卡以及对端确认，是不同的完成时刻。
-关闭连接时还要处理发送队列、FIN、`SO_LINGER` 和异常退出。把这些语义混在
-一起，很容易造成尾部数据丢失，或者 close 永远无法结束。
-
-### 3. 邻居解析是动态过程
-
-路由存在不代表下一跳 MAC 已经可用。当前实现会通过内核邻居机制触发解析，
-并通过 Netlink 获取邻居状态。解析中的报文可以丢弃但不立即向 socket 返回
-错误；只有邻居进入 `NUD_FAILED` 后才报告不可达。
-
-### 4. 性能优化必须建立在正确性之上
-
-tuple hash、frame cache、TX completion、fd 引用和完成通知都可能成为热点，
-但每次简化都可能引入 ABA、生命周期或并发问题。因此项目同时保留协议回环、
-异步多 waiter、Netlink 事件、静态分析和长时间传输测试。
-
 ## 如何运行
 
-在 Debian/Ubuntu 环境中，可以从引导脚本开始：
+在 Debian/Ubuntu 环境中，可以使用安装脚本：
 
 ```bash
 git clone https://github.com/Tomatonight/netfast.git
 cd netfast
+cp config.example.json netfast_config.json
+editor netfast_config.json
 ./setup.sh
-```
-
-也可以指定接口、队列数和 worker 数：
-
-```bash
-./setup.sh --interface <interface> --queues 2 --workers 2 --yes
 ```
 
 构建并启动异步 HTTP Server：
 
 ```bash
-make PROFILE=release -j$(nproc) http-async
+make -j$(nproc) http-async
 sudo ./build/example/http_async_server
 ```
 

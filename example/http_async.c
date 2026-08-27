@@ -46,7 +46,7 @@ struct http_connection {
 
 struct http_operation {
     http_operation *next;
-    net_async_req *request;
+    req *request;
     http_operation_kind kind;
     http_connection *connection;
     struct sockaddr_storage peer;
@@ -208,7 +208,7 @@ static void operation_unlink(http_server *server, http_operation *operation)
 }
 
 static http_operation *operation_find(http_server *server,
-                                      net_async_req *request)
+                                      req *request)
 {
     for (http_operation *operation = server->operations; operation;
          operation = operation->next) {
@@ -234,25 +234,25 @@ static int submit_operation(http_server *server, http_operation *operation)
     case HTTP_OP_ACCEPT:
         operation->peer_length = sizeof(operation->peer);
         operation->request = net_async_req_create(
-            server->listen_fd, NET_ASYNC_ACCEPT,
+            server->listen_fd, REQ_ACCEPT,
             (struct sockaddr *)&operation->peer, &operation->peer_length);
         break;
     case HTTP_OP_READ:
         operation->request = net_async_req_create(
-            connection->fd, NET_ASYNC_READ,
+            connection->fd, REQ_READ,
             connection->request + connection->request_length,
             (uint32_t)(HTTP_REQUEST_CAPACITY - connection->request_length));
         break;
     case HTTP_OP_WRITE:
         operation->request = net_async_req_create(
-            connection->fd, NET_ASYNC_WRITE,
+            connection->fd, REQ_WRITE,
             connection->response + connection->response_offset,
             (uint32_t)(connection->response_length -
                        connection->response_offset));
         break;
     case HTTP_OP_CLOSE:
         operation->request = net_async_req_create(connection->fd,
-                                                   NET_ASYNC_CLOSE);
+                                                   REQ_CLOSE);
         break;
     }
 
@@ -520,7 +520,7 @@ static int complete_write(http_connection *connection, int result)
     return close_connection(connection, false);
 }
 
-static int complete_operation(http_server *server, net_async_req *request)
+static int complete_operation(http_server *server, req *request)
 {
     http_operation *operation = operation_find(server, request);
     if (!operation) {
@@ -530,11 +530,10 @@ static int complete_operation(http_server *server, net_async_req *request)
     }
     operation_unlink(server, operation);
     http_connection *connection = operation->connection;
-    int result = request->ret;
-    int type = request->type;
-    int async_fd = request->async_fd;
-    http_log("DEBUG", "op=%s type=%d fd=%d ret=%d",
-             operation_name(operation->kind), type, async_fd, result);
+    req_type type;
+    int result = net_async_result(request, &type);
+    http_log("DEBUG", "op=%s type=%d ret=%d",
+             operation_name(operation->kind), type, result);
     net_async_req_destroy(request);
 
     int ret;
@@ -569,7 +568,7 @@ static int complete_operation(http_server *server, net_async_req *request)
     return ret;
 }
 
-static int wait_setup_request(http_server *server, net_async_req *request,
+static int wait_setup_request(http_server *server, req *request,
                               const char *name)
 {
     if (!request)
@@ -581,7 +580,7 @@ static int wait_setup_request(http_server *server, net_async_req *request,
         return -1;
     }
 
-    net_async_req *completed = NULL;
+    req *completed = NULL;
     int count = net_async_wait(server->cq_fd, &completed, 1, 1, 5000);
     if (count != 1 || completed != request) {
         if (completed)
@@ -589,9 +588,9 @@ static int wait_setup_request(http_server *server, net_async_req *request,
         errno = count < 0 ? errno : ETIMEDOUT;
         return -1;
     }
-    int result = completed->ret;
-    http_log("DEBUG", "setup=%s type=%d fd=%d ret=%d", name,
-             completed->type, completed->async_fd, result);
+    req_type type;
+    int result = net_async_result(completed, &type);
+    http_log("DEBUG", "setup=%s type=%d ret=%d", name, type, result);
     net_async_req_destroy(completed);
     if (result < 0) {
         errno = -result;
@@ -603,7 +602,7 @@ static int wait_setup_request(http_server *server, net_async_req *request,
 static int setup_listener(http_server *server)
 {
     server->listen_fd = wait_setup_request(
-        server, net_async_req_create(-1, NET_ASYNC_SOCKET,
+        server, net_async_req_create(-1, REQ_SOCKET,
                                      AF_INET, SOCK_STREAM, IPPROTO_TCP),
         "socket");
     if (server->listen_fd < 0)
@@ -612,7 +611,7 @@ static int setup_listener(http_server *server)
     int reuse = 1;
     if (wait_setup_request(
             server, net_async_req_create(server->listen_fd,
-                NET_ASYNC_SETSOCKOPT, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                REQ_SETSOCKOPT, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 (socklen_t)sizeof(reuse)), "setsockopt") < 0)
         return -1;
 
@@ -622,12 +621,12 @@ static int setup_listener(http_server *server)
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
     if (wait_setup_request(
-            server, net_async_req_create(server->listen_fd, NET_ASYNC_BIND,
+            server, net_async_req_create(server->listen_fd, REQ_BIND,
                 (const struct sockaddr *)&address,
                 (socklen_t)sizeof(address)), "bind") < 0)
         return -1;
     if (wait_setup_request(
-            server, net_async_req_create(server->listen_fd, NET_ASYNC_LISTEN,
+            server, net_async_req_create(server->listen_fd, REQ_LISTEN,
                                          HTTP_BACKLOG), "listen") < 0)
         return -1;
     return 0;
@@ -664,7 +663,7 @@ int main(void)
     http_log("INFO", "listening on 0.0.0.0:%u accept-depth=%u",
              HTTP_PORT, HTTP_ACCEPT_DEPTH);
     while (!g_stop) {
-        net_async_req *completed[HTTP_COMPLETION_BATCH];
+        req *completed[HTTP_COMPLETION_BATCH];
         int count = net_async_wait(server.cq_fd, completed, 1,
                                    HTTP_COMPLETION_BATCH, 1000);
         if (count < 0) {

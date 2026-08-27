@@ -6,7 +6,7 @@
 #include <errno.h>
 #include <stdlib.h>
 
-static trie_node* create_trie_node(trie_node* parent)
+static trie_node* trie_node_create(trie_node* parent)
 {
 	trie_node* node = calloc(1, sizeof(*node));
 	if (!node)
@@ -16,7 +16,7 @@ static trie_node* create_trie_node(trie_node* parent)
 	return node;
 }
 
-static void clear_empty_branch(trie_node* node)
+static void trie_clear_empty_branch(trie_node* node)
 {
 	while (node && node->parent && !node->left_node &&
 		   !node->right_node && !node->exist_element) {
@@ -35,7 +35,7 @@ static uint32_t trie_max_depth(const trie* trie)
 	return trie->type == TRIE_IPV4 ? 32u : 128u;
 }
 
-static trie_node* find_trie_node_common(trie* trie, uint64_t net,
+static trie_node* trie_find_node(trie* trie, uint64_t net,
 										uint32_t mask, bool create,
 										bool search_prefix)
 {
@@ -57,7 +57,7 @@ static trie_node* find_trie_node_common(trie* trie, uint64_t net,
 
 		trie_node** next = bit ? &cur->right_node : &cur->left_node;
 		if (!*next && create)
-			*next = create_trie_node(cur);
+			*next = trie_node_create(cur);
 		if (!*next)
 			return search_prefix ? last_exist_node : NULL;
 		cur = *next;
@@ -74,7 +74,7 @@ int add_trie_element(trie* trie, uint64_t net, uint32_t mask, uint64_t info)
 		return -1;
 	}
 	TRIE_WRLOCK(trie);
-	trie_node* find = find_trie_node_common(trie, net, mask, true, false);
+	trie_node* find = trie_find_node(trie, net, mask, true, false);
 	int ret = find ? trie->cb_add(find, info) : -ENOMEM;
 	TRIE_UNLOCK(trie);
 	return ret;
@@ -87,14 +87,14 @@ int delete_trie_element(trie* trie, uint64_t net, uint32_t mask, uint64_t info)
 		return -1;
 	}
 	TRIE_WRLOCK(trie);
-	trie_node* find = find_trie_node_common(trie, net, mask, false, false);
+	trie_node* find = trie_find_node(trie, net, mask, false, false);
 	if (!find) {
 		TRIE_UNLOCK(trie);
 		WARN_LOG("delete_trie:no node");
 		return 0;
 	}
 	int ret = trie->cb_delete(find, info);
-	clear_empty_branch(find);
+	trie_clear_empty_branch(find);
 	TRIE_UNLOCK(trie);
 	return ret;
 }
@@ -107,7 +107,7 @@ uint64_t search_trie_element(trie* trie, uint64_t net, uint32_t mask,
 		return 0;
 	}
 	TRIE_RDLOCK(trie);
-	trie_node* find = find_trie_node_common(trie, net, mask, false, prefix_search);
+	trie_node* find = trie_find_node(trie, net, mask, false, prefix_search);
 	uint64_t ret = 0;
 	while (find) {
 		if (find->exist_element)

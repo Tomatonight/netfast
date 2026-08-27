@@ -23,7 +23,7 @@ int ipv6_init(void)
 
 /* ── 跳过扩展头，找到 L4 协议号 ────────────────────────── */
 /* Parse extension headers after the fixed IPv6 header has been consumed. */
-static int ipv6_skip_exthdrs(skbuff* skb, uint8_t initial_nh,
+static int ipv6_skip_extension_headers(skbuff* skb, uint8_t initial_nh,
                              uint8_t* out_proto)
 {
     uint8_t nh = initial_nh;
@@ -81,7 +81,7 @@ done:
     return 0;
 }
 
-static inline worker* get_ipv6_frag_worker(const ipv6_hdr* ip6)
+static inline worker* ipv6_select_fragment_worker(const ipv6_hdr* ip6)
 {
     if (g_worker_num <= 1)
         return get_current_worker();
@@ -95,7 +95,7 @@ static inline worker* get_ipv6_frag_worker(const ipv6_hdr* ip6)
 }
 
 /* ── IPv6 首部校验 ────────────────────────────────────── */
-static bool check_ipv6_hdr(skbuff* skb)
+static bool ipv6_validate_header(skbuff* skb)
 {
     ipv6_hdr* ip6 = skb->ipv6_hdr;
 
@@ -125,13 +125,14 @@ int ipv6_recv(skbuff* skb)
     ipv6_hdr* ip6 = (ipv6_hdr*)skb_start(skb);
     skb->ipv6_hdr = ip6;
 
-    if (!check_ipv6_hdr(skb))
+    if (!ipv6_validate_header(skb))
         return -1;
 
     bool fragmented = ipv6_has_frag(skb);
-    if (fragmented &&
-        get_ipv6_frag_worker(ip6) != get_current_worker()) {
-        transmit_skb_2_worker(get_ipv6_frag_worker(ip6), skb, ipv6_recv);
+    worker* fragment_worker = fragmented
+        ? ipv6_select_fragment_worker(ip6) : get_current_worker();
+    if (fragment_worker != get_current_worker()) {
+        worker_enqueue_skb(fragment_worker, skb, ipv6_recv);
         return 0;
     }
 
@@ -160,7 +161,7 @@ int ipv6_recv(skbuff* skb)
 
     /* 处理扩展头，找到 L4 协议 */
     uint8_t protocol;
-    if (ipv6_skip_exthdrs(skb, initial_next_hdr, &protocol) < 0) {
+    if (ipv6_skip_extension_headers(skb, initial_next_hdr, &protocol) < 0) {
         if (protocol == IPV6_NEXTHDR_NONEXT)
             goto done;  /* No Next Header，静默丢弃 */
         DEBUG_LOG("IPv6 extension header parse failed, next_hdr=%u", protocol);

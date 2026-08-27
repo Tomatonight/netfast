@@ -204,7 +204,7 @@ static void icmp_deliver_error(skbuff* skb, const icmp_error_info* info,
         return;
 
     if (aim != get_current_worker()) {
-        transmit_skb_2_worker(aim, skb, resume);
+        worker_enqueue_skb(aim, skb, resume);
         return;
     }
 

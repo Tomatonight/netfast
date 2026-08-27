@@ -31,27 +31,7 @@ static int req_copy_sockaddr(struct sockaddr_storage *dst,
     return 0;
 }
 
-static int fcntl_req(fd_entry* entry, int cmd, int arg)
-{
-    req r;
-    req_init(&r);
-
-    req_fill(&r, REQ_FCNTL, fcntl, .entry = entry, .cmd = cmd, .arg = arg);
-
-    return req_push_wait(fd_entry_get_worker(entry), &r);
-}
-
-int socket_req(int family, int type, int protocol)
-{
-    req r;
-    req_init(&r);
-
-    req_fill(&r, REQ_SOCKET, Socket, .family = family, .type = type, .protocol = protocol);
-
-    return req_push_wait(random_worker(), &r);
-}
-
-static int bind_req(fd_entry* entry, const struct sockaddr *addr, socklen_t addrlen)
+static int req_socket_bind(fd_entry* entry, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (!addr) {
         errno = EFAULT;
@@ -63,15 +43,16 @@ static int bind_req(fd_entry* entry, const struct sockaddr *addr, socklen_t addr
     }
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_BIND, bind, .entry = entry, .addrlen = addrlen);
+    req_fill(&r, REQ_BIND, bind, .addrlen = addrlen);
     if (req_copy_sockaddr(&r.argv.bind.addr, addr, addrlen) < 0)
         return -1;
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int connect_req(fd_entry* entry, const struct sockaddr *addr,
+static int req_socket_connect(fd_entry* entry, const struct sockaddr *addr,
                        socklen_t addrlen)
 {
     if (!addr) {
@@ -84,45 +65,62 @@ static int connect_req(fd_entry* entry, const struct sockaddr *addr,
     }
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_CONNECT, connect, .entry = entry, .addrlen = addrlen);
+    req_fill(&r, REQ_CONNECT, connect, .addrlen = addrlen);
     if (req_copy_sockaddr(&r.argv.connect.addr, addr, addrlen) < 0)
         return -1;
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int listen_req(fd_entry* entry, int backlog)
+static int req_socket_listen(fd_entry* entry, int backlog)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_LISTEN, listen, .entry = entry, .backlog = backlog);
+    req_fill(&r, REQ_LISTEN, listen, .backlog = backlog);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int write_req(fd_entry* entry, const void *buf, uint32_t len)
+static int req_socket_accept(fd_entry* entry, struct sockaddr *addr,
+                             socklen_t *addrlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_WRITE, write, .entry = entry, .buf = buf, .len = len);
+    req_fill(&r, REQ_ACCEPT, accept,
+             .addr = addr, .addrlen = addrlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int read_req(fd_entry* entry, void *buf, uint32_t len)
+static int req_socket_write(fd_entry* entry, const void *buf, uint32_t len)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_READ, read, .entry = entry, .buf = buf, .len = len);
+    req_fill(&r, REQ_WRITE, write, .buf = buf, .len = len);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int sendto_req(fd_entry* entry, const void *buf, uint32_t len, int flags,
+static int req_socket_read(fd_entry* entry, void *buf, uint32_t len)
+{
+    req r;
+    req_init(&r);
+    r.entry = entry;
+
+    req_fill(&r, REQ_READ, read, .buf = buf, .len = len);
+
+    return req_push_wait(fd_entry_get_worker(entry), &r);
+}
+
+static int req_socket_sendto(fd_entry* entry, const void *buf, uint32_t len, int flags,
                       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     /* A connected socket may pass a NULL destination (the kernel API permits
@@ -137,9 +135,10 @@ static int sendto_req(fd_entry* entry, const void *buf, uint32_t len, int flags,
     }
     req r;
     req_init(&r);
+    r.entry = entry;
 
     req_fill(&r, REQ_SENDTO, sendto,
-        .entry = entry, .buf = buf, .len = len, .flags = flags,
+        .buf = buf, .len = len, .flags = flags,
         .addrlen = addrlen, .has_dest_addr = dest_addr != NULL);
     if (dest_addr && req_copy_sockaddr(&r.argv.sendto.dest_addr,
                                        dest_addr, addrlen) < 0)
@@ -148,112 +147,130 @@ static int sendto_req(fd_entry* entry, const void *buf, uint32_t len, int flags,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int recvfrom_req(fd_entry* entry, void *buf, uint32_t len, int flags,
+static int req_socket_recvfrom(fd_entry* entry, void *buf, uint32_t len, int flags,
                         struct sockaddr *src_addr, socklen_t *addrlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
     req_fill(&r, REQ_RECVFROM, recvfrom,
-        .entry = entry, .buf = buf, .len = len, .flags = flags,
+        .buf = buf, .len = len, .flags = flags,
         .src_addr = src_addr, .addrlen = addrlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int accept_req(fd_entry* entry, struct sockaddr *addr,
-                      socklen_t *addrlen)
-{
-    req r;
-    req_init(&r);
-
-    req_fill(&r, REQ_ACCEPT, accept, .entry = entry, .addr = addr, .addrlen = addrlen);
-
-    return req_push_wait(fd_entry_get_worker(entry), &r);
-}
-
-static int getsockname_req(fd_entry* entry, struct sockaddr *addr,
+static int req_socket_getsockname(fd_entry* entry, struct sockaddr *addr,
                            socklen_t *addrlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_GETSOCKNAME, getsockname, .entry = entry, .addr = addr, .addrlen = addrlen);
+    req_fill(&r, REQ_GETSOCKNAME, getsockname, .addr = addr, .addrlen = addrlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int getpeername_req(fd_entry* entry, struct sockaddr *addr,
+static int req_socket_getpeername(fd_entry* entry, struct sockaddr *addr,
                            socklen_t *addrlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_GETPEERNAME, getpeername, .entry = entry, .addr = addr, .addrlen = addrlen);
+    req_fill(&r, REQ_GETPEERNAME, getpeername, .addr = addr, .addrlen = addrlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int setsockopt_req(fd_entry* entry, int level, int optname,
+static int req_socket_setsockopt(fd_entry* entry, int level, int optname,
                           const void *optval, socklen_t optlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
     req_fill(&r, REQ_SETSOCKOPT, setsockopt,
-        .entry = entry, .level = level, .optname = optname,
+        .level = level, .optname = optname,
         .optval = optval, .optlen = optlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int getsockopt_req(fd_entry* entry, int level, int optname,
+static int req_socket_getsockopt(fd_entry* entry, int level, int optname,
                           void *optval, socklen_t *optlen)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
     req_fill(&r, REQ_GETSOCKOPT, getsockopt,
-        .entry = entry, .level = level, .optname = optname,
+        .level = level, .optname = optname,
         .optval = optval, .optlen = optlen);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int close_req(fd_entry* entry)
+static int req_socket_fcntl(fd_entry* entry, int cmd, int arg)
 {
     req r;
     req_init(&r);
+    r.entry = entry;
 
-    req_fill(&r, REQ_CLOSE, close, .entry = entry);
+    req_fill(&r, REQ_FCNTL, fcntl,
+             .cmd = cmd, .arg = arg);
 
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int shutdown_req(fd_entry* entry, int how)
+static int req_socket_close(fd_entry* entry)
+{
+    req r;
+    req_init(&r);
+    r.entry = entry;
+    r.type = REQ_CLOSE;
+
+    return req_push_wait(fd_entry_get_worker(entry), &r);
+}
+
+static int req_socket_shutdown(fd_entry* entry, int how)
+{
+    req r;
+    req_init(&r);
+    r.entry = entry;
+
+    req_fill(&r, REQ_SHUTDOWN, shutdown, .how = how);
+
+    return req_push_wait(fd_entry_get_worker(entry), &r);
+}
+
+int socket_req(int family, int type, int protocol)
 {
     req r;
     req_init(&r);
 
-    req_fill(&r, REQ_SHUTDOWN, shutdown, .entry = entry, .how = how);
+    req_fill(&r, REQ_SOCKET, Socket,
+             .family = family, .type = type, .protocol = protocol);
 
-    return req_push_wait(fd_entry_get_worker(entry), &r);
+    return req_push_wait(worker_select_random(), &r);
 }
 
 const fd_entry_ops socket_fd_ops = {
-    .bind        = bind_req,
-    .connect     = connect_req,
-    .listen      = listen_req,
-    .accept      = accept_req,
-    .write       = write_req,
-    .read        = read_req,
-    .sendto      = sendto_req,
-    .recvfrom    = recvfrom_req,
-    .getsockname = getsockname_req,
-    .getpeername = getpeername_req,
-    .setsockopt  = setsockopt_req,
-    .getsockopt  = getsockopt_req,
-    .fcntl       = fcntl_req,
-    .close       = close_req,
-    .shutdown    = shutdown_req,
+    .bind        = req_socket_bind,
+    .connect     = req_socket_connect,
+    .listen      = req_socket_listen,
+    .accept      = req_socket_accept,
+    .write       = req_socket_write,
+    .read        = req_socket_read,
+    .sendto      = req_socket_sendto,
+    .recvfrom    = req_socket_recvfrom,
+    .getsockname = req_socket_getsockname,
+    .getpeername = req_socket_getpeername,
+    .setsockopt  = req_socket_setsockopt,
+    .getsockopt  = req_socket_getsockopt,
+    .fcntl       = req_socket_fcntl,
+    .close       = req_socket_close,
+    .shutdown    = req_socket_shutdown,
 };

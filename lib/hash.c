@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint32_t round_hash_size(uint32_t requested)
+static uint32_t hash_round_size(uint32_t requested)
 {
     uint32_t size = MIN_HASH_SIZE;
     while (size < requested && size <= UINT32_MAX / 2u)
@@ -13,7 +13,7 @@ static uint32_t round_hash_size(uint32_t requested)
 
 hash* hash_create(uint32_t requested, ptrdiff_t key_offset, uint32_t key_len)
 {
-    uint32_t size = round_hash_size(requested);
+    uint32_t size = hash_round_size(requested);
     if (!size)
         return NULL;
 

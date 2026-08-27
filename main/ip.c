@@ -8,6 +8,7 @@
 #include "tcp.h"
 #include "icmp.h"
 #include "log.h"
+#include "rss.h"
 #include "worker.h"
 
 #include <arpa/inet.h>
@@ -18,7 +19,7 @@
 static _Atomic(uint32_t) ip_id;
 static const uint8_t default_ttl = 64;
 
-static void ip_id_init(void)
+static void ipv4_id_init(void)
 {
     atomic_store_explicit(&ip_id, (uint32_t)get_current_time_ms(),
                           memory_order_relaxed);
@@ -26,13 +27,13 @@ static void ip_id_init(void)
 
 int ipv4_init(void)
 {
-    ip_id_init();
+    ipv4_id_init();
     if (route_init() < 0)
         return -1;
     return tcp_metrics_init();
 }
 
-static bool check_ipv4_hdr(skbuff* skb)
+static bool ipv4_validate_header(skbuff* skb)
 {
     ipv4_hdr* ip = skb->ipv4_hdr;
     if (IPV4_VHL_VERSION(ip->vhl) != 4)
@@ -59,7 +60,7 @@ static bool check_ipv4_hdr(skbuff* skb)
     return true;
 }
 
-static worker* get_frag_worker(const ipv4_hdr* hdr)
+static worker* ipv4_select_fragment_worker(const ipv4_hdr* hdr)
 {
     if (g_worker_num <= 1)
         return get_current_worker();
@@ -72,7 +73,7 @@ static worker* get_frag_worker(const ipv4_hdr* hdr)
  * the eventual accepted socket before doing checksum, route and TCP work.
  * SYN/handshake packets may make one extra hop back to the listener owner;
  * established traffic then stays on its tuple worker. */
-static worker* ipv4_tcp_software_rss_worker(skbuff* skb, ipv4_hdr* ip)
+static worker* ipv4_select_tcp_worker(skbuff* skb, ipv4_hdr* ip)
 {
     if (g_worker_num <= 1 || IPV4_VHL_VERSION(ip->vhl) != 4 ||
         IPV4_VHL_IHL(ip->vhl) < 5 || ip->protocol != IPPROTO_TCP ||
@@ -90,7 +91,7 @@ static worker* ipv4_tcp_software_rss_worker(skbuff* skb, ipv4_hdr* ip)
 
     /* Match the NIC's inbound RSS tuple order and tcp_accept(): peer/wire
      * source first, local/wire destination second. */
-    return select_worker_by_tuple(AF_INET,
+    return rss_select_worker_by_tuple(AF_INET,
         (const uint8_t*)&ip->saddr, (const uint8_t*)&ip->daddr,
         ports.sport, ports.dport);
 }
@@ -104,18 +105,18 @@ int ipv4_recv(skbuff* skb)
 
     ipv4_hdr* ip = (ipv4_hdr*)skb_start(skb);
     skb->ipv4_hdr = ip;
-    if (!check_ipv4_hdr(skb))
+    if (!ipv4_validate_header(skb))
         return -1;
 
-    worker* frag_worker = get_frag_worker(ip);
+    worker* frag_worker = ipv4_select_fragment_worker(ip);
     if (ipv4_is_frag(ip) && frag_worker != get_current_worker()) {
-        transmit_skb_2_worker(frag_worker, skb, ipv4_recv);
+        worker_enqueue_skb(frag_worker, skb, ipv4_recv);
         return 0;
     }
 
-    worker* rss_worker = ipv4_tcp_software_rss_worker(skb, ip);
+    worker* rss_worker = ipv4_select_tcp_worker(skb, ip);
     if (rss_worker != get_current_worker()) {
-        transmit_skb_2_worker(rss_worker, skb, ipv4_recv);
+        worker_enqueue_skb(rss_worker, skb, ipv4_recv);
         return 0;
     }
 

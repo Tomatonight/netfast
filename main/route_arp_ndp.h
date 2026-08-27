@@ -150,7 +150,7 @@ static inline bool route_include_nexthop(const route_info* info, const uint8_t* 
     return (info->dst_ip[full_bytes] & mask8) == (nexthop[full_bytes] & mask8);
 }
 
-bool route_info_check(const route_info* info);
+bool route_info_is_valid(const route_info* info);
 uint32_t get_route_mtu(const route_info* info);
 
 #endif /* ROUTE_ARP_NDP_H */

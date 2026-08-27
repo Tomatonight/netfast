@@ -11,12 +11,10 @@
 #include "fd_entry.h"
 #include "worker.h" /* g_workers/g_worker_num */
 #include "icmp.h"
+#include "rss.h"
 #include "thread.h"
 
-static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, int flags, sockaddr_in* daddr, socklen_t* addrlen);
-static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len, int flags, sockaddr_in* dest_addr, socklen_t addrlen);
-static int udp_recv_(skbuff* skb);
-static int udp_release(struct Socket *sock, req* r);
+/* ── 报文输出、查找和首部构造 ──────────────────────────── */
 
 /* IP fragmentation mutates and splits its input skb, so output a shallow
  * clone when fragmentation is required. */
@@ -25,7 +23,7 @@ static int udp_output(skbuff* skb)
     skbuff* output = skb;
     uint32_t ip_header = skb->family == AF_INET6
         ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
-    if (route_info_check(skb->route) &&
+    if (route_info_is_valid(skb->route) &&
         skb_data_len(skb) + ip_header > get_route_mtu(skb->route)) {
         output = skb_clone(skb);
         if (!output)
@@ -71,7 +69,7 @@ static Socket* udp_lookup_recv_socket6(const uint8_t src_ip[16], uint16_t src_po
                                    socket_worker);
 }
 
-static void make_udp_hdr(Socket* sock, skbuff* skb){
+static void udp_build_header(Socket* sock, skbuff* skb){
     udp_hdr* hdr = skb->udp_hdr;
     skb->tx_checksum_offset = 0;
     uint16_t udp_len = (uint16_t)skb_data_len(skb);
@@ -104,7 +102,7 @@ static void make_udp_hdr(Socket* sock, skbuff* skb){
     if (hdr->check == 0)
         hdr->check = 0xffffu;
 }
-static int socket_recv_skb(Socket* sock, skbuff* skb)
+static int udp_queue_socket_skb(Socket* sock, skbuff* skb)
 {
     uint32_t data_len = skb_data_len(skb);
     if (data_len > SOCKET_USEABLE_RECV_BUFF_SIZE(sock))
@@ -116,6 +114,43 @@ static int socket_recv_skb(Socket* sock, skbuff* skb)
     socket_notify_event(sock, notify_data_read);
     return (int)data_len;
 }
+
+static int udp_receive_on_worker(skbuff* skb)
+{
+    udp_hdr* udp = skb->udp_hdr;
+    worker* socket_worker;
+    Socket* sock;
+    uint32_t rss = udp->sport;
+    if (skb->family == AF_INET6) {
+        sock = udp_lookup_recv_socket6(skb->ipv6_hdr->saddr, udp->sport,
+                                       skb->ipv6_hdr->daddr, udp->dport,
+                                       &socket_worker);
+        for (uint32_t i = 0; i < 16; ++i)
+            rss = rss * 33u + skb->ipv6_hdr->saddr[i];
+    } else {
+        ipv4_hdr* ip = skb->ipv4_hdr;
+        sock = udp_lookup_recv_socket(ip->saddr, udp->sport,
+                                      ip->daddr, udp->dport,
+                                      &socket_worker);
+        rss ^= ip->saddr;
+    }
+    if (!sock) {
+        DEBUG_LOG("No socket found for received UDP packet family=%d dport=%u",
+                  skb->family, ntohs(udp->dport));
+        if (skb->family == AF_INET)
+            (void)icmp_send_dest_unreach(skb, ICMP_PORT_UNREACH);
+        return 0;
+    }
+    if (socket_worker != get_current_worker()) {
+        worker_enqueue_skb(socket_worker, skb, udp_receive_on_worker);
+        return 0;
+    }
+    Socket* aim_sock = sock->tuple_node.next ? socket_select(sock, rss) : sock;
+    udp_queue_socket_skb(aim_sock, skb);
+    return 0;
+}
+
+/* ── 输入路径 ──────────────────────────────────────────── */
 
 int udp_recv(skbuff* skb){
     if (skb_data0_len(skb) < sizeof(udp_hdr))
@@ -150,45 +185,101 @@ int udp_recv(skbuff* skb){
     skb_truncate(skb, udp_total_len);
     if (skb_consume(skb, sizeof(*udp), true) != sizeof(*udp))
         return -1;
-    return udp_recv_(skb);
+    return udp_receive_on_worker(skb);
 }
-static int udp_recv_(skbuff* skb)
+/* ── Socket 协议操作回调 ───────────────────────────────── */
+
+static int udp_bind(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
 {
-    udp_hdr*  udp = skb->udp_hdr;
-    worker* socket_worker;
-    Socket* sock;
-    uint32_t rss = udp->sport;
-    if (skb->family == AF_INET6) {
-        sock = udp_lookup_recv_socket6(skb->ipv6_hdr->saddr, udp->sport,
-                                       skb->ipv6_hdr->daddr, udp->dport,
-                                       &socket_worker);
-        for (uint32_t i = 0; i < 16; ++i)
-            rss = rss * 33u + skb->ipv6_hdr->saddr[i];
-    } else {
-        ipv4_hdr* ip = skb->ipv4_hdr;
-        sock = udp_lookup_recv_socket(ip->saddr, udp->sport,
-                                      ip->daddr, udp->dport,
-                                      &socket_worker);
-        rss ^= ip->saddr;
+    (void)r;
+    bind_table* bound_table = udp_bound_table(sock->family);
+    int ret = socket_bind_local(sock, addr, addrlen, bound_table);
+    if (ret < 0)
+        return ret;
+
+    if (!install_tuple(sock, udp_tuple_hash(sock->family))) {
+        WARN_LOG("Failed to install UDP Socket tuple");
+        unbind_saddr(sock, bound_table);
+        return -EADDRINUSE;
     }
-    if (!sock) {
-        DEBUG_LOG("No socket found for received UDP packet family=%d dport=%u",
-                  skb->family, ntohs(udp->dport));
-        if (skb->family == AF_INET)
-            (void)icmp_send_dest_unreach(skb, ICMP_PORT_UNREACH);
-        return 0;
-    }
-    if (socket_worker != get_current_worker()) {
-        transmit_skb_2_worker(socket_worker, skb, udp_recv_);
-        return 0;
-    }
-    Socket* aim_sock = sock->tuple_node.next ? socket_select(sock, rss) : sock;
-    socket_recv_skb(aim_sock, skb);
     return 0;
 }
-static int udp_read(struct Socket *sock, req* r, void *buf, uint32_t len){
-    return udp_recvfrom(sock, r, buf, len, 0, NULL, NULL);
+
+static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
+{
+    bool was_connected = sock->flag.is_connected;
+    bool was_hashed = sock->flag.is_hash;
+    bool is_v6 = sock->family == AF_INET6;
+    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
+    socklen_t required = is_v6 ? sizeof(*addr6) : sizeof(*addr);
+    uint32_t old_dip = sock->dip;
+    uint8_t old_dip6[16];
+    uint32_t old_scope_id = sock->dip6_scope_id;
+    uint16_t old_dport = sock->dport;
+    memcpy(old_dip6, sock->dip6, sizeof(old_dip6));
+
+    if (addrlen < required)
+        return -EINVAL;
+    if (addr->sin_family != sock->family)
+        return -EAFNOSUPPORT;
+
+    int route_ret = set_socket_route(sock,
+        is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
+        is_v6 ? addr6->sin6_scope_id : 0);
+    if (route_ret < 0)
+        return -EHOSTUNREACH;
+
+    if (!sock->flag.is_bound) {
+        int bind_ret = socket_auto_bind(sock, udp_bound_table(sock->family), NULL,
+            is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
+            is_v6 ? addr6->sin6_port : addr->sin_port,
+            is_v6 ? addr6->sin6_scope_id : 0);
+        if (bind_ret < 0)
+            return -EADDRINUSE;
+    }
+
+    /* Reconnecting UDP is supported, but the old tuple must be removed
+     * before overwriting the peer fields used to construct its hash key. */
+    if (was_hashed && !uninstall_tuple(sock, udp_tuple_hash(sock->family)))
+        return -EIO;
+
+    if (is_v6) {
+        memcpy(sock->dip6, &addr6->sin6_addr, 16);
+        sock->dip6_scope_id = addr6->sin6_scope_id;
+        sock->dport = addr6->sin6_port;
+    } else {
+        sock->dip = addr->sin_addr.s_addr;
+        sock->dport = addr->sin_port;
+    }
+
+    /* Ensure the final tuple maps to this worker before installing it. */
+    {
+        worker* tuple_worker = rss_select_worker_by_tuple(sock->family,
+            is_v6 ? sock->sip6 : (const uint8_t*)&sock->sip,
+            is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
+            sock->sport, sock->dport);
+        if (tuple_worker != get_current_worker()) {
+            set_socket_worker(sock, tuple_worker);
+            worker_move_request(r, tuple_worker);
+            return REQ_PENDING;
+        }
+    }
+
+    if (!install_tuple(sock, udp_tuple_hash(sock->family))) {
+        WARN_LOG("Failed to install UDP Socket tuple on connect");
+        sock->dip = old_dip;
+        memcpy(sock->dip6, old_dip6, sizeof(old_dip6));
+        sock->dip6_scope_id = old_scope_id;
+        sock->dport = old_dport;
+        sock->flag.is_connected = was_connected;
+        if (was_hashed && !install_tuple(sock, udp_tuple_hash(sock->family)))
+            ERR_LOG("Failed to restore old UDP tuple after reconnect failure");
+        return -EADDRINUSE;
+    }
+    sock->flag.is_connected = 1;
+    return 0;
 }
+
 static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, int flags, sockaddr_in* daddr, socklen_t* addrlen){
     if(!sock->flag.is_bound){
         //DEBUG_LOG("UDP Socket is not bound");
@@ -213,7 +304,7 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
 
         /* Blocking semantics */
         if(!sock->options.recv_timeout){
-            wait(sock, r, REQ_WAITING_READ);
+            stack_wait_request(sock, r, REQ_WAITING_READ);
             return REQ_PENDING;
         }
 
@@ -223,15 +314,15 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
             return -EAGAIN;
         }
 
-        wait_until(sock, r, REQ_WAITING_READ, get_current_time_ms() + get_time(&sock->recv_timeout));
+        stack_wait_request_until(sock, r, REQ_WAITING_READ, get_current_time_ms() + get_time(&sock->recv_timeout));
         return REQ_PENDING;
     }
 
     bool is_peek = (flags & MSG_PEEK) != 0;
 
     /* MSG_PEEK: look at the head without dequeuing, no accounting change */
-    skbuff* skb = is_peek ? SKB_FROM_QUEUE_NODE(get_queue_first(q))
-                          : SKB_FROM_QUEUE_NODE(pop_queue(q));
+    skbuff* skb = is_peek ? SKB_FROM_NODE(get_queue_first(q), queue_node)
+                          : SKB_FROM_NODE(pop_queue(q), queue_node);
 
     uint32_t avail = skb_data_len(skb);
 
@@ -288,8 +379,10 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     /* MSG_TRUNC: return real datagram length even when truncated */
     return (int)((truncated && (flags & MSG_TRUNC)) ? avail : recv_len);
 }
-static int udp_write(struct Socket *sock, req* r, const void *buf, uint32_t len){
-    return udp_sendto(sock, r, buf, len, 0, NULL, 0);
+
+static int udp_read(struct Socket *sock, req* r, void *buf, uint32_t len)
+{
+    return udp_recvfrom(sock, r, buf, len, 0, NULL, NULL);
 }
 
 
@@ -397,13 +490,13 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
 
     /* Ensure the final (sip, sport, dip, dport) tuple maps to this worker. */
     {
-        worker* tuple_worker = select_worker_by_tuple(sock->family,
+        worker* tuple_worker = rss_select_worker_by_tuple(sock->family,
             is_v6 ? sock->sip6 : (const uint8_t*)&sock->sip,
             is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
             sock->sport, sock->dport);
         if (tuple_worker != get_current_worker()) {
             set_socket_worker(sock, tuple_worker);
-            change_req_worker(r, tuple_worker);
+            worker_move_request(r, tuple_worker);
             return REQ_PENDING;
         }
     }
@@ -449,7 +542,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     }
 
     set_skb_by_socket(skb, sock);
-    make_udp_hdr(sock, skb);
+    udp_build_header(sock, skb);
 
     /* Immediate output path. */
     int send_ret = udp_output(skb);
@@ -483,96 +576,12 @@ exit:
     return ret;
 }
 
-static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
+static int udp_write(struct Socket *sock, req* r, const void *buf, uint32_t len)
 {
-    bool was_connected = sock->flag.is_connected;
-    bool was_hashed = sock->flag.is_hash;
-    bool is_v6 = sock->family == AF_INET6;
-    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
-    socklen_t required = is_v6 ? sizeof(*addr6) : sizeof(*addr);
-    uint32_t old_dip = sock->dip;
-    uint8_t old_dip6[16];
-    uint32_t old_scope_id = sock->dip6_scope_id;
-    uint16_t old_dport = sock->dport;
-    memcpy(old_dip6, sock->dip6, sizeof(old_dip6));
-
-    if (addrlen < required)
-        return -EINVAL;
-    if (addr->sin_family != sock->family)
-        return -EAFNOSUPPORT;
-
-    int route_ret = set_socket_route(sock,
-        is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
-        is_v6 ? addr6->sin6_scope_id : 0);
-    if (route_ret < 0)
-        return -EHOSTUNREACH;
-
-    if (!sock->flag.is_bound) {
-        int bind_ret = socket_auto_bind(sock, udp_bound_table(sock->family), NULL,
-            is_v6 ? (const uint8_t*)&addr6->sin6_addr : (const uint8_t*)&addr->sin_addr.s_addr,
-            is_v6 ? addr6->sin6_port : addr->sin_port,
-            is_v6 ? addr6->sin6_scope_id : 0);
-        if (bind_ret < 0)
-            return -EADDRINUSE;
-    }
-
-    /* Reconnecting UDP is supported, but the old tuple must be removed
-     * before overwriting the peer fields used to construct its hash key. */
-    if (was_hashed && !uninstall_tuple(sock, udp_tuple_hash(sock->family)))
-        return -EIO;
-
-    if (is_v6) {
-        memcpy(sock->dip6, &addr6->sin6_addr, 16);
-        sock->dip6_scope_id = addr6->sin6_scope_id;
-        sock->dport = addr6->sin6_port;
-    } else {
-        sock->dip = addr->sin_addr.s_addr;
-        sock->dport = addr->sin_port;
-    }
-
-    /* Ensure the final tuple maps to this worker before installing it. */
-    {
-        worker* tuple_worker = select_worker_by_tuple(sock->family,
-            is_v6 ? sock->sip6 : (const uint8_t*)&sock->sip,
-            is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
-            sock->sport, sock->dport);
-        if (tuple_worker != get_current_worker()) {
-            set_socket_worker(sock, tuple_worker);
-            change_req_worker(r, tuple_worker);
-            return REQ_PENDING;
-        }
-    }
-
-    if (!install_tuple(sock, udp_tuple_hash(sock->family))) {
-        WARN_LOG("Failed to install UDP Socket tuple on connect");
-        sock->dip = old_dip;
-        memcpy(sock->dip6, old_dip6, sizeof(old_dip6));
-        sock->dip6_scope_id = old_scope_id;
-        sock->dport = old_dport;
-        sock->flag.is_connected = was_connected;
-        if (was_hashed && !install_tuple(sock, udp_tuple_hash(sock->family)))
-            ERR_LOG("Failed to restore old UDP tuple after reconnect failure");
-        return -EADDRINUSE;
-    }
-    sock->flag.is_connected = 1;
-    return 0;
+    return udp_sendto(sock, r, buf, len, 0, NULL, 0);
 }
 
-static int udp_bind(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
-{
-    (void)r;
-    bind_table* bound_table = udp_bound_table(sock->family);
-    int ret = socket_bind_local(sock, addr, addrlen, bound_table);
-    if (ret < 0)
-        return ret;
 
-    if (!install_tuple(sock, udp_tuple_hash(sock->family))) {
-        WARN_LOG("Failed to install UDP Socket tuple");
-        unbind_saddr(sock, bound_table);
-        return -EADDRINUSE;
-    }
-    return 0;
-}
 
 static int udp_getsockname(struct Socket *sock, req* r, struct sockaddr_in *addr, socklen_t *addrlen)
 {
@@ -638,7 +647,7 @@ static int udp_setsockopt(struct Socket* sock, req* r, int level, int optname, c
     return -ENOPROTOOPT;
 }
 
-static int udp_getsockopt(struct Socket* sock, req* r, int level, int optname, void* optval, socklen_t* optlen)
+static int udp_getsockopt(struct Socket* sock, req* r, int level,int optname,void* optval,socklen_t* optlen)
 {
     (void)r;
     if (!optval || !optlen || *optlen == 0)
@@ -647,22 +656,6 @@ static int udp_getsockopt(struct Socket* sock, req* r, int level, int optname, v
     if (level == SOL_SOCKET)
         return socket_getsockopt(sock, level, optname, optval, optlen);
     return -ENOPROTOOPT;
-}
-
-static uint32_t udp_poll(struct Socket* sock)
-{
-    uint32_t mask = 0;
-
-    if (sock->error)
-        mask |= EPOLLERR;
-
-    if (sock->recv_buffer_len > 0 && !sock->flag.close_recv)
-        mask |= EPOLLIN;
-
-    if (!sock->flag.close_send)
-        mask |= EPOLLOUT;
-
-    return mask;
 }
 
 static int udp_release(struct Socket *sock, req* r)
@@ -684,6 +677,7 @@ static int udp_icmp_process(struct Socket* sock,
     socket_notify_event(sock, notify_err);
     return 0;
 }
+/* 保持操作表在文件末尾，便于核对所有回调的完整性。 */
 protocol_ops udp_protocol_ops = {
     .protocol = IPPROTO_UDP,
     .pcb_init = NULL,
@@ -701,5 +695,4 @@ protocol_ops udp_protocol_ops = {
     .getpeername = udp_getpeername,
     .setsockopt = udp_setsockopt,
     .getsockopt = udp_getsockopt,
-    .poll = udp_poll,
 };
