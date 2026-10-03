@@ -29,6 +29,7 @@ hash* hash_create(uint32_t requested, ptrdiff_t key_offset, uint32_t key_len)
     h->mask = size - 1u;
     h->key_offset = key_offset;
     h->key_len = key_len;
+    atomic_init(&h->element_count, 0);
     return h;
 }
 
@@ -82,6 +83,8 @@ void hash_link_node_locked(hash* h, uint32_t index, hash_node* node,
                            uint32_t value)
 {
     node->hash = value;
+    node->owner = h;
+    atomic_fetch_add_explicit(&h->element_count, 1u, memory_order_release);
     node->next = h->buckets[index];
     node->pprev = &h->buckets[index];
     if (node->next)
@@ -91,11 +94,14 @@ void hash_link_node_locked(hash* h, uint32_t index, hash_node* node,
 
 void hash_unlink_node_locked(hash_node* node)
 {
+    hash* h = node->owner;
     *node->pprev = node->next;
     if (node->next)
         node->next->pprev = node->pprev;
     node->next = NULL;
     node->pprev = NULL;
+    node->owner = NULL;
+    atomic_fetch_sub_explicit(&h->element_count, 1u, memory_order_release);
 }
 
 hash_node* hash_find_node(const hash* h, const void* key)
@@ -143,12 +149,6 @@ hash_node* hash_del_key(hash* h, const void* key)
 
 bool hash_is_empty(const hash* h)
 {
-    for (uint32_t i = 0; i < h->size; i++) {
-        HASH_BUCKET_RDLOCK(h, i);
-        bool empty = h->buckets[i] == NULL;
-        HASH_BUCKET_UNLOCK(h, i);
-        if (!empty)
-            return false;
-    }
-    return true;
+    return atomic_load_explicit(&h->element_count,
+                                memory_order_acquire) == 0;
 }

@@ -10,6 +10,22 @@
 extern "C" {
 #endif
 
+typedef struct Socket Socket;
+
+typedef uint32_t net_event_mask;
+
+#define NET_EVENT_READ      (UINT32_C(1) << 0)
+#define NET_EVENT_WRITE     (UINT32_C(1) << 1)
+#define NET_EVENT_CONNECT   (UINT32_C(1) << 2)
+#define NET_EVENT_ACCEPT    (UINT32_C(1) << 3)
+#define NET_EVENT_FIN       (UINT32_C(1) << 4)
+#define NET_EVENT_ERROR     (UINT32_C(1) << 5)
+
+/* Called on the worker that owns sock.  The callback receives the internal
+ * socket object so protocol-specific, non-blocking operations can be used
+ * without re-submitting a request to the same worker. */
+typedef void (*net_callback)(Socket *sock, net_event_mask events, void *arg);
+
 /* ── socket API ── */
 int net_socket(int family, int type, int protocol);
 int net_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
@@ -31,6 +47,10 @@ int net_getsockopt(int sockfd, int level, int optname,
 int net_fcntl(int sockfd, int cmd, ...);
 int net_close(int fd);
 int net_shutdown(int sockfd, int how);
+
+int net_set_callback(int sockfd, net_event_mask events,
+                     net_callback cb, void *arg);
+int net_clear_callback(int sockfd);
 
 /* ── asynchronous request API ──
  * A successful submit transfers request ownership to the completion queue.
@@ -144,8 +164,7 @@ int net_async_create(void);
 req *net_async_req_create(int fd, req_type type, ...);
 void net_async_req_destroy(req *request);
 int net_async_submit(int cq_fd, req *request);
-/* Return the completed operation result and optionally store its type.
- * Request arguments are available through net_async_argv(). */
+
 int net_async_result(const req *request, req_type *type);
 req_argv *net_async_argv(req *request);
 int net_async_wait(int cq_fd, req **requests,

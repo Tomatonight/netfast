@@ -42,9 +42,6 @@ static trie_node* trie_find_node(trie* trie, uint64_t net,
 	trie_node* cur = &trie->root;
 	uint32_t net_host = ntohl((uint32_t)net);
 	const uint8_t* net6 = (const uint8_t*)(uintptr_t)net;
-	if (trie->type == TRIE_IPV6 && !net6)
-		return NULL;
-
 	trie_node* last_exist_node = cur->exist_element ? cur : NULL;
 	for (uint32_t bit_idx = 0; bit_idx < mask; ++bit_idx) {
 		bool bit;

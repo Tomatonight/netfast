@@ -60,7 +60,7 @@ typedef struct trie {
 		.rwlock = PTHREAD_RWLOCK_INITIALIZER, \
 	}
 
-/* IPv4 keys are passed by value in the low 32 bits. IPv6 keys are pointers
+/* IPv4 keys are passed by value in the low 32 bits. IPv6 keys are non-NULL pointers
  * to 16 network-order bytes carried through uintptr_t. */
 int add_trie_element(trie* trie, uint64_t net, uint32_t mask, uint64_t element);
 int delete_trie_element(trie* trie, uint64_t net, uint32_t mask, uint64_t element);

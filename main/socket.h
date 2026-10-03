@@ -20,6 +20,7 @@ typedef struct bind_slot bind_slot;
 typedef struct bind_table bind_table;
 typedef struct tuple_entry tuple_entry;
 typedef struct icmp_error_info icmp_error_info;
+struct thread;
 
 #define SOCKET_USEABLE_RECV_BUFF_SIZE(sock) \
     ((sock)->recv_buffer_len_max > (sock)->recv_buffer_len ? \
@@ -43,6 +44,8 @@ typedef struct protocol_ops {
     int (*pcb_init)(struct Socket* sock);
     int (*icmp_process)(struct Socket* sock, const icmp_error_info* info,
                         int err);
+    /* A NULL req means a worker-local, non-blocking attempt.  Protocol
+     * implementations must return -EAGAIN instead of attaching a waiter. */
     int (*read)(struct Socket* sock, req* req, void* buf, uint32_t len);
     int (*write)(struct Socket* sock, req* req, const void* buf, uint32_t len);
     int (*recvfrom)(struct Socket* sock, req* req, void* buf, uint32_t len, int flags, sockaddr_in* addr, socklen_t* addrlen);
@@ -111,6 +114,9 @@ typedef struct Socket {
     uint32_t send_buffer_len_max;
 
     route_info* route;
+    uint64_t route_generation;
+    uint8_t route_dest[16];
+    uint32_t route_scope_id;
     protocol_ops* protocol_ops;
     void* pcb;
 
@@ -120,19 +126,28 @@ typedef struct Socket {
     tuple_entry* tuple_entry;
     bind_slot* bind_reservation;
 
+	list_node timer_migrate_node;
+
 
 	list_node pending;
 	task* pending_task;
 
-	uint32_t notified_events;
+    uint32_t notified_events;
+
+    net_event_mask callback_events;
+    net_callback callback;
+    void *callback_arg;
 } Socket;
 
 void socket_notify_event(Socket* sock, enum notify_event event);
+int socket_set_callback(Socket *sock, net_event_mask events,
+                        net_callback cb, void *arg);
 
 Socket* create_socket(int family, int type, int protocol);
 void set_socket_worker(Socket* sock, worker* w);
 void destroy_socket(Socket* sock);
 void socket_detach_with_fd_entry(Socket* sock);
+void socket_process_timer_migrations(task* tk);
 
 void socket_process_create_request(req* req);
 void socket_process_bind_request(req* req);
@@ -172,6 +187,8 @@ bool unbind_saddr(Socket* sock, bind_table* bound_table);
 bool bind_exist(const addr_key* key, const bind_table* bound_table);
 
 void set_skb_by_socket(skbuff* skb, Socket* sock);
+bool socket_route_is_valid(const Socket* sock, const uint8_t* dest_ip,
+                           uint32_t scope_id);
 int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id);
 
 int socket_auto_bind(Socket* sock, bind_table* bound_table,

@@ -1,10 +1,9 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/icmp.h>
+#include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
-#include <linux/in.h>
-#include <linux/udp.h>
-#include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -24,105 +23,259 @@ struct {
     __type(value, netfast_xdp_config);
 } netfast_cfg SEC(".maps");
 
-#define IPV4_FRAG_MORE        0x2000U
-#define IPV4_FRAG_OFFSET      0x1fffU
+#define IPV4_FRAG_MORE    0x2000U
+#define IPV4_FRAG_OFFSET  0x1fffU
+#define XDP_MAX_V6_EXT    4
 
-static __always_inline int xdp_parse_ethernet_protocol(
-    void** data, void* data_end, __u16* eth_proto)
+static __always_inline int xdp_port_owned(
+    __u16 port, const netfast_xdp_config* config)
 {
-    struct ethhdr *eth = *data;
-    if ((void *)(eth + 1) > data_end)
-        return -1;
+    return port >= config->source_port_first &&
+           port <= config->source_port_last;
+}
 
-    __u16 proto = eth->h_proto;
-    *data = eth + 1;
+/* XDP sees ingress packets.  For a normal TCP/UDP ingress packet, only the
+ * destination port belongs to the local NetFast socket. */
+static __always_inline int xdp_ingress_port_owned(
+    const __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
+{
+    const __be16* ports = (const __be16 *)cursor;
+    if ((const void *)(ports + 2) > data_end)
+        return 0;
 
-    /* Basic single VLAN (802.1Q/AD) handling. */
-    if (proto == bpf_htons(ETH_P_8021Q) || proto == bpf_htons(ETH_P_8021AD)) {
-        struct {
-            __be16 tci;
-            __be16 encap_proto;
-        } *vh = *data;
-        if ((void *)(vh + 1) > data_end)
-            return -1;
-        proto = vh->encap_proto;
-        *data = vh + 1;
+    return xdp_port_owned(bpf_ntohs(ports[1]), config);
+}
+
+/* An ICMP error received by the host quotes the packet that caused the
+ * error.  For a packet sent by a local NetFast socket, that quoted packet's
+ * source port is the local port, so ICMP needs a separate source-port test. */
+static __always_inline int xdp_quoted_source_port_owned(
+    const __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
+{
+    const __be16* ports = (const __be16 *)cursor;
+    if ((const void *)(ports + 2) > data_end)
+        return 0;
+
+    return xdp_port_owned(bpf_ntohs(ports[0]), config);
+}
+
+static __always_inline int xdp_ipv4_icmp_error(
+    const __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
+{
+    const struct icmphdr* icmp = (const void *)cursor;
+    if ((const void *)(icmp + 1) > data_end)
+        return 0;
+
+    if (icmp->type != ICMP_DEST_UNREACH &&
+        icmp->type != ICMP_TIME_EXCEEDED &&
+        icmp->type != ICMP_PARAMETERPROB)
+        return 0;
+
+    const struct iphdr* quoted = (const void *)(icmp + 1);
+    if ((const void *)(quoted + 1) > data_end ||
+        quoted->version != 4 || quoted->ihl < 5)
+        return 0;
+
+    __u32 header_len = (__u32)quoted->ihl * 4u;
+    if ((const __u8 *)quoted + header_len > (const __u8 *)data_end)
+        return 0;
+    if (quoted->protocol != IPPROTO_TCP &&
+        quoted->protocol != IPPROTO_UDP)
+        return 0;
+
+    return xdp_quoted_source_port_owned((const __u8 *)quoted + header_len,
+                                        data_end, config);
+}
+
+static __always_inline int xdp_ipv6_quoted_ports(
+    const __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
+{
+    const struct ipv6hdr* quoted = (const void *)cursor;
+    if ((const void *)(quoted + 1) > data_end)
+        return 0;
+
+    __u8 next_header = quoted->nexthdr;
+    const __u8* next = (const __u8 *)(quoted + 1);
+
+#pragma unroll
+    for (int i = 0; i < XDP_MAX_V6_EXT; i++) {
+        if (next_header == IPPROTO_TCP || next_header == IPPROTO_UDP)
+            return xdp_quoted_source_port_owned(next, data_end, config);
+
+        if (next_header == IPPROTO_HOPOPTS ||
+            next_header == IPPROTO_ROUTING ||
+            next_header == IPPROTO_DSTOPTS) {
+            if (next + 2 > (const __u8 *)data_end)
+                return 0;
+            __u32 header_len = ((__u32)next[1] + 1u) * 8u;
+            if (header_len < 8u ||
+                next + header_len > (const __u8 *)data_end)
+                return 0;
+            next_header = next[0];
+            next += header_len;
+            continue;
+        }
+
+        if (next_header == IPPROTO_FRAGMENT) {
+            if (next + 8 > (const __u8 *)data_end)
+                return 0;
+            /* A non-first fragment does not contain TCP/UDP ports. */
+            __be16 fragment_offset = *(__be16 *)(next + 2);
+            if (bpf_ntohs(fragment_offset) & 0xfff8u)
+                return 0;
+            next_header = next[0];
+            next += 8;
+            continue;
+        }
+
+        if (next_header == IPPROTO_AH) {
+            if (next + 2 > (const __u8 *)data_end)
+                return 0;
+            __u32 header_len = ((__u32)next[1] + 2u) * 4u;
+            if (header_len < 8u ||
+                next + header_len > (const __u8 *)data_end)
+                return 0;
+            next_header = next[0];
+            next += header_len;
+            continue;
+        }
+
+        return 0;
     }
-
-    *eth_proto = bpf_ntohs(proto);
     return 0;
 }
 
-static __always_inline int xdp_l4_destination_is_userspace(
-    __u8 protocol, __u8* cursor, void* data_end,
+static __always_inline int xdp_ipv6_icmp_error(
+    const __u8* cursor, void* data_end,
     const netfast_xdp_config* config)
 {
-    __u16 destination;
-    if (protocol == IPPROTO_TCP) {
-        struct tcphdr* tcp = (void*)cursor;
-        if ((void*)(tcp + 1) > data_end)
-            return 0;
-        destination = bpf_ntohs(tcp->dest);
-    } else if (protocol == IPPROTO_UDP) {
-        struct udphdr* udp = (void*)cursor;
-        if ((void*)(udp + 1) > data_end)
-            return 0;
-        destination = bpf_ntohs(udp->dest);
-    } else {
+    if (cursor + 1 > (const __u8 *)data_end)
         return 0;
+
+    /* ICMPv6 error types are 1 through 4. */
+    if (cursor[0] < 1 || cursor[0] > 4)
+        return 0;
+    if (cursor + sizeof(struct icmphdr) > (const __u8 *)data_end)
+        return 0;
+
+    return xdp_ipv6_quoted_ports(cursor + sizeof(struct icmphdr),
+                                 data_end, config);
+}
+
+static __always_inline int xdp_l4_owned(
+    __u8 protocol, const __u8* cursor, void* data_end,
+    const netfast_xdp_config* config)
+{
+    if (protocol == IPPROTO_ICMP)
+        return xdp_ipv4_icmp_error(cursor, data_end, config);
+    if (protocol == IPPROTO_ICMPV6)
+        return xdp_ipv6_icmp_error(cursor, data_end, config);
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+        return 0;
+    return xdp_ingress_port_owned(cursor, data_end, config);
+}
+
+static __always_inline int xdp_parse_ethernet(
+    void** data, void* data_end, __u16* protocol)
+{
+    struct ethhdr* eth = *data;
+    if ((void *)(eth + 1) > data_end)
+        return -1;
+
+    __be16 proto = eth->h_proto;
+    *data = eth + 1;
+
+    /* Keep this bounded for old BPF verifiers while accepting QinQ frames. */
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (proto != bpf_htons(ETH_P_8021Q) &&
+            proto != bpf_htons(ETH_P_8021AD))
+            break;
+        struct {
+            __be16 tci;
+            __be16 encap_proto;
+        } *vlan = *data;
+        if ((void *)(vlan + 1) > data_end)
+            return -1;
+        proto = vlan->encap_proto;
+        *data = vlan + 1;
     }
-    return destination >= config->source_port_first &&
-           destination <= config->source_port_last;
+
+    *protocol = bpf_ntohs(proto);
+    return 0;
 }
 
 static __always_inline int xdp_redirect_current_queue(struct xdp_md* ctx)
 {
-    __u32 qid = ctx->rx_queue_index;
-    if (!bpf_map_lookup_elem(&xsks_map, &qid))
+    __u32 queue = ctx->rx_queue_index;
+    if (!bpf_map_lookup_elem(&xsks_map, &queue))
         return XDP_PASS;
-    return bpf_redirect_map(&xsks_map, qid, 0);
+    return bpf_redirect_map(&xsks_map, queue, 0);
 }
 
-static __always_inline int xdp_ipv6_should_redirect(
+static __always_inline int xdp_ipv6_owned(
     void* data, void* data_end, const netfast_xdp_config* config)
 {
-    struct ipv6hdr *ip6 = data;
+    struct ipv6hdr* ip6 = data;
     if ((void *)(ip6 + 1) > data_end)
         return 0;
 
-    __u8 nh = ip6->nexthdr;
-    __u8 *cursor = (__u8 *)(ip6 + 1);
+    __u8 next_header = ip6->nexthdr;
+    __u8* cursor = (__u8 *)(ip6 + 1);
 
-    /* Keep this parser deliberately small: old kernels reject the large
-     * verifier state space produced by an unrolled extension-header loop.
-     * The common one-extension and Fragment-header forms are covered; other
-     * chains safely fall back to the kernel. */
-    if (nh == IPPROTO_FRAGMENT)
+    if (next_header == IPPROTO_FRAGMENT)
         return config->redirect_fragments;
-    if (nh == IPPROTO_UDP || nh == IPPROTO_TCP)
-        return xdp_l4_destination_is_userspace(nh, cursor, data_end, config);
+    if (xdp_l4_owned(next_header, cursor, data_end, config))
+        return 1;
 
-    if (nh != IPPROTO_HOPOPTS && nh != IPPROTO_ROUTING &&
-        nh != IPPROTO_DSTOPTS)
+    /* Handle one outer extension chain.  Complex or encrypted chains remain
+     * on the kernel path instead of being guessed at in XDP. */
+    if (next_header != IPPROTO_HOPOPTS &&
+        next_header != IPPROTO_ROUTING &&
+        next_header != IPPROTO_DSTOPTS)
         return 0;
     if (cursor + 2 > (__u8 *)data_end)
         return 0;
 
     __u8 next = cursor[0];
-    __u32 hdr_len = ((__u32)cursor[1] + 1u) * 8u;
-    if (hdr_len < 8u || cursor + hdr_len > (__u8 *)data_end)
+    __u32 header_len = ((__u32)cursor[1] + 1u) * 8u;
+    if (header_len < 8u || cursor + header_len > (__u8 *)data_end)
         return 0;
-    cursor += hdr_len;
+    cursor += header_len;
     if (next == IPPROTO_FRAGMENT)
         return config->redirect_fragments;
-    return xdp_l4_destination_is_userspace(next, cursor, data_end, config);
+    return xdp_l4_owned(next, cursor, data_end, config);
 }
 
-/* This program is used with AF_XDP multi-buffer receive enabled.  The
- * frags variant tells the kernel that the XDP program is safe to run on
- * frames carrying XDP_PKT_CONTD fragments. */
+static __always_inline int xdp_ipv4_owned(
+    void* data, void* data_end, const netfast_xdp_config* config)
+{
+    struct iphdr* ip = data;
+    if ((void *)(ip + 1) > data_end || ip->ihl < 5)
+        return 0;
+
+    __u32 header_len = (__u32)ip->ihl * 4u;
+    if ((void *)ip + header_len > data_end)
+        return 0;
+
+    /* Multicast remains with the kernel stack. */
+    if ((bpf_ntohl(ip->daddr) & 0xf0000000U) == 0xe0000000U)
+        return 0;
+
+    __u16 fragment = bpf_ntohs(ip->frag_off);
+    if (fragment & (IPV4_FRAG_MORE | IPV4_FRAG_OFFSET))
+        return config->redirect_fragments;
+
+    return xdp_l4_owned(ip->protocol, (__u8 *)ip + header_len,
+                        data_end, config);
+}
+
 SEC("xdp.frags")
-int xdp_redirect(struct xdp_md *ctx)
+int xdp_redirect(struct xdp_md* ctx)
 {
     __u32 config_key = NETFAST_XDP_CONFIG_KEY;
     const netfast_xdp_config* config =
@@ -130,45 +283,21 @@ int xdp_redirect(struct xdp_md *ctx)
     if (!config)
         return XDP_PASS;
 
-    void *data = (void *)(long)ctx->data;
-    void *data_end = (void *)(long)ctx->data_end;
-    __u16 eth_proto = 0;
-    if (xdp_parse_ethernet_protocol(&data, data_end, &eth_proto) != 0)
+    void* data = (void *)(long)ctx->data;
+    void* data_end = (void *)(long)ctx->data_end;
+    __u16 protocol;
+    if (xdp_parse_ethernet(&data, data_end, &protocol) < 0)
         return XDP_PASS;
 
-    /* Only configured transport ports (and optionally fragments) are owned. */
-    if (eth_proto == ETH_P_IPV6) {
-        if (!xdp_ipv6_should_redirect(data, data_end, config))
-            return XDP_PASS;
-        return xdp_redirect_current_queue(ctx);
-    }
-    if (eth_proto != ETH_P_IP)
-        return XDP_PASS;
+    int owned;
+    if (protocol == ETH_P_IP)
+        owned = xdp_ipv4_owned(data, data_end, config);
+    else if (protocol == ETH_P_IPV6)
+        owned = xdp_ipv6_owned(data, data_end, config);
+    else
+        owned = 0;
 
-    struct iphdr* ip = data;
-    if ((void*)(ip + 1) > data_end)
-        return XDP_PASS;
-    if (ip->ihl < 5 || (void*)ip + ((__u32)ip->ihl * 4u) > data_end)
-        return XDP_PASS;
-
-    /* IPv4 multicast is handled by the normal kernel path.  Do not
-     * redirect it to AF_XDP; otherwise multicast destination MACs (01:00:5e)
-     * reach userspace and are rejected later by ether_recv(). */
-    if ((bpf_ntohl(ip->daddr) & 0xf0000000U) == 0xe0000000U)
-        return XDP_PASS;
-
-    __u16 frag_off = bpf_ntohs(ip->frag_off);
-    if (frag_off & (IPV4_FRAG_MORE | IPV4_FRAG_OFFSET))
-        return config->redirect_fragments
-            ? xdp_redirect_current_queue(ctx) : XDP_PASS;
-
-    __u8* l4 = (__u8*)ip + ((__u32)ip->ihl * 4u);
-    if (xdp_l4_destination_is_userspace(ip->protocol, l4, data_end, config))
-        return xdp_redirect_current_queue(ctx);
-
-
-    /* other protocols: pass */
-    return XDP_PASS;
+    return owned ? xdp_redirect_current_queue(ctx) : XDP_PASS;
 }
 
 char _license[] SEC("license") = "GPL";

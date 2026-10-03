@@ -16,15 +16,17 @@
 
 /* ── 报文输出、查找和首部构造 ──────────────────────────── */
 
-/* IP fragmentation mutates and splits its input skb, so output a shallow
- * clone when fragmentation is required. */
+/* IP fragmentation mutates and splits its input skb.  Preserve other
+ * references, while allowing the normal single-owner send to fragment in
+ * place. */
 static int udp_output(skbuff* skb)
 {
     skbuff* output = skb;
     uint32_t ip_header = skb->family == AF_INET6
         ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
-    if (route_info_is_valid(skb->route) &&
-        skb_data_len(skb) + ip_header > get_route_mtu(skb->route)) {
+    if (route_info_is_valid(skb->route, skb->route_generation) &&
+        skb_data_len(skb) + ip_header > get_route_mtu(skb->route) &&
+        GET_REF_CNT(skb) > 1) {
         output = skb_clone(skb);
         if (!output)
             return -ENOMEM;
@@ -183,7 +185,7 @@ int udp_recv(skbuff* skb){
 	                                IPPROTO_UDP)) != 0)
 		return -1;
     skb_truncate(skb, udp_total_len);
-    if (skb_consume(skb, sizeof(*udp), true) != sizeof(*udp))
+    if (!skb_consume(skb, sizeof(*udp), true))
         return -1;
     return udp_receive_on_worker(skb);
 }
@@ -298,7 +300,7 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     queue *q=&sock->recv_queue;
     if(q->element_number==0){
         /* MSG_DONTWAIT or O_NONBLOCK �?EAGAIN */
-        if ((flags & MSG_DONTWAIT) || (sock->file_flags & O_NONBLOCK)) {
+        if (!r || (flags & MSG_DONTWAIT) || (sock->file_flags & O_NONBLOCK)) {
             return -EAGAIN;
         }
 
@@ -495,6 +497,12 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
             is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
             sock->sport, sock->dport);
         if (tuple_worker != get_current_worker()) {
+            /* A worker-local callback cannot migrate a NULL request.  Let
+             * the caller resubmit the operation through the normal API. */
+            if (!r) {
+                ret = -EAGAIN;
+                goto exit;
+            }
             set_socket_worker(sock, tuple_worker);
             worker_move_request(r, tuple_worker);
             return REQ_PENDING;
@@ -509,7 +517,8 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
 
     /* Build skb. */
     uint32_t udp_l2_len = sock->route->if_info->l2_len;
-    uint32_t hdr_len = sizeof(udp_hdr) + (is_v6 ? MAX_IP6_HDR_WITH_EXT_LEN : MAX_IP_HDR_WITH_OPT_LEN) + udp_l2_len;
+    uint32_t hdr_len = sizeof(udp_hdr) +
+        (is_v6 ? MAX_IP6_HDR_WITH_EXT_LEN : sizeof(ipv4_hdr)) + udp_l2_len;
     skbuff* skb = skb_alloc(hdr_len + len);
     if (!skb) {
         ERR_LOG("skb alloc failed");
@@ -517,7 +526,8 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
         goto exit;
     }
     skb_reserve(skb, hdr_len);
-    udp_hdr* udp = (udp_hdr*)skb_data_push(skb, sizeof(*udp));
+    udp_hdr* udp = (udp_hdr*)skb_data_push(
+        skb, sizeof(*udp), sizeof(*udp));
     if (!udp) {
         PUT_REF(skb);
         ret = -ENOMEM;
@@ -525,16 +535,11 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     }
     skb->udp_hdr = udp;
 
-    uint32_t seg_len = 0;
-    uint32_t pre_size = 0;
     uint32_t mtu = get_route_mtu(sock->route);
     uint32_t l2_len = sock->route->if_info->l2_len;
-    uint32_t ip_headers = is_v6
-            ? IPV6_HDR_LEN + sizeof(ipv6_frag_hdr) : sizeof(ipv4_hdr);
-    seg_len  = (mtu + l2_len) & ~7u;
-    pre_size = ip_headers + l2_len;
+    uint32_t alloc_size = (mtu + l2_len) & ~7u;
 
-    if (!skb_data_append(skb, buf, len, pre_size, seg_len)) {
+    if (!skb_data_append(skb, buf, len, alloc_size)) {
         ERR_LOG("skb_data_append failed len=%u", (uint32_t)len);
         PUT_REF(skb);
         ret = -ENOMEM;
@@ -650,7 +655,7 @@ static int udp_setsockopt(struct Socket* sock, req* r, int level, int optname, c
 static int udp_getsockopt(struct Socket* sock, req* r, int level,int optname,void* optval,socklen_t* optlen)
 {
     (void)r;
-    if (!optval || !optlen || *optlen == 0)
+    if (*optlen == 0)
         return -EINVAL;
 
     if (level == SOL_SOCKET)

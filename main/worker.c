@@ -141,8 +141,8 @@ void set_current_worker(worker* w)
 
 worker* worker_select_random(void)
 {
-    uint32_t state = get_current_time_ms();
-    return &g_workers[state % (uint32_t)g_worker_num];
+    static uint32_t idx = 0;
+    return &g_workers[idx++ % (uint32_t)g_worker_num];
 }
 
 void worker_move_request(req* req, worker* new_worker)

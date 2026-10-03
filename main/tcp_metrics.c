@@ -62,10 +62,6 @@ tcp_metrics* tcp_metrics_get(int family, const uint8_t* dip, uint32_t ifindex)
     if (node) {
         tcp_metrics* metrics =
             HASH_CONTAINER_OF(node, tcp_metrics, node);
-        /* 不可复活：引用归零表示该条目正被释放（tcp_metrics_free 待
-         * 执行）。INC_REF_NOT_ZERO 从 0 递增失败即视为死节点，直接在此
-         * 摘除（同一桶 WRLOCK 内），让后续查找可新建同 key 条目；
-         * tcp_metrics_free 会通过 node.pprev 判断是否已被摘除。 */
         if (INC_REF_NOT_ZERO(metrics)) {
             HASH_BUCKET_UNLOCK(table, index);
             return metrics;
@@ -80,6 +76,10 @@ tcp_metrics* tcp_metrics_get(int family, const uint8_t* dip, uint32_t ifindex)
     }
     metrics->family = family;
     metrics->key = key;
+    /* Use the minimum RTO as the conservative initial RTT. */
+    atomic_init(&metrics->rtt, TCP_RTO_MIN_MS);
+    atomic_init(&metrics->last_rtt_ms, 0);
+    atomic_init(&metrics->rttvar, 0);
     hash_link_node_locked(table, index, &metrics->node, value);
     HASH_BUCKET_UNLOCK(table, index);
     return metrics;
@@ -87,19 +87,26 @@ tcp_metrics* tcp_metrics_get(int family, const uint8_t* dip, uint32_t ifindex)
 
 uint32_t tcp_metrics_default_rto(void)
 {
-    return TCP_RTO_MIN_MS * 5u;
+    return TCP_RTO_MIN_MS;
+}
+
+uint32_t tcp_metrics_srtt(const tcp_metrics* metrics)
+{
+    return atomic_load_explicit(&metrics->rtt, memory_order_relaxed);
 }
 
 uint32_t tcp_metrics_sample(tcp_metrics* metrics, uint32_t measured_rtt)
 {
     /* RFC 6298: alpha=1/8, beta=1/4, clock granularity=1 ms。
-     * rtt/rttvar 为原子字段，多 worker 并发采样/读取无数据竞争；
-     * 两字段非同一时刻一致（可能一旧一新），对启发式估计可接受。 */
+     * RTT 字段均为原子字段，多 worker 并发采样/读取无数据竞争；
+     * 各字段非同一时刻一致（可能一旧一新），对启发式估计可接受。 */
     if ( measured_rtt == 0)
         return tcp_metrics_rto(metrics);
 
+    uint32_t last_rtt = atomic_load_explicit(&metrics->last_rtt_ms,
+                                             memory_order_relaxed);
     uint32_t rtt = atomic_load_explicit(&metrics->rtt, memory_order_relaxed);
-    if (rtt == 0) {
+    if (!last_rtt) {
         atomic_store_explicit(&metrics->rtt, measured_rtt,
                               memory_order_relaxed);
         atomic_store_explicit(&metrics->rttvar, measured_rtt / 2u,
@@ -116,6 +123,8 @@ uint32_t tcp_metrics_sample(tcp_metrics* metrics, uint32_t measured_rtt)
             (uint32_t)(((uint64_t)7u * rtt + measured_rtt) / 8u),
             memory_order_relaxed);
     }
+    atomic_store_explicit(&metrics->last_rtt_ms, measured_rtt,
+                          memory_order_relaxed);
 
     return tcp_metrics_rto(metrics);
 }

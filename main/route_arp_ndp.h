@@ -66,6 +66,7 @@ typedef ndp_key  arp_key;
 /* ── 通用搜索 / 增删接口 ─────────────────────────────────── */
 
 route_info* search_route_table(const route_key* key);
+uint64_t    route_table_generation(sa_family_t family);
 ndp_info*   search_ndp_table(const ndp_key* key);
 int         resolve_neighbor_entry(const ndp_key* key, ndp_info** result);
 bool        search_best_saddr_by_daddr(const route_key* key, route_key* answer);
@@ -119,8 +120,6 @@ static inline bool route_is_broadcast(const route_info* info)
 
 static inline bool route_include_nexthop(const route_info* info, const uint8_t* nexthop)
 {
-    if (!info || !nexthop)
-        return false;
     if (info->dst_mask == 0)
         return true;
 
@@ -150,7 +149,14 @@ static inline bool route_include_nexthop(const route_info* info, const uint8_t* 
     return (info->dst_ip[full_bytes] & mask8) == (nexthop[full_bytes] & mask8);
 }
 
-bool route_info_is_valid(const route_info* info);
+/* Validate both the referenced interface and the caller's cached route
+ * generation.  A route object may remain in the FIB across unrelated route
+ * updates, so the generation belongs to the cache owner (socket/skb). */
+bool route_info_is_valid(const route_info* info, uint64_t cached_generation);
+bool route_cache_key_matches(const route_info* route, uint64_t generation,
+                             sa_family_t family, const uint8_t* cached_dest,
+                             uint32_t cached_scope_id,
+                             const uint8_t* dest, uint32_t scope_id);
 uint32_t get_route_mtu(const route_info* info);
 
 #endif /* ROUTE_ARP_NDP_H */

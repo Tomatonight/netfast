@@ -60,7 +60,8 @@ struct thread {
 
 	pthread_spinlock_t wheel_lock;  /* protects wheel_*_list / cursors */
 	list_node loop_tasks;
-	uint32_t work_pending : 1;      /* a callback left immediately runnable work */
+	list_node socket_timer_queue;
+	pthread_spinlock_t socket_timer_lock;
 	frame_cache frame_cache;
 
 };
@@ -71,8 +72,15 @@ void destroy_task(task* t);
 thread* create_thread(void);
 /* The caller must stop the loop and destroy/unregister all tasks first. */
 void destroy_thread(thread* t);
+/* Both t and tk must be valid; update_task_timer also requires a parent. */
 int register_task(thread* t, task* tk);
 void unregister_task(task* tk);
+
+/* Locked intrusive list used to defer socket timer registration to the
+ * destination worker. */
+void thread_enqueue_socket_timer(thread* t, list_node* node);
+void thread_remove_socket_timer(thread* t, list_node* node);
+list_node* thread_pop_socket_timer(thread* t);
 
 static inline int update_task_timer(task* tk, uint64_t timeout)
 {

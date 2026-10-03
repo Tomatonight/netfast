@@ -439,31 +439,34 @@ data_info* alloc_data_info(uint32_t size)
         return NULL;
     }
     info->slot = slot;
-    info->start = slot->data;
-    info->end = slot->data;
+    info->buf_start = slot->data;
+    info->buf_end = slot->data + slot->slot_size;
+    info->start = info->buf_start;
+    info->end = info->start;
     info->next = NULL;
-    info->size = size ? size : slot->slot_size;
     return info;
 }
-data_info* create_data_info(frame_slot* slot, uint32_t start, uint32_t end)
+data_info* create_data_info(frame_slot* slot, uint32_t buf_start,
+                            uint32_t buf_end, uint32_t start, uint32_t end)
 {
-    if (start > end)
+    if (buf_start > buf_end || start > end || buf_start > start || end > buf_end)
         return NULL;
     bool allocated = slot == NULL;
     if (!slot) {
-        slot = frame_slot_alloc(end);
+        slot = frame_slot_alloc(buf_end);
     }
-    if (!slot || end > slot->slot_size)
+    if (!slot || buf_end > slot->slot_size)
         goto fail;
 
     data_info* info = malloc(sizeof(*info));
     if (!info)
         goto fail;
     info->slot = slot;
+    info->buf_start = slot->data + buf_start;
+    info->buf_end = slot->data + buf_end;
     info->start = slot->data + start;
     info->end = slot->data + end;
     info->next = NULL;
-    info->size = slot->slot_size;
     return info;
 
 fail:

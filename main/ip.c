@@ -19,6 +19,32 @@
 static _Atomic(uint32_t) ip_id;
 static const uint8_t default_ttl = 64;
 
+static bool ipv4_build_output_header(skbuff* skb, uint32_t sip, uint32_t dip)
+{
+    if (skb_data_len(skb) > UINT16_MAX - sizeof(ipv4_hdr))
+        return false;
+
+    uint32_t l2_len = skb->route && skb->route->if_info
+        ? skb->route->if_info->l2_len : 0;
+    ipv4_hdr* ip = (ipv4_hdr*)skb_data_push(
+        skb, sizeof(ipv4_hdr), sizeof(ipv4_hdr) + l2_len);
+    if (!ip)
+        return false;
+    memset(ip, 0, sizeof(*ip));
+    ip->vhl = IPV4_MAKE_VHL(4, 5);
+    ip->tos = (uint8_t)(skb->l4_private.tcp.ip_ecn & 0x03u);
+    ip->tot_len = htons((uint16_t)skb_data_len(skb));
+    ip->id = htons((uint16_t)atomic_fetch_add_explicit(
+        &ip_id, 1u, memory_order_relaxed));
+    ip->ttl = default_ttl;
+    ip->protocol = (uint8_t)skb->protocol;
+    ip->saddr = sip;
+    ip->daddr = dip;
+    ip->check = checksum(ip, sizeof(*ip), 0);
+    skb->ipv4_hdr = ip;
+    return true;
+}
+
 static void ipv4_id_init(void)
 {
     atomic_store_explicit(&ip_id, (uint32_t)get_current_time_ms(),
@@ -105,6 +131,7 @@ int ipv4_recv(skbuff* skb)
 
     ipv4_hdr* ip = (ipv4_hdr*)skb_start(skb);
     skb->ipv4_hdr = ip;
+    skb->l4_private.tcp.ip_ecn = (uint8_t)(ip->tos & 0x03u);
     if (!ipv4_validate_header(skb))
         return -1;
 
@@ -139,7 +166,7 @@ int ipv4_recv(skbuff* skb)
 
     ip = skb->ipv4_hdr;
     uint32_t ipv4_hdr_len = (uint32_t)IPV4_VHL_IHL(ip->vhl) * 4u;
-    if (skb_consume(skb, ipv4_hdr_len, true) != ipv4_hdr_len) {
+    if (!skb_consume(skb, ipv4_hdr_len, true)) {
         if (skb->flag.is_defrag)
             PUT_REF(skb);
         return -1;
@@ -177,26 +204,27 @@ int ipv4_output(skbuff* skb)
             return -1;
         route = skb->route;
 
-        if (skb_data_len(skb) > UINT16_MAX - sizeof(ipv4_hdr))
-            return -1;
+        if (skb->protocol == IPPROTO_TCP &&
+            route->if_info->mtu > sizeof(ipv4_hdr) &&
+            skb_data_len(skb) > route->if_info->mtu - sizeof(ipv4_hdr)) {
+            if (!tcp_skb_frag(skb, route->if_info->mtu))
+                return -1;
+        }
 
-        ipv4_hdr* ip = (ipv4_hdr*)skb_data_push(skb, sizeof(ipv4_hdr));
-        if (!ip)
+        if (!ipv4_build_output_header(skb, sip, dip))
             return -1;
-        memset(ip, 0, sizeof(*ip));
-        ip->vhl = IPV4_MAKE_VHL(4, 5);
-        ip->tot_len = htons((uint16_t)skb_data_len(skb));
-        ip->id = htons((uint16_t)atomic_fetch_add_explicit(
-            &ip_id, 1u, memory_order_relaxed));
-        ip->ttl = default_ttl;
-        ip->protocol = (uint8_t)skb->protocol;
-        ip->saddr = sip;
-        ip->daddr = dip;
-        ip->check = checksum(ip, sizeof(*ip), 0);
-        skb->ipv4_hdr = ip;
+        if (skb->frag_list.next) {
+            skbuff* frag;
+            FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
+                if (!ipv4_build_output_header(frag, sip, dip))
+                    return -1;
+            }
+        }
     }
 
     uint32_t total_size = skb_data_len(skb);
+    if (skb->frag_list.next)
+        return skb_send_frags(skb);
     if (total_size <= route->if_info->mtu)
         return route->if_info->ops->send(route->if_info, skb);
 
@@ -217,8 +245,17 @@ int ipv4_forward(skbuff* skb){
         return -1;
     }
     skb->flag.is_forward=1;
+    /* TTL and protocol occupy one 16-bit word.  Update that word in the
+     * existing checksum (RFC 1624) instead of walking the whole header. */
+    uint16_t old_ttl_protocol = (uint16_t)skb->ipv4_hdr->ttl |
+                                ((uint16_t)skb->ipv4_hdr->protocol << 8);
     skb->ipv4_hdr->ttl--;
-    skb->ipv4_hdr->check = 0;
-    skb->ipv4_hdr->check=checksum((uint16_t*)skb->ipv4_hdr, ((uint32_t)IPV4_VHL_IHL(skb->ipv4_hdr->vhl) * 4u),0);
+    uint16_t new_ttl_protocol = (uint16_t)skb->ipv4_hdr->ttl |
+                                ((uint16_t)skb->ipv4_hdr->protocol << 8);
+    uint32_t sum = (uint16_t)~skb->ipv4_hdr->check +
+                   (uint16_t)~old_ttl_protocol + new_ttl_protocol;
+    while (sum >> 16)
+        sum = (sum & 0xffffu) + (sum >> 16);
+    skb->ipv4_hdr->check = (uint16_t)~sum;
     return ipv4_output(skb);
 }

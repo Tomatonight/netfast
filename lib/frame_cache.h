@@ -65,10 +65,11 @@ static inline frame_slot* frame_slot_from_rx_frame(void* frame)
 
 typedef struct data_info {
     frame_slot* slot;
-    uint8_t* start;
-    uint8_t* end;
+    uint8_t* buf_start; /* usable memory start, analogous to skb->head */
+    uint8_t* buf_end;   /* usable memory end, analogous to skb->end */
+    uint8_t* start;     /* data start, analogous to skb->data */
+    uint8_t* end;       /* data end, analogous to skb->tail */
     struct data_info* next;
-    uint32_t size;
 } data_info;
 
 void frame_global_cache_init(void);
@@ -80,8 +81,14 @@ uint32_t frame_rx_headroom(void);
 frame_slot* frame_slot_alloc(uint32_t min_data_len);
 
 void free_data_info(data_info* info);
+/* Allocate a node whose slot is at least size bytes.  The node initially
+ * exposes the complete slot as its usable buffer and contains no data. */
 data_info* alloc_data_info(uint32_t size);
-data_info* create_data_info(frame_slot* slot, uint32_t start, uint32_t end);
+/* Offsets are relative to slot->data.  Both the usable buffer range and the
+ * valid data range are expressed explicitly and must satisfy
+ * buf_start <= start <= end <= buf_end. */
+data_info* create_data_info(frame_slot* slot, uint32_t buf_start,
+                            uint32_t buf_end, uint32_t start, uint32_t end);
 void copy_data_info(data_info* dst, const data_info* src);
 
 #endif

@@ -49,6 +49,10 @@ typedef struct if_info {
     list_node addr_list;
     const if_ops* ops;
     void* xdp_data[32];
+    /* Cached queue count used by the XDP TX fast path.  It is populated
+     * when the interface is started, so packet sends do not repeatedly
+     * consult the configuration tree. */
+    uint32_t xdp_queue_count;
     list_node list;
     ref_info ref;
 } if_info;

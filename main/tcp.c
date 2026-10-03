@@ -24,156 +24,370 @@
 #include "worker.h"
 #include "xdp.h"
 
-#define TCP_IPV4_DEFAULT_MSS 536
-#define TCP_IPV6_DEFAULT_MSS 1220
-#define TCP_IPV4_MIN_MSS 128
-#define TCP_IPV6_MIN_MSS 128
+#define TCP_IPV4_MIN_MSS 512
+#define TCP_IPV6_MIN_MSS 512
+#define TCP_SKB_CAPACITY_MSS 1u
 
-/* 临时关闭拥塞控制，便于独立调试 TCP 丢包恢复。
- * 设为 1 即可恢复 CUBIC 窗口限制和状态更新。 */
-#define TCP_CONGESTION_CONTROL_ENABLED 0
+#define TCP_XMIT_FLAG_NEW_TRANSMIT (1u << 0)
+#define TCP_XMIT_FLAG_RETRANSMIT   (1u << 1)
+#define TCP_OUTPUT_BURST_MAX                (254u)
 
-/* 生命周期和定时器。 */
 static void tcp_destroy_pcb(tcp_pcb* pcb);
 static void tcp_destroy_socket(Socket* sock);
 static void tcp_timer_cb(task* tk);
 static void tcp_reset_timer(tcp_pcb* pcb);
-static void tcp_update_timer(tcp_pcb* pcb, uint64_t* which,
-                             uint64_t deadline_ms, bool override);
 
-/* 输入状态机。 */
+
 static int tcp_input(Socket* sock, skbuff* skb);
 
-/* 控制报文、数据发送和重传。 */
-static int tcp_send_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag);
-static int tcp_send_syn(Socket* sock, bool with_ack);
-static int tcp_write_xmit(tcp_pcb* pcb);
-static int tcp_fast_retransmit(tcp_pcb* pcb);
-static int tcp_retransmit_skb(tcp_pcb* pcb, skbuff* skb, bool probe);
-static uint32_t tcp_skb_seq_budget(tcp_pcb* pcb, skbuff* skb, bool probe);
-static int tcp_send_probe(tcp_pcb* pcb);
+static int tcp_send_new_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag);
+static int tcp_send_new_syn(Socket* sock);
+static int tcp_send_new(tcp_pcb* pcb);
+static void tcp_commit_fin_send(tcp_pcb* pcb);
+static void tcp_fast_retransmit(tcp_pcb* pcb);
+static void tcp_retransmit_first(tcp_pcb* pcb);
+static uint32_t tcp_skb_budget(tcp_pcb* pcb, skbuff* skb);
+static int tcp_xmit_skb(tcp_pcb* pcb, skbuff* skb, uint32_t ack,
+                        uint32_t xmit_flags);
 
-/* ── 序列空间、窗口和发送定时器基础函数 ─────────────────── */
-
-static inline uint32_t tcp_flags_seq_len(uint8_t flags)
+static inline uint8_t tcp_ecn_tx_flags(tcp_pcb* pcb, uint8_t flags)
 {
-    return ((flags & TCP_FLAG_SYN) ? 1u : 0u) +
-           ((flags & TCP_FLAG_FIN) ? 1u : 0u);
+    if (pcb->tcp_flag.ecn_echo_pending)
+        flags |= TCP_FLAG_ECE;
+    if (pcb->tcp_flag.ecn_cwr_pending) {
+        flags |= TCP_FLAG_CWR;
+        pcb->tcp_flag.ecn_cwr_pending = 0;
+    }
+    return flags;
 }
 
-static inline void tcp_skb_refresh_seq_end(skbuff* skb)
+static inline bool tcp_duplicate_ack(tcp_pcb* pcb, skbuff* skb)
+{
+    tcp_hdr* hdr = skb->tcp_hdr;
+    uint8_t flags = skb->l4_private.tcp.flag;
+    uint32_t ack = ntohl(hdr->ack_seq);
+
+    if (!(flags & TCP_FLAG_ACK))
+        return false;
+    return
+        !(flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) &&
+        skb_data_len(skb) == 0 &&
+        ack == pcb->last_ack &&
+        SEQ_GT(pcb->snd_nxt, pcb->snd_una) &&
+        tcp_decode_window(pcb, ntohs(hdr->window), flags) == pcb->snd_wnd;
+}
+
+static inline void tcp_skb_update_seq_end(skbuff* skb)
 {
     skb->l4_private.tcp.seq_end = skb->l4_private.tcp.seq +
-        skb_data_len(skb) + tcp_flags_seq_len(skb->l4_private.tcp.flag);
+        skb_data_len(skb) +
+        ((skb->l4_private.tcp.flag & TCP_FLAG_SYN) ? 1u : 0u) +
+        ((skb->l4_private.tcp.flag & TCP_FLAG_FIN) ? 1u : 0u);
 }
 
 static inline uint32_t tcp_skb_seq_len(const skbuff* skb)
 {
     return skb->l4_private.tcp.seq_end - skb->l4_private.tcp.seq;
 }
+static inline void tcp_update_mss(tcp_pcb* pcb){
+    /* Bound send MSS by the current route MTU and the peer's MSS. */
+    uint32_t route_mss = pcb->rcv_mss;
+    if (pcb->sock && pcb->sock->route) {
+        uint32_t ip_hdr_len = pcb->sock->family == AF_INET6
+            ? IPV6_HDR_LEN : (uint32_t)sizeof(ipv4_hdr);
+        uint32_t header_len = ip_hdr_len + (uint32_t)sizeof(tcp_hdr);
+        uint32_t mtu = get_route_mtu(pcb->sock->route);
+        route_mss = mtu > header_len ? mtu - header_len : 0;
+        pcb->rcv_mss = route_mss;
+    }
 
-static inline uint32_t tcp_receive_space(const tcp_pcb* pcb)
-{
-    uint32_t used = pcb->sock->recv_buffer_len;
-    return used < pcb->sock->recv_buffer_len_max
-        ? pcb->sock->recv_buffer_len_max - used : 0u;
+    uint32_t mss = min(pcb->peer_mss, route_mss);
+
+    if (TCP_SKB_CAPACITY_MSS == 1) {
+        uint32_t tcp_option_len = MAX_TCP_HDR_LEN - sizeof(tcp_hdr);
+        uint32_t ip_option_len = pcb->sock->family == AF_INET6
+            ? MAX_IP6_HDR_WITH_EXT_LEN - IPV6_HDR_LEN
+            : MAX_IP_HDR_WITH_OPT_LEN - sizeof(ipv4_hdr);
+        uint32_t option_len = tcp_option_len + ip_option_len;
+        mss = mss - option_len;
+    }
+    pcb->snd_mss = mss;
 }
 
-uint32_t tcp_data_mss(const tcp_pcb* pcb)
+static bool tcp_build_frag_header(skbuff* skb, const uint8_t* header,
+                                     uint32_t header_len, uint32_t seq,
+                                     uint8_t flags)
 {
-    /* 时间戳协商成功后，每个报文段需要预留 12 字节 TCP 选项。 */
-    uint32_t option_len = pcb->tcp_flag.peer_ts_ok ? 12u : 0u;
-    return pcb->snd_mss > option_len ? pcb->snd_mss - option_len : 1u;
+    Socket* sock = skb->sock;
+    uint32_t lower_header_len = 0;
+    route_info* route = skb->route ;
+    lower_header_len = route->if_info->l2_len;
+    lower_header_len += sock->family == AF_INET6
+        ? IPV6_HDR_LEN : (uint32_t)sizeof(ipv4_hdr);
+
+    tcp_hdr* tcp = (tcp_hdr*)skb_data_push(
+        skb, header_len, header_len + lower_header_len);
+    if (!tcp)
+        return false;
+    memcpy(tcp, header, header_len);
+    tcp->seq = htonl(seq);
+    tcp->flags = flags;
+    tcp->check = 0;
+    skb->tcp_hdr = tcp;
+    skb->tx_checksum_offset = 0;
+
+    if (skb->route->if_info->hw_tx_checksum_enabled) {
+        tcp->check = skb->family == AF_INET6
+            ? skb_checksum_protocol6(NULL, skb_data_len(skb),
+                                     sock->sip6, sock->dip6, IPPROTO_TCP)
+            : skb_checksum_protocol(NULL, skb_data_len(skb),
+                                    sock->sip, sock->dip, IPPROTO_TCP);
+        skb->tx_checksum_offset = offsetof(tcp_hdr, check);
+    } else {
+        tcp->check = skb->family == AF_INET6
+            ? skb_checksum_protocol6(skb, skb_data_len(skb),
+                                     sock->sip6, sock->dip6, IPPROTO_TCP)
+            : skb_checksum_protocol(skb, skb_data_len(skb),
+                                    sock->sip, sock->dip, IPPROTO_TCP);
+    }
+    return true;
 }
 
-static inline uint32_t tcp_max_hdr_reserve_len(const Socket* sock)
+bool tcp_skb_frag(skbuff* skb, uint32_t mtu)
+{
+    if (skb->family != AF_INET && skb->family != AF_INET6)
+        return false;
+
+    uint32_t ip_hdr_len = skb->family == AF_INET6
+        ? IPV6_HDR_LEN : (uint32_t)sizeof(ipv4_hdr);
+    uint32_t tcp_hdr_len =
+        (uint32_t)(skb->tcp_hdr->doff_res_flags >> 4) * 4u;
+    uint32_t total_len = skb_data_len(skb);
+
+    uint32_t payload_limit = mtu - ip_hdr_len - tcp_hdr_len;
+    uint32_t payload_len = total_len - tcp_hdr_len;
+    if (payload_len <= payload_limit)
+        return true;
+
+    uint8_t header[MAX_TCP_HDR_LEN];
+    if (!skb_copy_bits(skb, 0, header, tcp_hdr_len)) {
+        ERR_LOG("tcp_skb_frag header copy failed total=%u hdr=%u",
+                total_len, tcp_hdr_len);
+        return false;
+    }
+    uint32_t base_seq = skb->l4_private.tcp.seq;
+    uint8_t original_flags = skb->l4_private.tcp.flag;
+
+    if (!skb_consume(skb, tcp_hdr_len, false)) {
+        return false;
+    }
+    if (!skb_frag(skb, payload_limit)) {
+        skb_free_frag_list(skb);
+        return false;
+    }
+
+    uint32_t data_offset = 0;
+    uint32_t syn_len = (original_flags & TCP_FLAG_SYN) ? 1u : 0u;
+    skbuff* frag;
+    bool has_tail = skb->frag_list.next != NULL;
+    uint8_t first_flags = original_flags;
+    if (has_tail)
+        first_flags &= (uint8_t)~(TCP_FLAG_FIN | TCP_FLAG_PSH);
+    if (!tcp_build_frag_header(skb, header, tcp_hdr_len, base_seq,
+                                  first_flags))
+        goto fail;
+    skb->l4_private.tcp.seq = base_seq;
+    skb->l4_private.tcp.flag = first_flags;
+    skb->l4_private.tcp.seq_end = base_seq + skb_data_len(skb) - tcp_hdr_len +
+        ((skb->l4_private.tcp.flag & TCP_FLAG_SYN) ? 1u : 0u) +
+        ((skb->l4_private.tcp.flag & TCP_FLAG_FIN) ? 1u : 0u);
+    data_offset += skb_data_len(skb) - tcp_hdr_len;
+
+    FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
+        bool last = frag->frag_list.next == NULL;
+        uint8_t flags = original_flags;
+        if (data_offset != 0)
+            flags &= (uint8_t)~TCP_FLAG_SYN;
+        if (!last)
+            flags &= (uint8_t)~(TCP_FLAG_FIN | TCP_FLAG_PSH);
+        uint32_t seq = base_seq + syn_len + data_offset;
+        uint32_t frag_payload_len = skb_data_len(frag);
+        if (!tcp_build_frag_header(frag, header, tcp_hdr_len, seq, flags))
+            goto fail;
+        frag->l4_private.tcp.seq = seq;
+        frag->l4_private.tcp.flag = flags;
+        frag->l4_private.tcp.seq_end = seq + frag_payload_len +
+            ((flags & TCP_FLAG_SYN) ? 1u : 0u) +
+            ((flags & TCP_FLAG_FIN) ? 1u : 0u);
+        data_offset += frag_payload_len;
+    }
+    return true;
+
+fail:
+    skb_free_frag_list(skb);
+    return false;
+}
+
+static inline uint32_t tcp_hdr_reserve_len(const Socket* sock)
 {
     uint32_t ip_hdr_len = sock->family == AF_INET6
-        ? MAX_IP6_HDR_WITH_EXT_LEN : MAX_IP_HDR_WITH_OPT_LEN;
+        ? MAX_IP6_HDR_WITH_EXT_LEN : sizeof(ipv4_hdr);
     uint32_t l2_len = sock->route->if_info->l2_len;
-
     return l2_len + ip_hdr_len + MAX_TCP_HDR_LEN;
 }
 
+static inline uint32_t tcp_skb_capacity(const tcp_pcb* pcb)
+{
+    return pcb->snd_mss * TCP_SKB_CAPACITY_MSS;
+}
+
+static inline uint64_t tcp_cwnd_limit(tcp_pcb* pcb)
+{
+    if(pcb->tcp_flag.peer_sack_ok) {
+        uint64_t acked_bytes = tcp_sack_acked_bytes(pcb);
+        return pcb->snd_cwnd + acked_bytes;
+    }
+    return (pcb->snd_cwnd);
+}
+static inline uint64_t tcp_win_limit(tcp_pcb* pcb)
+{
+    return min(pcb->snd_wnd, tcp_cwnd_limit(pcb));
+}
 static void tcp_update_persist_timer(tcp_pcb* pcb)
 {
-    if (!pcb->snd_wnd && pcb->persist_deadline_ms == TCP_TIMER_STOP &&
-        (pcb->retransmit_queue.element_number ||
-         pcb->sock->send_queue.element_number)) {
-        tcp_update_timer(pcb, &pcb->persist_deadline_ms,
-                         get_current_time_ms() + pcb->persist_backoff, false);
+    bool pending = pcb->retransmit_tree.count ||
+                   pcb->sock->send_queue.element_number;
+    if (!pcb->snd_wnd && pending) {
+        if (pcb->persist_deadline_ms == TCP_TIMER_STOP){
+            pcb->persist_backoff = TCP_PERSIST_BACKOFF_MS_DEFAULT;
+            pcb->persist_probes_out = 0;
+            tcp_update_timer(pcb, &pcb->persist_deadline_ms,
+                             get_current_time_ms() + pcb->persist_backoff,
+                             false);
+
+        }
+    } else {
+        if (pcb->persist_deadline_ms != TCP_TIMER_STOP)
+            tcp_update_timer(pcb, &pcb->persist_deadline_ms,
+                             TCP_TIMER_STOP, false);
     }
 }
 
-static void tcp_update_send_timer(tcp_pcb* pcb)
+static void tcp_update_transmit_timer(tcp_pcb* pcb)
 {
     Socket* sock = pcb->sock;
-    uint32_t send_limit = pcb->snd_cwnd < pcb->snd_wnd
-        ? (uint32_t)pcb->snd_cwnd : pcb->snd_wnd;
-
-
-    if (!pcb->retransmit_queue.element_number || !send_limit) {
+    /*
+    if (!pcb->retransmit_tree.count || !pcb->snd_wnd) {
         tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                          TCP_TIMER_STOP, true);
     } else if (pcb->retransmit_deadline_ms == TCP_TIMER_STOP) {
         tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                          get_current_time_ms()+ pcb->retransmit_timeout, false);
     }
-
-    bool sendable = sock->send_queue.element_number && send_limit &&
-                    SEQ_LT(pcb->snd_nxt, pcb->snd_una + send_limit);
+    */
+    bool sendable = sock->send_queue.element_number &&
+                    tcp_win_limit(pcb) >
+                        (uint32_t)(pcb->snd_nxt - pcb->snd_una);
 
     if (!sendable) {
         tcp_update_timer(pcb, &pcb->nagle_deadline_ms, TCP_TIMER_STOP, false);
-    } else {
-        if(pcb->nagle_deadline_ms == TCP_TIMER_STOP)
-            tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
+    } else if(pcb->nagle_deadline_ms == TCP_TIMER_STOP){
+        tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
                          get_current_time_ms() , false);
     }
 }
 
 static void tcp_update_sndwin(tcp_pcb* pcb, uint32_t new_wnd){
-    uint32_t old_wnd = pcb->snd_wnd;
-    if(old_wnd == new_wnd)
+    new_wnd = new_wnd - new_wnd % pcb->snd_mss;
+    if (pcb->snd_wnd == new_wnd)
         return;
-    if (new_wnd == 0) {
-        pcb->persist_probes_out = 0;
-    }
-    else if(old_wnd == 0){
-        //old win is 0 ,new > 0
-        pcb->persist_backoff = TCP_PERSIST_BACKOFF_MS_DEFAULT;
-        pcb->persist_probes_out = 0;
-        tcp_update_timer(pcb, &pcb->persist_deadline_ms, TCP_TIMER_STOP, true);
-    }
     pcb->snd_wnd = new_wnd;
     tcp_update_persist_timer(pcb);
-    tcp_update_send_timer(pcb);
+    tcp_update_transmit_timer(pcb);
 
 }
 
 void tcp_update_sndcwnd(tcp_pcb* pcb, uint64_t new_cwnd)
 {
+
     if (pcb->snd_cwnd == new_cwnd)
         return;
 
     pcb->snd_cwnd = new_cwnd;
-    tcp_update_send_timer(pcb);
+    tcp_update_transmit_timer(pcb);
 }
 
-static skbuff* tcp_retransmit_enqueue(tcp_pcb* pcb, skbuff* skb)
+
+void tcp_skb_tree_insert(tcp_skb_tree* tree, skbuff* skb,
+                         size_t node_offset)
 {
-    tcp_sack_clear_skb_state(skb);
-    add_queue(&pcb->retransmit_queue, &skb->queue_node);
-    return skb;
+    struct rb_node** link = &tree->root.rb_node;
+    struct rb_node* parent = NULL;
+    struct rb_node* skb_node = (struct rb_node*)((uint8_t*)skb + node_offset);
+    uint32_t seq = skb->l4_private.tcp.seq;
+    uint32_t seq_end = skb->l4_private.tcp.seq_end;
+
+    while (*link) {
+        skbuff* queued = skb_from_node(*link, node_offset);
+        parent = *link;
+        if (SEQ_LT(seq, queued->l4_private.tcp.seq) ||
+            (seq == queued->l4_private.tcp.seq &&
+             SEQ_LT(seq_end, queued->l4_private.tcp.seq_end)))
+            link = &(*link)->rb_left;
+        else
+            link = &(*link)->rb_right;
+    }
+
+    rb_link_node(skb_node, parent, link);
+    rb_insert_color(skb_node, &tree->root);
+    tree->count++;
 }
-static inline bool tcp_should_send_timestamps(const tcp_pcb* pcb,
-                                              uint8_t flags)
+
+void tcp_skb_tree_remove(tcp_skb_tree* tree, skbuff* skb,
+                         size_t node_offset)
 {
-    /* Offer timestamps on an active-open SYN.  A SYN-ACK may echo the
-     * option only after it was observed in the incoming SYN. */
-    return pcb->tcp_flag.peer_ts_ok ||
-        ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == TCP_FLAG_SYN);
+    struct rb_node* node = (struct rb_node*)((uint8_t*)skb + node_offset);
+    rb_erase(node, &tree->root);
+    rb_init_node(node);
+    tree->count--;
 }
+
+skbuff* tcp_skb_tree_lower_bound(const tcp_skb_tree* tree, uint32_t seq,
+                                 size_t node_offset)
+{
+    struct rb_node* node = tree->root.rb_node;
+    skbuff* result = NULL;
+
+    while (node) {
+        skbuff* skb = skb_from_node(node, node_offset);
+        if (SEQ_GEQ(skb->l4_private.tcp.seq, seq)) {
+            result = skb;
+            node = node->rb_left;
+        } else {
+            node = node->rb_right;
+        }
+    }
+    return result;
+}
+
+skbuff* tcp_skb_tree_prev_lower_bound(const tcp_skb_tree* tree, uint32_t seq,
+                                      size_t node_offset)
+{
+    struct rb_node* node = tree->root.rb_node;
+    skbuff* result = NULL;
+
+    while (node) {
+        skbuff* skb = skb_from_node(node, node_offset);
+        if (SEQ_LT(skb->l4_private.tcp.seq, seq)) {
+            result = skb;
+            node = node->rb_right;
+        } else {
+            node = node->rb_left;
+        }
+    }
+    return result;
+}
+
 
 static inline bool tcp_deadline_due(uint64_t now_ms, uint64_t *deadline_ms)
 {
@@ -187,7 +401,6 @@ static inline bool tcp_deadline_due(uint64_t now_ms, uint64_t *deadline_ms)
     return false;
 }
 
-/* ── PCB 初始化与接收重排队列 ──────────────────────────── */
 
 static int tcp_pcb_init(Socket* sock){
     tcp_pcb* pcb = calloc(1, sizeof(*pcb));
@@ -197,7 +410,11 @@ static int tcp_pcb_init(Socket* sock){
     sock->pcb=pcb;
     pcb->sock=sock;
     pcb->state=TCP_STATE_CLOSED;
-    init_queue(&pcb->retransmit_queue);
+    pcb->retransmit_tree.root = RB_ROOT;
+    pcb->retransmit_tree.count = 0;
+    pcb->reorder_tree.root = RB_ROOT;
+    pcb->reorder_tree.count = 0;
+    tcp_rack_init(pcb);
 
     pcb->timer_task = create_task(TASK_TYPE_TIMER);
     if (!pcb->timer_task)
@@ -219,13 +436,13 @@ static int tcp_pcb_init(Socket* sock){
     pcb->nagle_interval    = TCP_NAGLE_INTERVAL_MS_DEFAULT;
     pcb->connect_timeout = TCP_CONNECT_TIMEOUT_MS_DEFAULT;
 
-    pcb->peer_mss = sock->family == AF_INET6 ? TCP_IPV6_DEFAULT_MSS : TCP_IPV4_DEFAULT_MSS;
-    pcb->snd_mss = pcb->peer_mss;
-    pcb->rcv_mss = pcb->snd_mss;
+    pcb->peer_mss = sock->family == AF_INET6 ? TCP_IPV6_MIN_MSS : TCP_IPV4_MIN_MSS;
+    pcb->rcv_mss = pcb->peer_mss;
+    tcp_update_mss(pcb);
     pcb->rcv_wnd = sock->recv_buffer_len_max;
     pcb->rcv_wnd_scale = TCP_RCV_WND_SCALE_DEFAULT;
     pcb->snd_wnd = pcb->rcv_wnd;//tmp set
-    /* 每个正常运行的 PCB 都必须持有已初始化的拥塞控制策略。 */
+
     if (tcp_ca_init(pcb) < 0)
         goto fail;
 
@@ -252,142 +469,110 @@ fail:
     return -1;
 }
 
-static bool tcp_process_received_data(tcp_pcb* pcb, skbuff* skb){
+static void tcp_receive_data(tcp_pcb* pcb, skbuff* skb){
     uint32_t seq = skb->l4_private.tcp.seq;
-    uint32_t data_len = skb_data_len(skb);
-    bool has_fin = (skb->l4_private.tcp.flag & TCP_FLAG_FIN) != 0;
-    uint32_t fin_seq = seq + data_len;
-    if (!data_len && !has_fin)
-        return false;
+    uint32_t seg_len = tcp_skb_seq_len(skb);
+    bool out_of_order = SEQ_GT(seq, pcb->rcv_nxt);
 
     /* Trim data before rcv_nxt (retransmitted/overlapping prefix) */
     if(SEQ_LT(seq, pcb->rcv_nxt)){
         uint32_t overlap = pcb->rcv_nxt - seq;
-        uint32_t data_overlap = min(overlap, data_len);
-        if (data_overlap) {
-            skb_consume(skb, data_overlap, false);
-            seq += data_overlap;
-            data_len = skb_data_len(skb);
+        if(overlap >= seg_len){
+            goto schedule_ack;
         }
-        if (overlap > data_overlap) {
-            return false;
-        }
+        skb_consume(skb, overlap, false);
+        seq += overlap;
+        seg_len -= overlap;
         skb->l4_private.tcp.seq = seq;
     }
-
-    /* Trim data beyond receive window (exceeds rcv_nxt + rcv_wnd) */
-    uint32_t window_end = pcb->rcv_nxt + pcb->rcv_wnd;
-    if(data_len && SEQ_GT(seq + data_len, window_end)){
-        uint32_t overlap = (seq + data_len) - window_end;
-        if (overlap >= data_len) {
-            return false;
+    if(SEQ_GT(seq + seg_len, pcb->rcv_nxt + pcb->rcv_wnd)){
+        uint32_t overlap = seq + seg_len - (pcb->rcv_nxt + pcb->rcv_wnd);
+        if(overlap >= seg_len){
+            goto schedule_ack;
         }
-        skb_truncate(skb, skb_data_len(skb) - overlap);
-        data_len = skb_data_len(skb);
+        if(skb->l4_private.tcp.flag & TCP_FLAG_FIN){
+            skb->l4_private.tcp.flag &= ~TCP_FLAG_FIN;
+            overlap--;
+        }
+        skb_truncate(skb, skb_data_len(skb) - overlap );
+        tcp_skb_update_seq_end(skb);
     }
 
-    /* FIN occupies sequence space but is retained only when its exact
-     * position remains inside the receive window after payload trimming. */
-    if (has_fin && (fin_seq != seq + data_len || !pcb->rcv_wnd ||
-        SEQ_LT(fin_seq, pcb->rcv_nxt) || !SEQ_LT(fin_seq, window_end))) {
-        skb->l4_private.tcp.flag &= ~TCP_FLAG_FIN;
-        has_fin = false;
-    }
-    if (!data_len && !has_fin)
-        return false;
-
-    if (pcb->unordered_skb_count >= TCP_OOO_SKB_MAX &&
+    if (pcb->reorder_tree.count >= TCP_OOO_SKB_MAX &&
         seq != pcb->rcv_nxt)
-        return false;
+        goto schedule_ack;
 
-    bool out_of_order = SEQ_GT(seq, pcb->rcv_nxt);
-    skb->l4_private.tcp.seq = seq;
-    skb->l4_private.tcp.seq_end = seq + data_len + (has_fin ? 1u : 0u);
-
-    /* Insert the complete segment by sequence number first.  Equal sequence
-     * numbers remain adjacent and are handled when they reach the head. */
-    list_node* insert_after = &pcb->unordered_skb_list;
-    list_node* node = pcb->unordered_skb_list.next;
-    while (node) {
-        skbuff* queued = (skbuff*)((uint8_t*)node -
-                                  offsetof(skbuff, tcp_list));
-        if (SEQ_GT(queued->l4_private.tcp.seq, seq))
-            break;
-        insert_after = node;
-        node = node->next;
-    }
     INC_REF(skb);
-    add_list_node(insert_after, &skb->tcp_list);
-    pcb->unordered_skb_count++;
+    TCP_TREE_INSERT(pcb, reorder, skb);
     if (out_of_order)
-        tcp_sack_receiver_update(pcb, seq,
-                                 skb->l4_private.tcp.seq_end);
+        tcp_sack_recv_ooo_skb(pcb, skb);
 
-    /* Consume only the now in-order prefix of the reorder queue. */
-    bool accepted = true;
-    bool delivered_any = false;
-    while (pcb->unordered_skb_list.next) {
-        skbuff* it = (skbuff*)((uint8_t*)pcb->unordered_skb_list.next -
-                              offsetof(skbuff, tcp_list));
-        uint32_t it_seq = it->l4_private.tcp.seq;
-        uint32_t it_seq_end = it->l4_private.tcp.seq_end;
 
-        /* The whole segment has already been delivered. */
-        if (SEQ_LEQ(it_seq_end, pcb->rcv_nxt)) {
-            remove_list_node(&it->tcp_list);
-            pcb->unordered_skb_count--;
-            if (it == skb)
-                accepted = false;
-            PUT_REF(it);
-            continue;
-        }
+    if(!out_of_order){
+        skbuff* it;
+        while ((it = TCP_TREE_FIRST(pcb, reorder))) {
+                uint32_t it_seq = it->l4_private.tcp.seq;
+                uint32_t it_seq_end = it->l4_private.tcp.seq_end;
 
-        /* A gap remains before this segment, so later entries cannot be
-         * consumed either because the queue is ordered by seq. */
-        if (SEQ_GT(it_seq, pcb->rcv_nxt))
-            break;
+                if (SEQ_LEQ(it_seq_end, pcb->rcv_nxt)) {
+                    tcp_skb_tree_remove(&pcb->reorder_tree, it,
+                                        offsetof(skbuff, reorder_node));
+                    PUT_REF(it);
+                    continue;
+                }
 
-        /* Discard the prefix that overlaps data already delivered. */
-        if (SEQ_LT(it_seq, pcb->rcv_nxt)) {
-            skb_consume(it, pcb->rcv_nxt - it_seq, false);
-            it->l4_private.tcp.seq = pcb->rcv_nxt;
-        }
+                if (SEQ_GT(it_seq, pcb->rcv_nxt))
+                    break;
 
-        bool it_has_fin =
-            (it->l4_private.tcp.flag & TCP_FLAG_FIN) != 0;
-        uint32_t next_seq = it_seq_end - (it_has_fin ? 1u : 0u);
-        remove_list_node(&it->tcp_list);
-        pcb->unordered_skb_count--;
-        add_queue(&pcb->sock->recv_queue, &it->queue_node);
-        pcb->sock->recv_buffer_len += skb_data_len(it);
-        pcb->rcv_nxt = next_seq;
-        delivered_any |= skb_data_len(it) != 0;
+                tcp_skb_tree_remove(&pcb->reorder_tree, it,
+                                    offsetof(skbuff, reorder_node));
 
-        if (it_has_fin) {
-            pcb->tcp_flag.recv_fin = 1;
-            break;
-        }
-    }
-    if (delivered_any)
+                /* Discard the prefix that overlaps data already delivered. */
+                if (SEQ_LT(it_seq, pcb->rcv_nxt)) {
+                    skb_consume(it, pcb->rcv_nxt - it_seq, false);
+                    it->l4_private.tcp.seq = pcb->rcv_nxt;
+                }
+
+                add_queue(&pcb->sock->recv_queue, &it->queue_node);
+                pcb->sock->recv_buffer_len += skb_data_len(it);
+                pcb->rcv_nxt += tcp_skb_seq_len(it);
+
+                if (it->l4_private.tcp.flag & TCP_FLAG_FIN) {
+                    pcb->tcp_flag.recv_fin = 1;
+                    break;
+                }
+            }
         socket_notify_event(pcb->sock, notify_data_read);
-    tcp_sack_receiver_prune(pcb);
-    pcb->rcv_wnd = tcp_receive_space(pcb);
-    return accepted;
+        tcp_sack_rcv_nxt_advance(pcb);
+        pcb->rcv_wnd = SOCKET_USEABLE_RECV_BUFF_SIZE(pcb->sock);
+    }
+
+schedule_ack:
+    if (out_of_order) {
+        tcp_update_timer(pcb, &pcb->ack_deadline_ms,
+                         get_current_time_ms(), true);
+    } else {
+        uint64_t deadline = ++pcb->ack_pending_segments >= 3
+            ? get_current_time_ms()
+            : get_current_time_ms() + pcb->ack_timeout;
+        tcp_update_timer(pcb, &pcb->ack_deadline_ms, deadline, false);
+    }
 }
 
-/* ── 连接生命周期与统一 TCP 定时器 ─────────────────────── */
+/* ── 连接生命周期与统一 TCP 定时�?─────────────────────── */
 
 static void tcp_abort_connect(Socket* sock)
 {
     tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
 
-    /* Remove the tuple while the concrete addresses are still present. */
     if (sock->flag.is_hash)
         uninstall_tuple(sock, tcp_tuple_hash(sock->family));
 
     skbuff* skb;
-    while ((skb = SKB_FROM_NODE(pop_queue(&pcb->retransmit_queue), queue_node)))
+    while ((skb = TCP_TREE_FIRST(pcb, retransmit))) {
+        TCP_REMOVE_RETRASMIT(pcb, skb);
         PUT_REF(skb);
+    }
 
     tcp_sack_reset(pcb);
 
@@ -428,26 +613,23 @@ static void tcp_destroy_socket(Socket* sock){
 }
 
 
-static void tcp_update_timer(tcp_pcb* pcb,uint64_t * which, uint64_t deadline_ms, bool override)
+void tcp_update_timer(tcp_pcb* pcb, uint64_t* which,
+                      uint64_t deadline_ms, bool override)
 {
-    if (*which == deadline_ms) {
+    if (*which == deadline_ms ||
+        (!override && *which != TCP_TIMER_STOP && *which < deadline_ms))
         return;
-    }
 
-    if (*which == TCP_TIMER_STOP || *which > deadline_ms || override) {
-        task* tk = pcb->timer_task;
-        uint64_t old_deadline_ms = *which;
-        *which = deadline_ms;
+    task* tk = pcb->timer_task;
+    bool reset = !tk->registered || *which == tk->timeout;
+    *which = deadline_ms;
 
-        if (!tk->registered || old_deadline_ms == tk->timeout) {
-            /* task 未安排，或者修改的是当前最早 deadline，需要重新选择。 */
-            tcp_reset_timer(pcb);
-        } else if (deadline_ms != TCP_TIMER_STOP &&
-                (tk->timeout == TCP_TIMER_STOP ||
-                    deadline_ms < tk->timeout)) {
-            tk->timeout = deadline_ms;
-            register_task(pcb->sock->owner->master, tk);
-        }
+    if (reset) {
+        tcp_reset_timer(pcb);
+    } else if (deadline_ms != TCP_TIMER_STOP &&
+               deadline_ms < tk->timeout) {
+        tk->timeout = deadline_ms;
+        register_task(pcb->sock->owner->master, tk);
     }
 }
 
@@ -456,7 +638,7 @@ static void tcp_reset_timer(tcp_pcb* pcb)
     task* tk = pcb->timer_task;
     uint64_t next = 0;
     uint64_t timeouts[] = {
-        pcb->fast_retransmit_deadline_ms,
+        pcb->recovery_deadline_ms,
         pcb->keepalive_deadline_ms,
         pcb->retransmit_deadline_ms,
         pcb->persist_deadline_ms,
@@ -489,13 +671,12 @@ static void tcp_timer_cb(task* tk)
     if (tcp_deadline_due(now_ms, &pcb->nagle_deadline_ms)) {
         fired++;
         if (sock->send_queue.element_number)
-            ret = tcp_write_xmit(pcb);
+            ret = tcp_send_new(pcb);
     }
-    /* A data RTO invalidates SACK recovery state, so it takes precedence when
-     * both recovery timers expire in the same callback. */
+
     if (tcp_deadline_due(now_ms, &pcb->retransmit_deadline_ms)) {
         fired++;
-        if(pcb->retransmit_queue.element_number){
+        if(pcb->retransmit_tree.count){
             if (pcb->state == TCP_STATE_SYN_SENT ||
                 pcb->state == TCP_STATE_SYN_RECEIVED) {
                 /* SYN retransmission with exponential backoff */
@@ -508,19 +689,14 @@ static void tcp_timer_cb(task* tk)
                 tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                                 get_current_time_ms() + pcb->connect_timeout, true);
             } else {
-                /* 启用拥塞控制时，数据 RTO 会在重传前进入 LOSS 状态；
-                 * SYN 重试和 persist 探测使用独立路径。 */
+
                 if (pcb->retransmits_out++ >= pcb->retries_max) {
                     sock->error = ETIMEDOUT;
                     tcp_destroy_socket(sock);
                     return;
                 }
 
-                pcb->sack_rto_events++;
-                pcb->fast_retransmit_deadline_ms = TCP_TIMER_STOP;
-                /* SACK is advisory and the receiver may renege.  A real RTO
-                 * therefore starts again from the cumulative ACK point. */
-                tcp_sack_clear_scoreboard(pcb);
+                pcb->recovery_deadline_ms = TCP_TIMER_STOP;
                 tcp_ca_rto_timeout(pcb);
 
                 pcb->retransmit_timeout =
@@ -529,25 +705,25 @@ static void tcp_timer_cb(task* tk)
                                 get_current_time_ms() + pcb->retransmit_timeout,
                                 true);
             }
-            skbuff* skb = SKB_FROM_NODE(
-                get_queue_first(&pcb->retransmit_queue), queue_node);
-            ret = tcp_retransmit_skb(pcb, skb, false);
+            skbuff* skb = TCP_TREE_FIRST(pcb, retransmit);
+            tcp_retransmit_skb(pcb, skb);
         }
     } else if (tcp_deadline_due(now_ms,
-                               &pcb->fast_retransmit_deadline_ms)) {
+                               &pcb->recovery_deadline_ms)) {
         fired++;
-        if (pcb->retransmit_queue.element_number) {
-            ret = tcp_fast_retransmit(pcb);
-            DEBUG_LOG("TCP fast retransmit timer fired");
+        if (pcb->retransmit_tree.count) {
+            tcp_fast_retransmit(pcb);
+            //DEBUG_LOG("TCP recovery timer fired");
         }
     }
     if (tcp_deadline_due(now_ms, &pcb->ack_deadline_ms)) {
         fired++;
-        ret = tcp_send_flag(sock, pcb->snd_nxt, pcb->rcv_nxt, TCP_FLAG_ACK);
+        ret = tcp_send_new_flag(sock, pcb->snd_nxt, pcb->rcv_nxt, TCP_FLAG_ACK);
     }
     if (tcp_deadline_due(now_ms, &pcb->persist_deadline_ms)) {
         fired++;
-        if (!pcb->snd_wnd && (pcb->retransmit_queue.element_number || sock->send_queue.element_number)) {
+        if (!pcb->snd_wnd && (pcb->retransmit_tree.count ||
+                              sock->send_queue.element_number)) {
             if (pcb->persist_probes_out++ >= pcb->retries_max) {
                 sock->error = ETIMEDOUT;
                 tcp_destroy_socket(sock);
@@ -556,7 +732,8 @@ static void tcp_timer_cb(task* tk)
             pcb->persist_backoff = min(pcb->persist_backoff * 2,
                                        TCP_PERSIST_BACKOFF_MS_MAX);
             tcp_update_timer(pcb, &pcb->persist_deadline_ms, get_current_time_ms() + pcb->persist_backoff, true);
-            ret = tcp_send_probe(pcb);
+            ret = tcp_send_new_flag(sock, pcb->snd_una - 1u, pcb->rcv_nxt,
+                                TCP_FLAG_ACK);
         }
     }
     if (tcp_deadline_due(now_ms, &pcb->timewait_deadline_ms)) {
@@ -575,12 +752,7 @@ static void tcp_timer_cb(task* tk)
     }
     if (tcp_deadline_due(now_ms, &pcb->keepalive_deadline_ms)) {
         fired++;
-        if (!sock->options.keepalive ||
-            pcb->state == TCP_STATE_CLOSED ||
-            pcb->state == TCP_STATE_LISTEN ||
-            pcb->state == TCP_STATE_SYN_SENT ||
-            pcb->state == TCP_STATE_TIME_WAIT ||
-            (pcb->state == TCP_STATE_FIN_WAIT_2 && !sock->fd_entry)) {
+        if (!sock->options.keepalive) {
             pcb->keepalive_repeat_count = 0;
         } else if(pcb->keepalive_repeat_count++ >= pcb->keepalive_repeat_max){
             sock->error = ETIMEDOUT;
@@ -590,14 +762,13 @@ static void tcp_timer_cb(task* tk)
             tcp_update_timer(pcb, &pcb->keepalive_deadline_ms,
                              get_current_time_ms() + pcb->keepalive_retry_timeout,
                              false);
-            ret = tcp_send_flag(sock, pcb->snd_una - 1, pcb->rcv_nxt,
+            ret = tcp_send_new_flag(sock, pcb->snd_una - 1, pcb->rcv_nxt,
                                 TCP_FLAG_ACK);
         }
     }
 
-    /* Every timer class is dispatched at most once per callback.  Re-arm
-     * anything scheduled by a handler, including an immediately due timer,
-     * after all other expired classes have had a chance to run. */
+
+
     tcp_reset_timer(pcb);
 
     DEBUG_LOG("TCP timer: fired=%u ret=%d", fired, ret);
@@ -639,12 +810,13 @@ static void tcp_destroy_pcb(tcp_pcb *pcb)
     PUT_REF(pcb->metrics);
     tcp_clear_associated_sockets(pcb);
     skbuff* skb;
-    list_node* tmp;
-    FOR_EACH_LIST_SAFE_OFFSET(&pcb->unordered_skb_list, skb, tmp, skbuff, tcp_list){
-        remove_list_node(&skb->tcp_list);
+    while ((skb = TCP_TREE_FIRST(pcb, reorder))) {
+        tcp_skb_tree_remove(&pcb->reorder_tree, skb,
+                            offsetof(skbuff, reorder_node));
         PUT_REF(skb);
     }
-    while ((skb = SKB_FROM_NODE(pop_queue(&pcb->retransmit_queue), queue_node))) {
+    while ((skb = TCP_TREE_FIRST(pcb, retransmit))) {
+        TCP_REMOVE_RETRASMIT(pcb, skb);
         PUT_REF(skb);
     }
     if(pcb->sock)
@@ -677,24 +849,7 @@ static int tcp_set_socket_route(Socket* sock, const uint8_t* dip,
         pcb->retransmit_timeout = tcp_metrics_rto(pcb->metrics);
     }
 
-    uint32_t ip_hdr_len = sock->family == AF_INET6
-        ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
-    uint32_t mtu = get_route_mtu(sock->route);
-    uint32_t headers = sizeof(tcp_hdr) + ip_hdr_len;
-
-    uint32_t route_mss = mtu - headers;
-    uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-
-    /* 一个待发送 TCP skb 必须完整落入单个 frame slot。loopback MTU
-     * 可达 65536，不能直接把 MTU 推导出的 MSS 用作 skb 分段上限。 */
-    route_mss = min(route_mss, FRAME_SLOT_MAX_SIZE - reserve_len);
-
-    uint32_t old_mss = pcb->snd_mss;
-    pcb->rcv_mss = route_mss;
-    pcb->snd_mss = min(pcb->peer_mss, route_mss);
-    /* 路由初始化可能在数据发送前改变有效 SMSS。 */
-    if (pcb->snd_mss != old_mss)
-        tcp_ca_mss_changed(pcb);
+    tcp_update_mss(pcb);
 
     return 0;
 }
@@ -716,22 +871,26 @@ static Socket *tcp_lookup_socket(uint32_t src_ip, uint16_t src_port,
 }
 
 
-static bool tcp_validate_header(skbuff *skb)
+static uint32_t tcp_validate_header(skbuff* skb)
 {
-    tcp_hdr *hdr = skb->tcp_hdr;
-    uint32_t hdr_len = (hdr->doff_res_flags >> 4) * 4;
+    if (skb_data0_len(skb) < sizeof(tcp_hdr))
+        return 0;
+
+    tcp_hdr* hdr = (tcp_hdr*)skb_start(skb);
+    uint32_t hdr_len = (uint32_t)(hdr->doff_res_flags >> 4) * 4u;
 
     /* TCP header length: 5..15 (20..60 bytes), 32-bit aligned */
     if (hdr_len < sizeof(tcp_hdr) || hdr_len > MAX_TCP_HDR_LEN ||
         hdr_len > skb_data0_len(skb))
     {
         DEBUG_LOG("Invalid TCP header length %u", hdr_len);
-        return false;
+        return 0;
     }
+    skb->tcp_hdr = hdr;
 
     /* Verify checksum (pseudo header + tcp header + payload). */
     if (skb->flag.is_hw_rcv_checksum)
-        return true;
+        return hdr_len;
     uint32_t seg_len = skb_data_len(skb);
     uint16_t csum = (skb->family == AF_INET6)
         ? skb_checksum_protocol6(skb, seg_len,
@@ -741,23 +900,16 @@ static bool tcp_validate_header(skbuff *skb)
     if (csum != 0)
     {
         DEBUG_LOG("Invalid TCP checksum csum=0x%04x seg_len=%u", ntohs(csum), seg_len);
-        return false;
+        return 0;
     }
 
-    return true;
+    return hdr_len;
 }
-static int tcp_parse_options(tcp_pcb* pcb,tcp_hdr* hdr){
-
+static void tcp_parse_options(const tcp_hdr* hdr, tcp_options* options)
+{
+    memset(options, 0, sizeof(*options));
     uint32_t hdr_len = (uint32_t)((hdr->doff_res_flags >> 4) & 0x0Fu) * 4u;
-
     int options_len = (int)hdr_len - (int)sizeof(tcp_hdr);
-
-    bool is_handshake = (hdr->flags & TCP_FLAG_SYN) != 0 &&
-        (pcb->state == TCP_STATE_SYN_SENT ||
-         pcb->state == TCP_STATE_SYN_RECEIVED);
-    uint32_t old_mss = pcb->snd_mss;
-    bool old_timestamps = pcb->tcp_flag.peer_ts_ok;
-
     const uint8_t *opt = (const uint8_t *)((const uint8_t *)hdr + sizeof(tcp_hdr));
     int i = 0;
     while (i < options_len) {
@@ -774,33 +926,18 @@ static int tcp_parse_options(tcp_pcb* pcb,tcp_hdr* hdr){
         if (len < 2 || i + len > options_len)
             break;
 
-        if (kind == 2 && len == 4 && is_handshake) { /* MSS */
+        if (kind == 2 && len == 4) { /* MSS */
             uint16_t mss_n;
             memcpy(&mss_n, &opt[i + 2], sizeof(mss_n));
-            uint16_t mss = ntohs(mss_n);
-            uint16_t min_mss = pcb->sock->family == AF_INET6
-                ? TCP_IPV6_MIN_MSS : TCP_IPV4_MIN_MSS;
-            if (mss < min_mss)
-                return -1;
-
-            uint32_t link_mss = pcb->rcv_mss;
-
-            pcb->peer_mss = mss;
-            pcb->snd_mss = min(pcb->peer_mss, link_mss);
+            options->mss = ntohs(mss_n);
+            options->flags |= TCP_OPTION_MSS_SEEN;
         }
-        else if (kind == 3 && len == 3 && is_handshake) { /* Window Scale */
-            /* RFC 7323: shift count 0..14 */
-            uint8_t ws = opt[i + 2];
-            if (ws > 14) {
-                DEBUG_LOG("TCP: peer window scale %u > 14, clamping to 14", ws);
-                ws = 14;
-            }
-            pcb->snd_wnd_scale = ws;
-            pcb->tcp_flag.peer_wnd_scale_ok = 1;
+        else if (kind == 3 && len == 3) { /* Window Scale */
+            options->wnd_scale = min(opt[i + 2], 14u);
+            options->flags |= TCP_OPTION_WINDOW_SCALE_SEEN;
         }
-        else if (kind == TCP_OPTION_SACK_PERMITTED && len == 2 &&
-                 is_handshake) {
-            pcb->tcp_flag.peer_sack_ok = 1;
+        else if (kind == TCP_OPTION_SACK_PERMITTED && len == 2) {
+            options->flags |= TCP_OPTION_SACK_PERMITTED_SEEN;
         }
         else if (kind == 8 && len == 10) { /* Timestamps (RFC 7323) */
             /* 格式：kind(1)=8, len(1)=10, TSval(4), TSecr(4) */
@@ -815,43 +952,82 @@ static int tcp_parse_options(tcp_pcb* pcb,tcp_hdr* hdr){
              * If timestamps were already negotiated (peer_ts_ok),
              * reject old segments: TSval < ts_recent means this
              * segment predates the last one we accepted. */
-            if (pcb->tcp_flag.peer_ts_ok && tsval < pcb->ts_recent) {
-                return -1;  /* old duplicate — silently drop */
+            /* SYN 阶段出现时间戳选项，表示对端支�?Timestamps */
+            options->tsval = tsval;
+            options->tsecr = tsecr;
+            options->flags |= TCP_OPTION_TIMESTAMP_SEEN;
+        }
+        else if (kind == TCP_OPTION_SACK && len >= 10u &&
+                 ((len - 2u) % 8u) == 0) {
+            uint32_t count = min((uint32_t)(len - 2u) / 8u,
+                                 (uint32_t)TCP_MAX_SACK_BLOCKS);
+            for (uint32_t block = 0; block < count &&
+                 options->sack_count < TCP_MAX_SACK_BLOCKS; block++) {
+                uint32_t left;
+                uint32_t right;
+                memcpy(&left, &opt[i + 2u + block * 8u], sizeof(left));
+                memcpy(&right, &opt[i + 6u + block * 8u], sizeof(right));
+                options->sacks[options->sack_count++] = (tcp_sack_block){
+                    .left = ntohl(left),
+                    .right = ntohl(right),
+                };
             }
-
-            /* SYN 阶段出现时间戳选项，表示对端支持 Timestamps */
-            if (hdr->flags & TCP_FLAG_SYN)
-                pcb->tcp_flag.peer_ts_ok = 1;
-            pcb->ts_recent = tsval;
-            pcb->ts_recent_age_ms = get_current_time_ms();
-            pcb->ts_last_tsecr = tsecr; 
+            if (options->sack_count)
+                options->flags |= TCP_OPTION_SACK_SEEN;
         }
 
         i += len;
     }
 
-    /* MSS 或时间戳协商会改变报文段尺度拥塞状态使用的有效数据
-     * SMSS，因此在握手期间重置拥塞控制。 */
-    if (is_handshake &&
-        (pcb->snd_mss != old_mss ||
-         old_timestamps != pcb->tcp_flag.peer_ts_ok))
-        tcp_ca_mss_changed(pcb);
+}
 
+static int tcp_apply_peer_syn_options(tcp_pcb* pcb,
+                                      const tcp_options* options,
+                                      uint8_t tcp_flags)
+{
+    if (options->flags & TCP_OPTION_MSS_SEEN) {
+        uint16_t min_mss = pcb->sock->family == AF_INET6
+            ? TCP_IPV6_MIN_MSS : TCP_IPV4_MIN_MSS;
+        if (options->mss < min_mss)
+            return -1;
+        pcb->peer_mss = options->mss;
+        tcp_update_mss(pcb);
+        tcp_ca_mss_changed(pcb);
+    }
+    if (options->flags & TCP_OPTION_WINDOW_SCALE_SEEN) {
+        pcb->snd_wnd_scale = options->wnd_scale;
+        pcb->tcp_flag.peer_wnd_scale_ok = 1;
+    }
+    if (options->flags & TCP_OPTION_SACK_PERMITTED_SEEN)
+        pcb->tcp_flag.peer_sack_ok = 1;
+    if (options->flags & TCP_OPTION_TIMESTAMP_SEEN) {
+        pcb->tcp_flag.peer_ts_ok = 1;
+        pcb->ts_recent = options->tsval;
+    }
+    /* ECN negotiation uses SYN flags rather than a TCP option:
+     * active SYN-ACK confirms ECE, while a passive SYN requests ECE+CWR. */
+    if ((tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) ==
+            (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+        if (tcp_flags & TCP_FLAG_ECE)
+            pcb->tcp_flag.ecn_ok = 1;
+    } else if ((tcp_flags & TCP_FLAG_SYN) &&
+               (tcp_flags & (TCP_FLAG_ECE | TCP_FLAG_CWR)) ==
+                   (TCP_FLAG_ECE | TCP_FLAG_CWR)) {
+        pcb->tcp_flag.ecn_ok = 1;
+    }
     return 0;
 }
 
 static int tcp_reply_rst(Socket* sock, skbuff* recv_skb)
 {
     tcp_hdr* tcp=recv_skb->tcp_hdr;
-    recv_skb->l4_private.tcp.seq = ntohl(tcp->seq);
-    recv_skb->l4_private.tcp.flag = tcp->flags;
-    tcp_skb_refresh_seq_end(recv_skb);
+
     if(tcp->flags & TCP_FLAG_RST)
         return 0;
     if(!(tcp->flags & TCP_FLAG_ACK))
-        return tcp_send_flag(sock, 0, recv_skb->l4_private.tcp.seq_end,
+        return tcp_send_new_flag(sock, 0, recv_skb->l4_private.tcp.seq_end,
                              TCP_FLAG_RST | TCP_FLAG_ACK);
-    return tcp_send_flag(sock, ntohl(tcp->ack_seq), 0, TCP_FLAG_RST);
+    return tcp_send_new_flag(sock, ntohl(tcp->ack_seq), 0, TCP_FLAG_RST);
 }
 
 static Socket *tcp_lookup_socket6(const uint8_t src_ip[16], uint16_t src_port,
@@ -872,61 +1048,56 @@ static Socket *tcp_lookup_socket6(const uint8_t src_ip[16], uint16_t src_port,
 
 int tcp_recv(struct skbuff *skb)
 {
-    tcp_hdr *tcp = NULL;
+    tcp_hdr* tcp;
     uint32_t tcp_hdr_len;
     bool is_v6 = (skb->family == AF_INET6);
 
-    if(skb->process == tcp_recv) {
+    if (skb->process == tcp_recv) {
         tcp = skb->tcp_hdr;
         tcp_hdr_len = (uint32_t)(tcp->doff_res_flags >> 4) * 4u;
-        goto find_socket;
+    } else {
+        tcp_hdr_len = tcp_validate_header(skb);
+        if (!tcp_hdr_len)
+            return -1;
+        tcp = skb->tcp_hdr;
     }
-    if (skb_data0_len(skb) < sizeof(tcp_hdr))
-        return -1;
-    tcp = (tcp_hdr *)skb_start(skb);
-    skb->tcp_hdr = tcp;
-    if (!tcp_validate_header(skb))
-        return -1;
 
-    tcp_hdr_len = (uint32_t)(tcp->doff_res_flags >> 4) * 4u;
-
-find_socket:
     bool is_syn = (tcp->flags & TCP_FLAG_SYN) && !(tcp->flags & TCP_FLAG_ACK);
     worker* aim_worker;
-    Socket *sock;
+    Socket* sock;
     if (is_v6) {
         ipv6_hdr* ip6 = skb->ipv6_hdr;
-        sock = tcp_lookup_socket6(ip6->saddr, tcp->sport, ip6->daddr, tcp->dport, is_syn, &aim_worker);
+        sock = tcp_lookup_socket6(ip6->saddr, tcp->sport,
+                                  ip6->daddr, tcp->dport,
+                                  is_syn, &aim_worker);
     } else {
         ipv4_hdr* ip = skb->ipv4_hdr;
-        sock = tcp_lookup_socket(ip->saddr, tcp->sport, ip->daddr, tcp->dport, is_syn, &aim_worker);
+        sock = tcp_lookup_socket(ip->saddr, tcp->sport,
+                                 ip->daddr, tcp->dport,
+                                 is_syn, &aim_worker);
     }
-    if (sock && aim_worker != get_current_worker()){
-        /* Keep the TCP header in the skb until it reaches its owner. */
+    if (sock && aim_worker != get_current_worker()) {
         worker_enqueue_skb(aim_worker, skb, tcp_recv);
         return 0;
     }
 
-    /* tcp_input() needs the parsed TCP/IP headers after the header bytes have
-     * been removed from skb data.  Pure ACKs have no payload, so consuming
-     * their header would otherwise release the last frame slot too early. */
-    frame_slot* header_slot = skb->data0.slot;
-    INC_REF(header_slot);
-    if (skb_consume(skb, tcp_hdr_len, true) != tcp_hdr_len) {
-        DEBUG_LOG("tcp_recv: failed to consume TCP header len=%u", tcp_hdr_len);
-        PUT_REF(header_slot);
+    uint8_t flags = tcp->flags;
+    uint32_t seq = ntohl(tcp->seq);
+    if (!skb_consume(skb, tcp_hdr_len, true))
         return -1;
-    }
+    skb->l4_private.tcp.seq = seq;
+    skb->l4_private.tcp.flag = flags;
+    tcp_skb_update_seq_end(skb);
 
-    int ret;
-    if (!sock)
-    {
-        if (tcp->flags & TCP_FLAG_RST) {
-            ret = 0;
-            goto out;
-        }
+    if (!sock) {
+        if (flags & TCP_FLAG_RST)
+            return 0;
+
         static __thread Socket sock_tmp;
-        uint32_t reply_scope_id = is_v6 && skb->route ? skb->route->ifindex : 0;
+        static __thread tcp_pcb pcb_tmp;
+        pcb_tmp.sock = &sock_tmp;
+        sock_tmp.pcb = &pcb_tmp;
+
         if (is_v6) {
             ipv6_hdr* ip6 = skb->ipv6_hdr;
             memcpy(sock_tmp.sip6, ip6->daddr, 16);
@@ -934,7 +1105,7 @@ find_socket:
             memcpy(sock_tmp.dip6, ip6->saddr, 16);
             sock_tmp.dport = tcp->sport;
             sock_tmp.family = AF_INET6;
-            sock_tmp.dip6_scope_id = reply_scope_id;
+
         } else {
             ipv4_hdr* ip = skb->ipv4_hdr;
             sock_tmp.sip = ip->daddr;
@@ -945,29 +1116,14 @@ find_socket:
         }
         sock_tmp.protocol = IPPROTO_TCP;
 
-        /* The input route describes the local destination.  Resolve the
-         * reversed destination before emitting the RST, then lend that
-         * route to the thread-local temporary socket for this call only. */
-        PUT_REF(skb->route);
-        skb->route = NULL;
-        skb->sock = &sock_tmp;
         const uint8_t* reply_dip = is_v6 ? sock_tmp.dip6 : (const uint8_t*)&sock_tmp.dip;
-        if (set_skb_route(skb, sock_tmp.family, reply_dip) < 0) {
-            ret = -EHOSTUNREACH;
-            goto out;
-        }
 
-        /* tcp_send_flag() obtains its output route from the socket.  Hold a
-         * temporary reference for this RST only; sock_tmp is thread-local
-         * and must not retain a route for the next unmatched packet. */
-        PUT_REF(sock_tmp.route);
-        GET_REF(sock_tmp.route, skb->route);
-        ret = tcp_reply_rst(&sock_tmp, skb);
-        PUT_REF(sock_tmp.route);
-        sock_tmp.route = NULL;
-        goto out;
+        if (set_socket_route(&sock_tmp, reply_dip, 0) < 0)
+            return -EHOSTUNREACH;
+        return tcp_reply_rst(&sock_tmp, skb);
     }
-    if(sock->tuple_node.next) {
+
+    if (sock->tuple_node.next) {
         if (is_v6) {
             uint32_t h = tcp->sport;
             for (uint32_t i = 0; i < 16; ++i)
@@ -977,44 +1133,44 @@ find_socket:
             sock = socket_select(sock, (uint32_t)(tcp->sport ^ skb->ipv4_hdr->saddr));
         }
     }
-    ret = tcp_input(sock, skb);
-out:
-    PUT_REF(header_slot);
-    return ret;
+    return tcp_input(sock, skb);
 }
-static void tcp_update_retransmit_queue(tcp_pcb* pcb, bool cwnd_limited){
+static void tcp_update_retransmit_tree(tcp_pcb* pcb){
     uint32_t ack = pcb->snd_una;
     uint32_t acked_bytes = 0;
-    bool acked = false;
-    while (pcb->retransmit_queue.element_number) {
-        skbuff* skb = SKB_FROM_NODE(get_queue_first(&pcb->retransmit_queue), queue_node);
+    while (pcb->retransmit_tree.count) {
+        skbuff* skb = TCP_TREE_FIRST(pcb, retransmit);
 
         if(SEQ_GT(ack, skb->l4_private.tcp.seq)){
-            acked = true;
             if(SEQ_GEQ(ack, skb->l4_private.tcp.seq_end)){
+                tcp_rack_update_last_acked(pcb, skb);
                 uint32_t data_len = skb_data_len(skb);
-                pop_queue(&pcb->retransmit_queue);
+                TCP_REMOVE_RETRASMIT(pcb, skb);
                 pcb->sock->send_buffer_len -= data_len;
                 acked_bytes += data_len;
                 PUT_REF(skb);
             }
             else{
                 uint32_t consumed = ack - skb->l4_private.tcp.seq;
-                if ((skb->l4_private.tcp.flag & TCP_FLAG_SYN) && consumed > 0) {
+                uint32_t old_state = skb->l4_private.tcp.sack_state;
+                tcp_sack_set_state(pcb, skb, 0);
+                if (skb->l4_private.tcp.flag & TCP_FLAG_SYN) {
                     skb->l4_private.tcp.flag &= ~TCP_FLAG_SYN;
                     consumed--;
                 }
 
-                if (consumed > 0) {
-                    uint32_t data_acked = min(consumed, skb_data_len(skb));
-                    if (data_acked) {
-                        skb_consume(skb, data_acked, false);
-                        pcb->sock->send_buffer_len -= data_acked;
-                        acked_bytes += data_acked;
-                    }
+                uint32_t data_acked = min(consumed, skb_data_len(skb));
+                if (data_acked) {
+                    skb_consume(skb, data_acked, false);
+                    pcb->sock->send_buffer_len -= data_acked;
+                    acked_bytes += data_acked;
                 }
+                tcp_skb_tree_remove(&(pcb)->retransmit_tree, (skb),
+                                    offsetof(skbuff, retransmit_node));
                 skb->l4_private.tcp.seq = ack;
-                tcp_sack_clear_skb_state(skb);
+                tcp_skb_tree_insert(&pcb->retransmit_tree, skb,
+                                    offsetof(skbuff, retransmit_node));
+                tcp_sack_set_state(pcb, skb, old_state);
                 break;
             }
         }
@@ -1022,104 +1178,67 @@ static void tcp_update_retransmit_queue(tcp_pcb* pcb, bool cwnd_limited){
             break;
     }
 
-    if (acked) {
-        /* A pending fast retransmit refers to the old SND.UNA.  Cancel it
-         * before the ACK path optionally schedules recovery for the new
-         * retransmit-queue head. */
-        tcp_update_timer(pcb, &pcb->fast_retransmit_deadline_ms,
-                         TCP_TIMER_STOP, true);
+    if (acked_bytes) {
         pcb->retransmits_out = 0;
         pcb->retransmit_timeout = tcp_metrics_rto(pcb->metrics);
+
         socket_notify_event(pcb->sock, notify_data_write);
 
-        if (pcb->sock->send_queue.element_number &&
-            pcb->nagle_deadline_ms == TCP_TIMER_STOP &&
-            SEQ_LT(pcb->snd_nxt,
-                   pcb->snd_una + pcb->snd_wnd)) {
-            tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
-                             get_current_time_ms(), false);
-        }
+        tcp_update_transmit_timer(pcb);
+        tcp_update_persist_timer(pcb);
 
-        tcp_ca_ack_bytes(pcb, acked_bytes, cwnd_limited);
+        tcp_ca_ack_bytes(pcb, acked_bytes);
+        if (pcb->ca.status == TCP_CA_STATUS_RECOVERY &&
+            !pcb->tcp_flag.peer_sack_ok)
+            tcp_retransmit_first(pcb);
     }
 
-    if (pcb->retransmit_queue.element_number == 0) {
-        tcp_update_timer(pcb, &pcb->fast_retransmit_deadline_ms,
+    if (!pcb->retransmit_tree.count) {
+        tcp_update_timer(pcb, &pcb->recovery_deadline_ms,
                          TCP_TIMER_STOP, true);
         tcp_update_timer(pcb, &pcb->retransmit_deadline_ms, TCP_TIMER_STOP, true);
         pcb->last_ack_repeat = 0;
-    } else if (acked) {
+    } else if (acked_bytes) {
         tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                          get_current_time_ms() + pcb->retransmit_timeout,
                          true);
     }
+
 }
 
 /* ── 报文构造、发送与重传 ──────────────────────────────── */
 
-static int tcp_fast_retransmit(tcp_pcb* pcb)
+static void tcp_fast_retransmit(tcp_pcb* pcb)
 {
-    if (!pcb->tcp_flag.sack_permitted_sent) {
-        skbuff* skb = SKB_FROM_NODE(
-            get_queue_first(&pcb->retransmit_queue), queue_node);
-        return skb ? tcp_retransmit_skb(pcb, skb, false) : 0;
-    }
-
-    uint32_t sent = 0;
-    int ret = 0;
-    while (sent < TCP_OUTPUT_BURST_MAX) {
-        skbuff* skb = tcp_sack_next_hole(pcb);
-        if (!skb) {
-            if (sent)
-                break;
-            /* Preserve classic three-duplicate-ACK recovery when the peer
-             * negotiated SACK but supplied no useful block. */
-            skb = tcp_sack_first_unsacked(pcb);
-        }
-        if (!skb || (sent && tcp_sack_pipe(pcb) >= pcb->snd_cwnd))
-            break;
-
-        uint32_t seq_budget = tcp_skb_seq_budget(pcb, skb, false);
-        /* The SACK scoreboard is per skb.  Do not send only a prefix and
-         * then mark the complete hole retransmitted; the RTO path can
-         * retransmit a short prefix without changing scoreboard state. */
-        if (seq_budget != tcp_skb_seq_len(skb))
-            break;
-
-        ret = tcp_retransmit_skb(pcb, skb, false);
-        if (ret < 0)
-            return ret;
-        tcp_sack_mark_retransmitted(pcb, skb);
-        sent++;
-    }
-
-    if (sent == TCP_OUTPUT_BURST_MAX) {
-        skbuff* next = tcp_sack_next_hole(pcb);
-        if (next && tcp_sack_pipe(pcb) < pcb->snd_cwnd &&
-            tcp_skb_seq_budget(pcb, next, false) ==
-                tcp_skb_seq_len(next))
-            tcp_update_timer(pcb, &pcb->fast_retransmit_deadline_ms,
-                             get_current_time_ms() + WHEEL_0_TICK_MS, false);
-    }
-    return ret;
+    tcp_rack_retransmit_lost(pcb);
+    tcp_rack_update_timer(pcb);
 }
 
-void tcp_schedule_fast_retransmit(tcp_pcb* pcb)
+static void tcp_retransmit_first(tcp_pcb* pcb)
 {
-    if (!pcb->retransmit_queue.element_number)
-        return;
+    queue* q = &pcb->rack.unacked_queue;
+    skbuff* skb;
+    uint8_t state;
 
-    /* Defer retransmission to the PCB timer task.  Repeated duplicate ACKs
-     * leave an already pending task unchanged. */
-    tcp_update_timer(pcb, &pcb->fast_retransmit_deadline_ms,
+    if (!q->element_number)
+        return;
+    skb = SKB_FROM_NODE(get_queue_first(q), rack_node);
+    if (!pcb->tcp_flag.peer_sack_ok) {
+        tcp_retransmit_skb(pcb, skb);
+        return;
+    }
+    state = skb->l4_private.tcp.sack_state;
+    state |= TCP_SACKED_LOST;
+    state &= ~TCP_SACKED_RETRANS;
+    tcp_sack_set_state(pcb, skb, state);
+    tcp_update_timer(pcb, &pcb->recovery_deadline_ms,
                      get_current_time_ms(), false);
 }
 
-static skbuff* tcp_alloc_skb(Socket* sock, uint32_t total_len)
+static skbuff* tcp_alloc_skb(Socket* sock, uint32_t data_len)
 {
-    uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-
-    skbuff* skb = skb_alloc(total_len);
+    uint32_t reserve_len = tcp_hdr_reserve_len(sock);
+    skbuff* skb = skb_alloc(reserve_len + data_len);
     if (!skb)
         return NULL;
     skb_reserve(skb, reserve_len);
@@ -1130,15 +1249,14 @@ static uint32_t tcp_build_options(tcp_pcb* pcb, skbuff* skb)
 {
     uint8_t flags = skb->l4_private.tcp.flag;
     bool is_syn = (flags & TCP_FLAG_SYN) != 0;
-    bool send_wscale = is_syn && tcp_should_send_window_scale(pcb, flags);
-    bool send_timestamps = tcp_should_send_timestamps(pcb, flags);
+    bool send_wscale = is_syn && (!(flags & TCP_FLAG_ACK) ||
+                                  pcb->tcp_flag.peer_wnd_scale_ok);
+    bool send_timestamps = pcb->tcp_flag.peer_ts_ok ||
+        ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == TCP_FLAG_SYN);
     bool send_sack_permitted = is_syn &&
         (!(flags & TCP_FLAG_ACK) || pcb->tcp_flag.peer_sack_ok);
     uint32_t sack_option_len = tcp_sack_option_len(pcb, flags);
 
-    /* 各选项组已按 4 字节对齐：MSS 4 字节，MSS+WS 8 字节，
-     * NOP+NOP+Timestamp 12 字节。先算出精确长度，避免临时缓冲
-     * 和整块 memcpy。 */
     uint32_t option_len = is_syn
         ? 4u + (send_sack_permitted ? 4u : 0u) +
           (send_wscale ? 4u : 0u)
@@ -1149,10 +1267,7 @@ static uint32_t tcp_build_options(tcp_pcb* pcb, skbuff* skb)
     if (!option_len)
         return 0;
 
-    /* 选项直接写入 skb headroom；基本 TCP 头随后会 push 到其前面。 */
-    uint8_t* options = skb_data_push(skb, option_len);
-    if (!options)
-        return 0;
+    uint8_t* options = skb_data_push(skb, option_len, option_len);
 
     uint8_t* pos = options;
     if (is_syn) {
@@ -1169,7 +1284,6 @@ static uint32_t tcp_build_options(tcp_pcb* pcb, skbuff* skb)
             pos[2] = 1; /* NOP padding */
             pos[3] = 1;
             pos += 4;
-            pcb->tcp_flag.sack_permitted_sent = 1;
         }
 
         if (send_wscale) {
@@ -1195,123 +1309,48 @@ static uint32_t tcp_build_options(tcp_pcb* pcb, skbuff* skb)
     }
 
     if (sack_option_len)
-        (void)tcp_sack_write_option(
-            pcb, flags, pos, option_len - (uint32_t)(pos - options));
+        tcp_sack_write_option(pcb, flags, pos);
 
     return option_len;
 }
 
-static int tcp_xmit_control_skb(Socket* sock, skbuff* send_skb,
-                                uint32_t ack)
+static int tcp_send_new_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag)
 {
-    tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
-    uint32_t seq = send_skb->l4_private.tcp.seq;
-    uint8_t flag = send_skb->l4_private.tcp.flag;
-    uint32_t opt_len = 0;
-    if (pcb)
-        opt_len = tcp_build_options(pcb, send_skb);
-
-    tcp_hdr* hdr = (tcp_hdr*)skb_data_push(send_skb, sizeof(tcp_hdr));
-    memset(hdr, 0, sizeof(*hdr));
-    send_skb->tcp_hdr = hdr;
-    send_skb->tx_checksum_offset = 0;
-
-    hdr->sport = sock->sport;
-    hdr->dport = sock->dport;
-    hdr->seq = htonl(seq);
-    hdr->ack_seq = htonl(ack);
-    hdr->flags = flag;
-
-    hdr->doff_res_flags = (uint8_t)(((sizeof(tcp_hdr) + opt_len) / 4) << 4);
-
-    /* Advertise current receive window if PCB is available */
-    uint16_t wnd = 0;
-    //rst tmp socket has no pcb
-    if (pcb)
-        wnd = tcp_encode_window(pcb, flag);
-    hdr->window = htons(wnd);
-
-    /* NOTE: URG not supported yet. */
-    hdr->urg_ptr = 0;
-    hdr->check = 0;
-    if (sock->route->if_info->hw_tx_checksum_enabled) {
-        hdr->check = sock->family == AF_INET6
-            ? skb_checksum_protocol6(NULL, skb_data_len(send_skb),
-                                     sock->sip6, sock->dip6, IPPROTO_TCP)
-            : skb_checksum_protocol(NULL, skb_data_len(send_skb),
-                                    sock->sip, sock->dip, IPPROTO_TCP);
-        send_skb->tx_checksum_offset = offsetof(tcp_hdr, check);
-    } else {
-        hdr->check = sock->family == AF_INET6
-            ? skb_checksum_protocol6(send_skb, skb_data_len(send_skb),
-                                     sock->sip6, sock->dip6, IPPROTO_TCP)
-            : skb_checksum_protocol(send_skb, skb_data_len(send_skb),
-                                    sock->sip, sock->dip, IPPROTO_TCP);
-    }
-
-    int ret = sock->family == AF_INET6 ? ipv6_output(send_skb)
-                                       : ipv4_output(send_skb);
-    if (ret >= 0 && pcb) {
-        pcb->ack_pending_segments = 0;
-        tcp_update_timer(pcb, &pcb->ack_deadline_ms, TCP_TIMER_STOP, true);
-    }
-    return ret;
-}
-
-static int tcp_send_flag(Socket* sock, uint32_t seq, uint32_t ack, uint8_t flag)
-{
-    uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-    skbuff* skb = tcp_alloc_skb(sock, reserve_len);
+    skbuff* skb = tcp_alloc_skb(sock, 0);
     if (!skb) {
         return -ENOMEM;
     }
 
     skb->l4_private.tcp.seq = seq;
     skb->l4_private.tcp.flag = flag;
-    tcp_skb_refresh_seq_end(skb);
-    set_skb_by_socket(skb, sock);
-
-    int ret = tcp_xmit_control_skb(sock, skb, ack);
+    tcp_skb_update_seq_end(skb);
+    int ret = tcp_xmit_skb((tcp_pcb*)sock->pcb, skb, ack, 0);
     PUT_REF(skb);
     return ret;
 }
 
-static int tcp_send_syn(Socket* sock, bool with_ack)
+static int tcp_send_new_syn(Socket* sock)
 {
     tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
-    uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-    skbuff* skb = tcp_alloc_skb(sock, reserve_len);
+    skbuff* skb = tcp_alloc_skb(sock, 0);
     if (!skb)
         return -ENOMEM;
 
     uint32_t seq = pcb->snd_nxt;
+    bool with_ack = pcb->state == TCP_STATE_SYN_RECEIVED;
     uint32_t ack = with_ack ? pcb->rcv_nxt : 0;
     skb->l4_private.tcp.seq = seq;
     skb->l4_private.tcp.flag = TCP_FLAG_SYN |
         (with_ack ? TCP_FLAG_ACK : 0);
-    tcp_skb_refresh_seq_end(skb);
-    set_skb_by_socket(skb, sock);
-
+    if (!with_ack)
+        skb->l4_private.tcp.flag |= TCP_FLAG_ECE | TCP_FLAG_CWR;
+    else if (pcb->tcp_flag.ecn_ok)
+        skb->l4_private.tcp.flag |= TCP_FLAG_ECE;
+    tcp_skb_update_seq_end(skb);
     INC_REF(skb);
-    add_queue(&pcb->retransmit_queue, &skb->queue_node);
 
-    skbuff* send_skb = skb_clone(skb);
-    if (!send_skb) {
-        skbuff* queued_skb = SKB_FROM_NODE(
-            pop_queue_last(&pcb->retransmit_queue), queue_node);
-        PUT_REF(queued_skb);
-        PUT_REF(skb);
-        return -ENOMEM;
-    }
-
-    /* 提交 SYN 占用的序号空间，再将已经构建好的报文交给输出层。 */
-    pcb->snd_nxt++;
-    pcb->snd_end++;
-    tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
-                     get_current_time_ms() + pcb->retransmit_timeout, false);
-
-    int ret = tcp_xmit_control_skb(sock, send_skb, ack);
-    PUT_REF(send_skb);
+    /* 提交 SYN 占用的序号空间，再将已经构建好的报文交给输出层�?*/
+    int ret = tcp_xmit_skb(pcb, skb, ack, TCP_XMIT_FLAG_NEW_TRANSMIT);
     PUT_REF(skb);
     return ret;
 }
@@ -1330,7 +1369,7 @@ static int tcp_process_syn_sent(Socket* sock, skbuff* skb){
     if(flags & TCP_FLAG_ACK){
          if(SEQ_LEQ(ack, pcb->snd_una) || SEQ_GT(ack, pcb->snd_nxt)){
             if(!(flags & TCP_FLAG_RST)){
-                tcp_send_flag(pcb->sock, ack, 0, TCP_FLAG_RST);
+                tcp_send_new_flag(pcb->sock, ack, 0, TCP_FLAG_RST);
             }
             return 0;
         }
@@ -1343,19 +1382,19 @@ static int tcp_process_syn_sent(Socket* sock, skbuff* skb){
 
     //to do security/compartment
 
-    if (tcp_parse_options(pcb, hdr) < 0)
-        return 0;
-
     if (flags & TCP_FLAG_SYN) {
+        tcp_options options;
+        tcp_parse_options(hdr, &options);
+        if (tcp_apply_peer_syn_options(pcb, &options, flags) < 0)
+            return 0;
         pcb->rcv_nxt = seq + 1;
         if (flags & TCP_FLAG_ACK) {
             pcb->snd_una = ack;
             pcb->last_ack = ack;
             pcb->last_ack_repeat = 0;
             pcb->state = TCP_STATE_ESTABLISHED;
-            tcp_update_retransmit_queue(pcb, false);
+            tcp_update_retransmit_tree(pcb);
             if (sock->options.keepalive) {
-                pcb->keepalive_repeat_count = 0;
                 tcp_update_timer(pcb, &pcb->keepalive_deadline_ms,
                                  get_current_time_ms() + pcb->keepalive_timeout,
                                  true);
@@ -1368,12 +1407,11 @@ static int tcp_process_syn_sent(Socket* sock, skbuff* skb){
         }
         else {
             pcb->state = TCP_STATE_SYN_RECEIVED;
-            skbuff* syn_skb = SKB_FROM_NODE(
-                get_queue_first(&pcb->retransmit_queue), queue_node);
+            skbuff* syn_skb = TCP_TREE_FIRST(pcb, retransmit);
             syn_skb->l4_private.tcp.flag |= TCP_FLAG_ACK;
             tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                              get_current_time_ms(),
-                             true);
+                             false);
         }
         tcp_update_sndwin(pcb, tcp_decode_window(pcb, window, flags));
         pcb->snd_wl1 = seq;
@@ -1399,12 +1437,15 @@ static int tcp_process_listen(Socket *sock, skbuff *skb)
         return 0;
 
     if (flags & TCP_FLAG_ACK) {
-        tcp_send_flag(sock, ack, 0, TCP_FLAG_RST);
+        tcp_send_new_flag(sock, ack, 0, TCP_FLAG_RST);
         return 0;
     }
 
     if (!(flags & TCP_FLAG_SYN))
         return 0;
+
+    tcp_options options;
+    tcp_parse_options(hdr, &options);
 
     FOR_EACH_LIST_OFFSET(&pcb->syn_list, child_pcb, tcp_pcb, syn_list) {
         if (is_v6 ? (memcmp(child_pcb->sock->sip6, skb->ipv6_hdr->daddr, 16) == 0)
@@ -1430,7 +1471,7 @@ static int tcp_process_listen(Socket *sock, skbuff *skb)
     }
 
     child_pcb = (tcp_pcb*)new_sock->pcb;
-    /* 只继承监听 PCB 的拥塞控制算法，不继承其实时 cwnd/恢复状态。 */
+    /* 只继承监�?PCB 的拥塞控制算法，不继承其实时 cwnd/恢复状态�?*/
     if (tcp_ca_inherit(child_pcb, pcb) < 0) {
         tcp_destroy_socket(new_sock);
         return -1;
@@ -1443,7 +1484,6 @@ static int tcp_process_listen(Socket *sock, skbuff *skb)
     new_sock->send_buffer_len_max = sock->send_buffer_len_max;
     new_sock->recv_buffer_len_max = sock->recv_buffer_len_max;
     child_pcb->rcv_wnd = new_sock->recv_buffer_len_max;
-    child_pcb->tcp_options = pcb->tcp_options;
     child_pcb->nagle_interval = pcb->nagle_interval;
     child_pcb->keepalive_timeout = pcb->keepalive_timeout;
     child_pcb->keepalive_interval = pcb->keepalive_interval;
@@ -1501,12 +1541,14 @@ static int tcp_process_listen(Socket *sock, skbuff *skb)
                          true);
     }
 
-    if (tcp_parse_options(child_pcb, hdr) < 0)
+    if (tcp_apply_peer_syn_options(child_pcb, &options, flags) < 0) {
+        tcp_destroy_socket(new_sock);
         return 0;
+    }
     child_pcb->rcv_nxt = seq + 1;
     tcp_update_sndwin(child_pcb,
                        tcp_decode_window(child_pcb, window, flags));
-    return tcp_send_syn(new_sock, true);
+    return tcp_send_new_syn(new_sock);
 }
 
 static int tcp_input(Socket *sock, skbuff *skb)
@@ -1514,26 +1556,23 @@ static int tcp_input(Socket *sock, skbuff *skb)
 
     tcp_pcb *pcb = (tcp_pcb *)sock->pcb;
     tcp_hdr *hdr = skb->tcp_hdr;
-    uint8_t flags = hdr->flags;
-    uint32_t seq = ntohl(hdr->seq);
+    uint8_t flags = skb->l4_private.tcp.flag;
+    uint32_t seq = skb->l4_private.tcp.seq;
     uint32_t ack = ntohl(hdr->ack_seq);
     uint16_t window = ntohs(hdr->window);
 
     uint32_t data_len = skb_data_len(skb);
-    uint32_t seg_len = data_len + tcp_flags_seq_len(flags);
-
-    skb->l4_private.tcp.seq = seq;
-    skb->l4_private.tcp.flag = flags;
-    skb->l4_private.tcp.seq_end = seq + seg_len;
+    uint32_t seg_len = tcp_skb_seq_len(skb);
     if (pcb->state == TCP_STATE_CLOSED) {
         if (flags & TCP_FLAG_RST)
             return 0;
         if (!(flags & TCP_FLAG_ACK))
-            return tcp_send_flag(pcb->sock, 0,
+            return tcp_send_new_flag(pcb->sock, 0,
                                  skb->l4_private.tcp.seq_end,
                                  TCP_FLAG_RST | TCP_FLAG_ACK);
-        return tcp_send_flag(pcb->sock, ack, 0, TCP_FLAG_RST);
+        return tcp_send_new_flag(pcb->sock, ack, 0, TCP_FLAG_RST);
     }
+
     if (pcb->state == TCP_STATE_LISTEN) {
         return tcp_process_listen(sock, skb);
     }
@@ -1541,11 +1580,8 @@ static int tcp_input(Socket *sock, skbuff *skb)
         return tcp_process_syn_sent(sock, skb);
     }
 
-    if (tcp_parse_options(pcb, hdr) < 0)
-        return 0;  /* PAWS: old duplicate — silently drop */
-
     /*
-3.10.7.4. Other States 其他状态
+3.10.7.4. Other States 其他状�?
 否则
 第一步，校验序列号：
 SYN-RECEIVED STATE
@@ -1557,26 +1593,38 @@ CLOSING STATE
 LAST-ACK STATE
 TIME-WAIT STATE
 分段按顺序处理。到达时的初始测试用于丢弃旧的重复项，但以SEG.SEQ的顺序进行进一
-步的处理。如果段的内容跨越新旧之间的边界，则仅处理新的部分。
-通常，必须实现对接收段的处理，以尽可能聚合ACK段（MUST-58）。例如，如果TCP端点正在处理一系列排队的段，则它必须在发送任何ACK段之前处理所有这些段（MUST59）。
-传入段的可接受性测试有四种情况：
+步的处理。如果段的内容跨越新旧之间的边界，则仅处理新的部分�?
+通常，必须实现对接收段的处理，以尽可能聚合ACK段（MUST-58）。例如，如果TCP端点正在处理一系列排队的段，则它必须在发送任何ACK段之前处理所有这些段（MUST59）�?
+传入段的可接受性测试有四种情况�?
 Segment Length	Receive Window	Test
 0	    0	    SEG.SEQ = RCV.NXT
 0	    >0	    RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND
 >0	    0	    not acceptable
 >0	    >0	    RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND or RCV.NXT <= SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
 在实现此处所述的序列号验证时，请参见附录A.2
-如果RCV.WND是0，不接受任何段，但应特别考虑接受有效的ACK、URG和RST。
+如果RCV.WND�?，不接受任何段，但应特别考虑接受有效的ACK、URG和RST�?
 如果传入段不可接受，则应发送应答确认（除非设置了RST位，否则删除段并返回）：
 <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-发送确认后，丢弃不可接受的段并返回。
+发送确认后，丢弃不可接受的段并返回�?
 注意，对于TIME-WAIT状态，[40]中描述了一种改进的算法，用于处理利用时间戳而不是依
 赖于这里描述的序列号检查的传入SYN段。当实现改进的算法时，上述逻辑不适用于在
-TIME-WAIT状态下的连接上接收的具有时间戳选项的传入SYN段。当实现改进的算法时，上述逻辑不适用于在TIME-WAIT状态下的连接上接收的具有时间戳选项的传入SYN段。
+TIME-WAIT状态下的连接上接收的具有时间戳选项的传入SYN段。当实现改进的算法时，上述逻辑不适用于在TIME-WAIT状态下的连接上接收的具有时间戳选项的传入SYN段�?
 在下文中，假设段是从RCV.NXT开始的理想段，不超过窗口大小。可以通过修剪位于窗口
 之外的任何部分（包括SYN和FIN）来定制实际段以适应该假设，并且如果段随后从
-RCV.NXT开始，则仅进一步处理。具有较高起始序列号的段应保留以供以后处理（SHLD31）。
+RCV.NXT开始，则仅进一步处理。具有较高起始序列号的段应保留以供以后处理（SHLD31）�?
 */
+
+    tcp_options options;
+    tcp_parse_options(hdr, &options);
+
+    if ((options.flags & TCP_OPTION_TIMESTAMP_SEEN) &&
+        pcb->tcp_flag.peer_ts_ok &&
+        SEQ_LT(options.tsval, pcb->ts_recent)) {
+        tcp_update_timer(pcb, &pcb->ack_deadline_ms,
+                         get_current_time_ms(), false);
+        return 0;
+    }
+
     bool seg_allow = false;
 
     if(!seg_len){
@@ -1597,13 +1645,8 @@ RCV.NXT开始，则仅进一步处理。具有较高起始序列号的段应保�
             seg_allow = true;
     }
 
-    /* A FIN retransmitted in TIME_WAIT is immediately before RCV.NXT and
-     * therefore fails the normal receive-window test.  Let it reach the
-     * FIN state-machine below, which will acknowledge it and restart the
-     * TIME_WAIT timer without consuming sequence space again. */
     if (!seg_allow && pcb->state == TCP_STATE_TIME_WAIT &&
-        (flags & (TCP_FLAG_ACK | TCP_FLAG_FIN)) ==
-            (TCP_FLAG_ACK | TCP_FLAG_FIN) &&
+        flags == (TCP_FLAG_ACK | TCP_FLAG_FIN) &&
         skb->l4_private.tcp.seq_end == pcb->rcv_nxt) {
         seg_allow = true;
     }
@@ -1617,32 +1660,32 @@ RCV.NXT开始，则仅进一步处理。具有较高起始序列号的段应保�
 第二步，校验RST位：
 RFC5961[9]的第3节描述了潜在的盲重置攻击和可选的缓解方法。这不提供加密保护（例如，在
 IPsec或TCP-AO中），但可以适用于RFC5961中描述的情况。对于实现RFC5961中描述的保护的堆
-栈，下面的三个检查适用；否则，下面进一步指示对这些状态的处理。
-1. 如果设置了RST位，并且序列号在当前接收窗口之外，则静默丢弃该段。
-2. 如果设置了RST位，并且序列号与下一个期望的序列号（RCV.NXT）完全匹配，则TCP端点必
-须根据连接状态，以下面规定的方式重置连接。
+栈，下面的三个检查适用；否则，下面进一步指示对这些状态的处理�?
+1. 如果设置了RST位，并且序列号在当前接收窗口之外，则静默丢弃该段�?
+2. 如果设置了RST位，并且序列号与下一个期望的序列号（RCV.NXT）完全匹配，则TCP端点�?
+须根据连接状态，以下面规定的方式重置连接�?
 3. 如果设置了RST位，并且序列号不完全匹配下一个期望的序列值，但仍然在当前接收窗口内，
 则TCP端点必须发送确认（challenge ACK）：
 <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 在发送challenge ACK后，TCP端点必须丢弃不可接受的段，并停止进一步处理传入数据包。请
-注意，RFC5961和勘误表ID4772[99]包含实现中ACK调节的其他注意事项。
+注意，RFC5961和勘误表ID4772[99]包含实现中ACK调节的其他注意事项�?
 SYN-RECEIVED STATE
 如果设置了RST位，
-如果该连接是通过被动OPEN（即来自LISTEN状态）初始化的，则将该连接返回到LISTEN状态
+如果该连接是通过被动OPEN（即来自LISTEN状态）初始化的，则将该连接返回到LISTEN状�?
 并返回。无需通知用户。如果此连接是通过主动OPEN（即来自SYN-SENT状态）初始化的，则
-拒绝连接；向用户发出“connection refused”的信号。在任何一种情况下，都应该刷新重传队
-列。在主动OPEN情况下，进入CLOSED状态并删除TCB，然后返回。
+拒绝连接；向用户发出“connection refused”的信号。在任何一种情况下，都应该刷新重传�?
+列。在主动OPEN情况下，进入CLOSED状态并删除TCB，然后返回�?
 ESTABLISHED STATE
 FIN-WAIT-1 STATE
 FIN-WAIT-2 STATE
 CLOSE-WAIT STATE
-如果设置了RST位，则任何未完成的RECEIVE和SEND都应接收“重置”的响应。应刷新所有段队
+如果设置了RST位，则任何未完成的RECEIVE和SEND都应接收“重置”的响应。应刷新所有段�?
 列。用户还应收到未被要求的常规“connection reset”信号。进入CLOSED（关闭）状态，删除
-TCB，返回。
+TCB，返回�?
 CLOSING STATE
 LAST-ACK STATE
 TIME-WAIT STATE
-如果设置了RST位，则进入关闭状态，删除TCB，返回。
+如果设置了RST位，则进入关闭状态，删除TCB，返回�?
 */
     if(flags & TCP_FLAG_RST){
         if(seq != pcb->rcv_nxt){
@@ -1678,11 +1721,18 @@ TIME-WAIT STATE
                 return 0;
         }
     }
+
+    if ((options.flags & TCP_OPTION_TIMESTAMP_SEEN) &&
+        pcb->tcp_flag.peer_ts_ok &&
+        SEQ_GEQ(options.tsval, pcb->ts_recent) &&
+        SEQ_LEQ(seq, pcb->last_ack_sent)) {
+        pcb->ts_recent = options.tsval;
+    }
     /*
 
-第三步，校验安全：
+第三步，校验安全�?
 SYN-RECEIVED STATE
-如果段中的security/compartment没有完全匹配TCB中的security/compartment，则发送一个重置并返回。
+如果段中的security/compartment没有完全匹配TCB中的security/compartment，则发送一个重置并返回�?
 ESTABLISHED STATE
 FIN-WAIT-1 STATE
 FIN-WAIT-2 STATE
@@ -1691,10 +1741,10 @@ CLOSING STATE
 LAST-ACK STATE
 TIME-WAIT STATE
 如果段中的security/compartment没有完全匹配TCB中的security/compartment，则发送一个重
-置；任何未完成的RECEIVE和SEND都应收到“reset’”响应。应刷新所有段队列。用户还应收到
-未被要求的常规“connection reset”信号。进入CLOSED状态，删除TCB，返回。
+置；任何未完成的RECEIVE和SEND都应收到“reset’”响应。应刷新所有段队列。用户还应收�?
+未被要求的常规“connection reset”信号。进入CLOSED状态，删除TCB，返回�?
 请注意，此检查放在序列检查之后，以防止来自这些具有不同安全性的端口号之间的旧连接的段导
-致当前连接中止。
+致当前连接中止�?
 */
 // to do security/compartment
 
@@ -1702,7 +1752,7 @@ TIME-WAIT STATE
 第四步，校验SYN位：
 SYN-RECEIVED STATE
 如果连接是通过被动OPEN初始化的，则将该连接返回到LISTEN状态并返回。否则，请按照以
-下同步状态的说明进行处理。
+下同步状态的说明进行处理�?
 ESTABLISHED STATE
 FIN-WAIT-1 STATE
 FIN-WAIT-2 STATE
@@ -1712,28 +1762,27 @@ LAST-ACK STATE
 TIME-WAIT STATE
 如果在这些同步状态下设置SYN位，则它可能是合法的新连接尝试（例如，在TIME-WAIT
 的情况下）、应重置连接的错误或攻击尝试的结果，如RFC5961[9]中所述。对于TIMEWAIT状态，
-如果使用时间戳选项并满足预期，则可以接受新连接（根据[40]）。对于所有
-其他情况，RFC5961提供了适用于某些情况的缓解措施，尽管也有提供加密保护的替代方
-案（见第7节）。RFC5961推荐，在这些同步状态下，如果设置了SYN位，则无论序列号如
+如果使用时间戳选项并满足预期，则可以接受新连接（根据[40]）。对于所�?
+其他情况，RFC5961提供了适用于某些情况的缓解措施，尽管也有提供加密保护的替代�?
+案（见第7节）。RFC5961推荐，在这些同步状态下，如果设置了SYN位，则无论序列号�?
 何，TCP端点都必须向远程端发送“challenge ACK”：
 <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-发送确认后，TCP实现必须丢弃不可接受的段并停止进一步的处理。请注意，RFC5961和
-勘误表ID4772[99]包含用于实现的额外ACK调节的说明。
-对于不遵循RFC5961的实现，本段中遵循RFC793中描述的原始行为。如果SYN在窗口
-中，则它是一个错误：发送重置，任何未完成的RECEIVE和SEND应接收“reset”响应，应
-刷新所有段队列，用户还应收到未被要求的常规“connection reset”信号，进入CLOSED状
-态，删除TCB，返回。
-如果SYN不在窗口中，则不会到达该步骤，并且会在第一步中发送ACK（序列号检查）。
+发送确认后，TCP实现必须丢弃不可接受的段并停止进一步的处理。请注意，RFC5961�?
+勘误表ID4772[99]包含用于实现的额外ACK调节的说明�?
+对于不遵循RFC5961的实现，本段中遵循RFC793中描述的原始行为。如果SYN在窗�?
+中，则它是一个错误：发送重置，任何未完成的RECEIVE和SEND应接收“reset”响应，�?
+刷新所有段队列，用户还应收到未被要求的常规“connection reset”信号，进入CLOSED�?
+态，删除TCB，返回�?
+如果SYN不在窗口中，则不会到达该步骤，并且会在第一步中发送ACK（序列号检查）�?
 */
     if(flags & TCP_FLAG_SYN){
         switch(pcb->state){
             case TCP_STATE_SYN_RECEIVED:
-                if(pcb->parent_sock){
-                    tcp_destroy_socket(pcb->sock);
-                    return 0;
-                }
-                /* Active-open SYN_RECEIVED follows the synchronized-state path. */
-                __attribute__((fallthrough));
+                tcp_send_new_flag(pcb->sock, pcb->snd_nxt, pcb->rcv_nxt,
+                              TCP_FLAG_RST | TCP_FLAG_ACK);
+                tcp_destroy_socket(pcb->sock);
+                return 0;
+
             case TCP_STATE_ESTABLISHED:
             case TCP_STATE_FIN_WAIT_1:
             case TCP_STATE_FIN_WAIT_2:
@@ -1752,51 +1801,51 @@ TIME-WAIT STATE
 
 /*
 第五步，校验ACK字段
-如果ACK位关闭，则丢弃段并返回。
+如果ACK位关闭，则丢弃段并返回�?
 如果设置了ACK位，
 RFC5961[9]的第5节描述了潜在的盲数据注入攻击，以及实现可以选择包括的缓解（MAY-12）。实
-现RFC5961的TCP堆栈必须添加输入检查，以确保只有在ACK值在（((SND.UNA - MAX.SND.WND)
-=< SEG.ACK =< SND.NXT)的范围内时，ACK值才可接受。必须丢弃ACK值不满足上述条件的所有
-传入段，并发回ACK。新的状态变量MAX.SND.WND被定义为本地发送方从其对端接收到的最大
+现RFC5961的TCP堆栈必须添加输入检查，以确保只有在ACK值在�?(SND.UNA - MAX.SND.WND)
+=< SEG.ACK =< SND.NXT)的范围内时，ACK值才可接受。必须丢弃ACK值不满足上述条件的所�?
+传入段，并发回ACK。新的状态变量MAX.SND.WND被定义为本地发送方从其对端接收到的最�?
 窗口（受窗口缩放影响），或者可以硬编码为最大允许窗口值。当ACK值可接受时，适用于以下各
 个状态处理：
 SYN-RECEIVED STATE
-如果SND.UNA < SEG.ACK =< SND.NXT，则进入ESTABLISHED状态，并继续处理，设
-置以下的变量：
+如果SND.UNA < SEG.ACK =< SND.NXT，则进入ESTABLISHED状态，并继续处理，�?
+置以下的变量�?
 SND.WND <- SEG.WND
 SND.WL1 <- SEG.SEQ
 SND.WL2 <- SEG.ACK
 如果该段的确认不可接受，形成一个重置段
 <SEQ=SEG.ACK><CTL=RST>
-并发送它。
+并发送它�?
 ESTABLISHED STATE
 如果SND.UNA < SEG.ACK =< SND.NXT，那么设置SND.UNA <- SEG.ACK。因此已完全
-确认的重传队列上的任何段都被删除。用户应收到已发送和完全确认的缓冲区的肯定确认
-（即，SEND缓冲区应返回“ok”响应）。如果ACK是重复的（SEG.ACK=<SND.UNA），则
-可以忽略它。如果ACK确认尚未发送的内容（SEG.ACK>SND.NXT），则发送ACK，丢弃
-该段，返回。
-如果SND.UNA =< SEG.ACK =< SND.NXT，发送窗口应该更新。如果 (SND.WL1 <
+确认的重传队列上的任何段都被删除。用户应收到已发送和完全确认的缓冲区的肯定确�?
+（即，SEND缓冲区应返回“ok”响应）。如果ACK是重复的（SEG.ACK=<SND.UNA），�?
+可以忽略它。如果ACK确认尚未发送的内容（SEG.ACK>SND.NXT），则发送ACK，丢�?
+该段，返回�?
+如果SND.UNA =< SEG.ACK =< SND.NXT，发送窗口应该更新。如�?(SND.WL1 <
 SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK))，设置SND.WND <-
-SEG.WND，设置SND.WL1 <- SEG.SEQ，并设置SND.WL2 <- SEG.ACK，
+SEG.WND，设置SND.WL1 <- SEG.SEQ，并设置SND.WL2 <- SEG.ACK�?
 请注意SND.WND是来自SND.UNA的偏移量。那个SND.WL1记录用于更新SND.WND的最
-后一个段的序列号，SND.WL2记录用于更新SND.WND的最后一个段的确认号。此处的校
-验防止使用旧段更新窗口。
+后一个段的序列号，SND.WL2记录用于更新SND.WND的最后一个段的确认号。此处的�?
+验防止使用旧段更新窗口�?
 FIN-WAIT-1 STATE
-除了ESTABLISHED状态的处理外，如果FIN段现在被确认，则进入FIN-WAIT-2并在该状态下继
-续处理。
+除了ESTABLISHED状态的处理外，如果FIN段现在被确认，则进入FIN-WAIT-2并在该状态下�?
+续处理�?
 FIN-WAIT-2 STATE
 除了ESTABLISHED状态的处理外，如果重传队列为空，则可以确认用户的CLOSE（“ok”），但
-不要删除TCB。
+不要删除TCB�?
 CLOSE-WAIT STATE
-执行与ESTABLISHED状态相同的处理。
+执行与ESTABLISHED状态相同的处理�?
 CLOSING STATE
-除了ESTABLISHED状态的处理外，如果ACK确认我们的FIN，则进入TIME-WAIT状态；否则，
-忽略该段。
+除了ESTABLISHED状态的处理外，如果ACK确认我们的FIN，则进入TIME-WAIT状态；否则�?
+忽略该段�?
 LAST-ACK STATE
 在这种状态下，唯一可以到达的是对我们的FIN的确认。如果我们的FIN现在已被确认，则删除
-TCB，进入CLOSED状态，并返回。
+TCB，进入CLOSED状态，并返回�?
 TIME-WAIT STATE
-唯一可以达到这种状态的是远程FIN的重传。确认它，并重新启动2 MSL超时。
+唯一可以达到这种状态的是远程FIN的重传。确认它，并重新启动2 MSL超时�?
 */
     if(!(flags & TCP_FLAG_ACK)){
         return 0;
@@ -1807,6 +1856,22 @@ TIME-WAIT STATE
         return 0;
     }
 
+    if (pcb->tcp_flag.ecn_ok &&
+        pcb->state >= TCP_STATE_ESTABLISHED &&
+        pcb->state != TCP_STATE_TIME_WAIT && !(flags & TCP_FLAG_RST)) {
+        if (flags & TCP_FLAG_CWR)
+            pcb->tcp_flag.ecn_echo_pending = 0;
+        if ((flags & TCP_FLAG_ECE) && !pcb->tcp_flag.ecn_cwr_pending) {
+            tcp_ca_event(pcb, TCP_CA_EVENT_ECN);
+            pcb->tcp_flag.ecn_cwr_pending = 1;
+        }
+        if (skb->l4_private.tcp.ip_ecn == TCP_ECN_CE) {
+            pcb->tcp_flag.ecn_echo_pending = 1;
+            tcp_update_timer(pcb, &pcb->ack_deadline_ms,
+                             get_current_time_ms(), false);
+        }
+    }
+
     switch(pcb->state){
         case TCP_STATE_SYN_RECEIVED:
             if(SEQ_LT(pcb->snd_una, ack) && SEQ_LEQ(ack, pcb->snd_nxt)){
@@ -1815,7 +1880,7 @@ TIME-WAIT STATE
                 pcb->last_ack = ack;
                 pcb->last_ack_repeat = 0;
 
-                tcp_update_retransmit_queue(pcb, false);
+                tcp_update_retransmit_tree(pcb);
                 tcp_update_sndwin(pcb,
                                    tcp_decode_window(pcb, window, flags));
                 pcb->snd_wl1 = seq;
@@ -1836,10 +1901,11 @@ TIME-WAIT STATE
                     parent_pcb->accept_list_num++;
                     socket_notify_event(pcb->parent_sock, notify_new_connection);
                 } else
-                    socket_notify_event(sock, notify_data_write);
+                    socket_notify_event(sock, notify_data_write |
+                                             notify_connect);
             }
             else if(SEQ_LEQ(ack, pcb->snd_una)){
-                tcp_send_flag(sock, ack, 0, TCP_FLAG_RST);
+                tcp_send_new_flag(sock, ack, 0, TCP_FLAG_RST);
                 return 0;
             }
             break;
@@ -1853,50 +1919,31 @@ TIME-WAIT STATE
             if (SEQ_LT(ack, pcb->snd_una))
                 break;
             if(SEQ_LT(pcb->snd_una, ack)){
-                uint32_t prior_flight = pcb->snd_nxt - pcb->snd_una;
-                bool cwnd_limited =
-                    (uint64_t)prior_flight + tcp_data_mss(pcb) >=
-                    pcb->snd_cwnd;
                 pcb->snd_una = ack;
-                tcp_update_retransmit_queue(pcb, cwnd_limited);
-                (void)tcp_sack_process_options(pcb, hdr, NULL);
+                tcp_update_retransmit_tree(pcb);
+                tcp_sack_process_options(pcb, &options);
+                tcp_update_transmit_timer(pcb);
                 pcb->last_ack = ack;
                 pcb->last_ack_repeat = 0;
 
-                /* RTT measurement (RFC 6298).
-                 * Prefer timestamp-based (TSecr) when available — it is
-                 * immune to retransmission ambiguity.
-                 * Fall back to sequence-based measurement otherwise. */
-                {
-                    uint32_t sample = 0;
+                uint64_t now = get_current_time_ms();
+                uint32_t sample = 0;
 
-                    if (pcb->tcp_flag.peer_ts_ok && pcb->ts_last_tsecr) {
-                        /* Timestamp echo: how long ago the peer received
-                         * our TSval = ts_last_tsecr. */
-                        uint64_t now = get_current_time_ms();
-                        if (now > pcb->ts_last_tsecr)
-                            sample = (uint32_t)(now - pcb->ts_last_tsecr);
-                        pcb->ts_last_tsecr = 0;  /* consume once */
-                    } else if (pcb->rtt_meas_time &&
-                               SEQ_LEQ(pcb->rtt_meas_seq, pcb->snd_una)) {
-                        /* Sequence-based fallback (Karn: only non-retransmit). */
-                        uint64_t now = get_current_time_ms();
-                        sample = (uint32_t)(now - pcb->rtt_meas_time);
-                    }
-
-                    if (sample && pcb->metrics) {
-                        pcb->retransmit_timeout =
-                            tcp_metrics_sample(pcb->metrics, sample);
-                        if (pcb->retransmit_queue.element_number) {
-                            tcp_update_timer(
-                                pcb, &pcb->retransmit_deadline_ms,
-                                get_current_time_ms() +
-                                    pcb->retransmit_timeout,
-                                true);
-                        }
-                    }
-                    pcb->rtt_meas_time = 0;
+                if (pcb->tcp_flag.peer_ts_ok &&
+                    (options.flags & TCP_OPTION_TIMESTAMP_SEEN) &&
+                    options.tsecr) {
+                    if (now > options.tsecr)
+                        sample = (uint32_t)(now - options.tsecr);
+                } else if (pcb->rtt_meas_time &&
+                           SEQ_LEQ(pcb->rtt_meas_seq, pcb->snd_una)) {
+                    sample = (uint32_t)(now - pcb->rtt_meas_time);
                 }
+
+                if (sample && pcb->metrics) {
+                    pcb->retransmit_timeout =
+                        tcp_metrics_sample(pcb->metrics, sample);
+                }
+                pcb->rtt_meas_time = 0;
 
                 if(SEQ_LT(pcb->snd_wl1, seq) || (pcb->snd_wl1 == seq && SEQ_LEQ(pcb->snd_wl2, ack))){
                     tcp_update_sndwin(pcb,
@@ -1906,33 +1953,33 @@ TIME-WAIT STATE
                 }
 
             }else{
-                /* 未推进 SND.UNA 的 ACK 不一定是重复 ACK：先应用其有效窗口
-                 * 更新，然后再进行经典重复 ACK 资格判定。 */
-                (void)tcp_sack_process_options(pcb, hdr, NULL);
 
+                tcp_sack_process_options(pcb, &options);
+
+                bool duplicate_ack = tcp_duplicate_ack(pcb, skb);
                 uint32_t new_wnd = tcp_decode_window(pcb, window, flags);
-                bool window_changed = false;
+
                 if (SEQ_LT(pcb->snd_wl1, seq) ||
-                    (pcb->snd_wl1 == seq && SEQ_LEQ(pcb->snd_wl2, ack))) {
-                    window_changed = pcb->snd_wnd != new_wnd;
+                    (pcb->snd_wl1 == seq &&
+                     SEQ_LEQ(pcb->snd_wl2, ack))) {
                     tcp_update_sndwin(pcb, new_wnd);
                     pcb->snd_wl1 = seq;
                     pcb->snd_wl2 = ack;
                 }
-                bool duplicate_ack = !window_changed &&
-                    ack == pcb->last_ack && seg_len == 0 &&
-                    SEQ_GT(pcb->snd_nxt, pcb->snd_una);
-                if (duplicate_ack) {
-                    pcb->last_ack_repeat++;
 
-                    tcp_ca_recv_repeat_ack(pcb,
-                                           pcb->last_ack_repeat);
-
-                } else if (ack != pcb->last_ack) {
-                    pcb->last_ack = ack;
+                if (!duplicate_ack) {
                     pcb->last_ack_repeat = 0;
+                    break;
                 }
 
+                pcb->last_ack = ack;
+                pcb->last_ack_repeat++;
+                if (pcb->last_ack_repeat == 3u) {
+                    tcp_retransmit_first(pcb);
+                    tcp_ca_event(pcb, TCP_CA_EVENT_LOSS);
+                } else if (pcb->last_ack_repeat > 3u) {
+                    tcp_ca_event(pcb, TCP_CA_EVENT_DUP_ACK);
+                }
                 break;
             }
             if(pcb->state == TCP_STATE_FIN_WAIT_1 && pcb->snd_una == pcb->snd_end){
@@ -1966,60 +2013,45 @@ TIME-WAIT STATE
 ESTABLISHED STATE
 FIN-WAIT-1 STATE
 FIN-WAIT-2 STATE
-如果设置了URG位，那么设置RCV.UP <- max(RCV.UP,SEG.UP)，并且如果紧急指针
-（RCV.UP）在消耗的数据之前，则向用户发送信号，告知远程侧具有紧急数据。如果用户已经
-收到此连续紧急数据序列的信号（或仍处于“紧急模式”），则不要再次向用户发出信号。
+如果设置了URG位，那么设置RCV.UP <- max(RCV.UP,SEG.UP)，并且如果紧急指�?
+（RCV.UP）在消耗的数据之前，则向用户发送信号，告知远程侧具有紧急数据。如果用户已�?
+收到此连续紧急数据序列的信号（或仍处于“紧急模式”），则不要再次向用户发出信号�?
 CLOSE-WAIT STATE
 CLOSING STATE
 LAST-ACK STATE
 TIME-WAIT STATE
-这不应该发生，因为已经从远程端接收到FIN。忽略URG。
+这不应该发生，因为已经从远程端接收到FIN。忽略URG�?
 */
 //to do
 /*
-第七步，处理段的文本：
+第七步，处理段的文本�?
 ESTABLISHED STATE
 FIN-WAIT-1 STATE
 FIN-WAIT-2 STATE
 一旦处于ESTABLISHED状态，就可以将段数据传递到用户RECEIVE缓冲区。来自段的数
 据可以移动到缓冲区中，直到缓冲区已满或段为空。如果段清空并带有PUSH标志，则当返
-回缓冲区时，通知用户已收到PUSH。
-当TCP端点负责将数据交付给用户时，它还必须确认数据的接收。
+回缓冲区时，通知用户已收到PUSH�?
+当TCP端点负责将数据交付给用户时，它还必须确认数据的接收�?
 一旦TCP端点对数据负责，它就会提高RCV.NXT超过接受的数据，并调整RCV.WND适用
-于当前可用缓冲区。RCV.NXT与RCV.WND的和不应降低。
-当一个有效段到达时，该段位于窗口中，但不在窗口左侧边缘，TCP实现可以发送确认
-RCV.NXT的ACK段（MAY-13）。
-请注意第3.8节中的窗口管理建议。
+于当前可用缓冲区。RCV.NXT与RCV.WND的和不应降低�?
+当一个有效段到达时，该段位于窗口中，但不在窗口左侧边缘，TCP实现可以发送确�?
+RCV.NXT的ACK段（MAY-13）�?
+请注意第3.8节中的窗口管理建议�?
 发送一个该格式的确认：
 <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-如果可能，该确认应捎带（piggybacked ）在正在传输的段上，而不会引起过度的延迟。
+如果可能，该确认应捎带（piggybacked ）在正在传输的段上，而不会引起过度的延迟�?
 CLOSE-WAIT STATE
 CLOSING STATE
 LAST-ACK STATE
 TIME-WAIT STATE
-这不应该发生，因为已经从远程端接收到FIN。忽略段文本。
+这不应该发生，因为已经从远程端接收到FIN。忽略段文本�?
 */
 switch(pcb->state){
     case TCP_STATE_ESTABLISHED:
     case TCP_STATE_FIN_WAIT_1:
     case TCP_STATE_FIN_WAIT_2:
-        if(data_len > 0 || (flags & TCP_FLAG_FIN)){
-            bool out_of_order = SEQ_GT(seq, pcb->rcv_nxt);
-            bool accepted = tcp_process_received_data(pcb, skb);
-            if (out_of_order) {
-                tcp_update_timer(pcb, &pcb->ack_deadline_ms,
-                                 get_current_time_ms(), true);
-            } else if (accepted) {
-                if (++pcb->ack_pending_segments >= 3) {
-                    tcp_update_timer(pcb, &pcb->ack_deadline_ms,
-                                     get_current_time_ms(), false);
-                } else {
-                    tcp_update_timer(pcb, &pcb->ack_deadline_ms,
-                                     get_current_time_ms() + pcb->ack_timeout,
-                                     false);
-                }
-            }
-        }
+        if(data_len > 0 || (flags & TCP_FLAG_FIN))
+            tcp_receive_data(pcb, skb);
         break;
     case TCP_STATE_CLOSE_WAIT:
     case TCP_STATE_CLOSING:
@@ -2031,28 +2063,28 @@ switch(pcb->state){
 /*
 第八步，校验FIN位：
 如果由于SEG.SEQ无法验证导致状态为CLOSED、LISTEN或SYN-SENT，则不要处理FIN；丢弃段
-并返回。
+并返回�?
 如果设置了FIN位，则向用户发出“connection closing”信号，并以相同消息返回任何即将发送的
-RECEIVE，基于FIN提高RCV.NXT，并发送FIN的确认。请注意，FIN表示对任何段文本的PUSH都
-尚未传递给用户。
+RECEIVE，基于FIN提高RCV.NXT，并发送FIN的确认。请注意，FIN表示对任何段文本的PUSH�?
+尚未传递给用户�?
 SYN-RECEIVED STATE
 ESTABLISHED STATE
-进入CLOSE-WAIT状态
+进入CLOSE-WAIT状�?
 FIN-WAIT-1 STATE
 如果我们的FIN已被确认（可能在该段中），则进入TIME-WAIT，启动时间等待计时器，关闭其
-他计时器；否则，进入CLOSING状态。
+他计时器；否则，进入CLOSING状态�?
 FIN-WAIT-2 STATE
-进入TIME-WAIT状态。启动时间等待计时器，关闭其他计时器。
+进入TIME-WAIT状态。启动时间等待计时器，关闭其他计时器�?
 CLOSE-WAIT STATE
 Remain in the CLOSE-WAIT state.
-保持在CLOSE-WAIT状态。
+保持在CLOSE-WAIT状态�?
 CLOSING STATE
-保持在CLOSING状态。
+保持在CLOSING状态�?
 LAST-ACK STATE
-保持在LAST-ACK状态。
+保持在LAST-ACK状态�?
 TIME-WAIT STATE
-保持在TIME-WAIT状态。重启2 MSL时间等待超时。
-并返回。
+保持在TIME-WAIT状态。重�? MSL时间等待超时�?
+并返回�?
     */
     if(pcb->state == TCP_STATE_CLOSED || pcb->state == TCP_STATE_SYN_SENT) {
         return 0;
@@ -2122,11 +2154,13 @@ TIME-WAIT STATE
     }
     return 0;
 }
-static void tcp_build_header(tcp_pcb* pcb, skbuff* skb){
-    uint8_t flags = skb->l4_private.tcp.flag;
+static void tcp_build_header(tcp_pcb* pcb, skbuff* skb, uint32_t ack){
+    uint8_t flags = tcp_ecn_tx_flags(pcb, skb->l4_private.tcp.flag);
+    skb->l4_private.tcp.flag = flags;
     uint32_t opt_len = tcp_build_options(pcb, skb);
 
-    tcp_hdr* hdr = (tcp_hdr*)skb_data_push(skb, sizeof(tcp_hdr));
+    tcp_hdr* hdr = (tcp_hdr*)skb_data_push(
+        skb, sizeof(tcp_hdr), sizeof(tcp_hdr));
     memset(hdr, 0, sizeof(tcp_hdr));
     skb->tcp_hdr = hdr;
     skb->tx_checksum_offset = 0;
@@ -2135,7 +2169,7 @@ static void tcp_build_header(tcp_pcb* pcb, skbuff* skb){
     hdr->dport = pcb->sock->dport;
 
     hdr->seq = htonl(skb->l4_private.tcp.seq);
-    hdr->ack_seq = htonl(pcb->rcv_nxt);
+    hdr->ack_seq = htonl(ack);
 
     hdr->flags = flags;
     hdr->doff_res_flags = (uint8_t)(((sizeof(tcp_hdr) + opt_len) / 4) << 4);
@@ -2164,55 +2198,162 @@ static void tcp_build_header(tcp_pcb* pcb, skbuff* skb){
                 pcb->sock->dip, IPPROTO_TCP);
     }
 }
-
-/* Build and submit one packet.  Selection policy and TCP state mutation stay
- * in the new-data/retransmit callers so future recovery algorithms can pick
- * an arbitrary retransmit-queue skb without duplicating the wire path. */
-static int tcp_xmit_segment(tcp_pcb* pcb, skbuff* skb, uint32_t seq_budget,
-                            bool push)
+static int tcp_xmit_skb(tcp_pcb* pcb, skbuff* skb, uint32_t ack,
+                        uint32_t xmit_flags)
 {
     Socket* sock = pcb->sock;
-
-    skbuff* send_skb = skb_clone(skb);
-    if (!send_skb)
-        return -ENOMEM;
-
-    uint32_t data_budget = seq_budget;
-    if (data_budget && (send_skb->l4_private.tcp.flag & TCP_FLAG_SYN))
-        data_budget--;
-    if (data_budget < skb_data_len(send_skb))
-        skb_truncate(send_skb, data_budget);
-    if (seq_budget < tcp_skb_seq_len(skb))
-        send_skb->l4_private.tcp.flag &= ~TCP_FLAG_FIN;
-    send_skb->l4_private.tcp.seq_end =
-        send_skb->l4_private.tcp.seq + seq_budget;
-    if (push)
-        send_skb->l4_private.tcp.flag |= TCP_FLAG_PSH;
-
-    int ret = tcp_set_socket_route(
-            sock,
-            sock->family == AF_INET6 ? sock->dip6
-                                     : (const uint8_t*)&sock->dip,
-            sock->family == AF_INET6 ? sock->dip6_scope_id : 0);
-    if (ret < 0) {
-        sock->error = EHOSTUNREACH;
-        socket_notify_event(sock, notify_err);
-        ret = -EHOSTUNREACH;
-        goto out;
+    skbuff* send_skb = skb;
+    bool tracked = (xmit_flags & (TCP_XMIT_FLAG_NEW_TRANSMIT |
+                                  TCP_XMIT_FLAG_RETRANSMIT)) != 0;
+    if (tracked) {
+        send_skb = skb_clone(skb);
+        if (!send_skb)
+            return -ENOMEM;
     }
+
+    bool has_payload = skb_data_len(send_skb) != 0;
+
+    const uint8_t* dest_ip = sock->family == AF_INET6
+                                 ? sock->dip6
+                                 : (const uint8_t*)&sock->dip;
+    uint32_t scope_id = sock->family == AF_INET6
+                            ? sock->dip6_scope_id : 0;
+    if (!socket_route_is_valid(sock, dest_ip, scope_id)) {
+        int ret = tcp_set_socket_route(sock, dest_ip, scope_id);
+        if (ret < 0) {
+            sock->error = EHOSTUNREACH;
+            socket_notify_event(sock, notify_err);
+            if (tracked)
+                PUT_REF(send_skb);
+            return ret;
+        }
+    }
+
     set_skb_by_socket(send_skb, sock);
 
-    tcp_build_header(pcb, send_skb);
-    ret = sock->family == AF_INET6
+    tcp_build_header(pcb, send_skb, ack);
+
+    if ((xmit_flags & TCP_XMIT_FLAG_NEW_TRANSMIT) &&
+        pcb->tcp_flag.ecn_ok && has_payload &&
+        !(send_skb->l4_private.tcp.flag & TCP_FLAG_SYN))
+        send_skb->l4_private.tcp.ip_ecn = TCP_ECN_ECT0;
+
+
+    int ret = sock->family == AF_INET6
         ? ipv6_output(send_skb) : ipv4_output(send_skb);
-    if (ret >= 0 && (send_skb->l4_private.tcp.flag & TCP_FLAG_ACK)) {
+
+    if (ret == 0 && (send_skb->l4_private.tcp.flag & TCP_FLAG_ACK)) {
+        pcb->last_ack_sent = ack;
         pcb->ack_pending_segments = 0;
-        tcp_update_timer(pcb, &pcb->ack_deadline_ms, TCP_TIMER_STOP, false);
+        tcp_update_timer(pcb, &pcb->ack_deadline_ms,
+                         TCP_TIMER_STOP, true);
     }
 
-out:
-    PUT_REF(send_skb);
+    if (xmit_flags & TCP_XMIT_FLAG_NEW_TRANSMIT) {
+        if (skb->l4_private.tcp.flag & TCP_FLAG_SYN)
+            pcb->snd_end++;
+        pcb->snd_nxt += tcp_skb_seq_len(skb);
+        tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
+                         get_current_time_ms() + pcb->retransmit_timeout,
+                         false);
+        if (skb->l4_private.tcp.flag & TCP_FLAG_FIN)
+            tcp_commit_fin_send(pcb);
+        if (!(skb->l4_private.tcp.flag & TCP_FLAG_SYN) &&
+            !pcb->rtt_meas_time) {
+            pcb->rtt_meas_time = get_current_time_ms();
+            pcb->rtt_meas_seq = skb->l4_private.tcp.seq;
+        }
+        tcp_skb_tree_insert(&pcb->retransmit_tree, skb,
+                        offsetof(skbuff, retransmit_node));
+        tcp_rack_skb_sent(pcb, skb, get_current_time_ms());
+    } else if (xmit_flags & TCP_XMIT_FLAG_RETRANSMIT) {
+        tcp_rack_skb_sent(pcb, skb, get_current_time_ms());
+    }
+
+    if (tracked)
+        PUT_REF(send_skb);
+
     return ret;
+}
+
+
+skbuff* tcp_skb_split(tcp_pcb* pcb, skbuff* skb, uint32_t seq_len)
+{
+    uint32_t data_len = skb_data_len(skb);
+    uint32_t split_seq = skb->l4_private.tcp.seq + seq_len;
+    uint64_t pkt_send_ms = skb->l4_private.tcp.pkt_send_ms;
+    uint8_t sack_state = skb->l4_private.tcp.sack_state;
+    bool in_send_queue = LIST_ATTACHED(&skb->queue_node);
+    bool in_retransmit_tree = !RB_EMPTY_NODE(&skb->retransmit_node);
+    bool in_rack_queue = LIST_ATTACHED(&skb->rack_node);
+    list_node* send_prev = in_send_queue ? skb->queue_node.pre : NULL;
+    skbuff* tail;
+
+    /* Splitting changes the byte ranges, so re-account SACK state on both
+     * resulting skbs after the split. */
+    tcp_sack_set_state(pcb, skb, 0);
+
+    if (in_send_queue) {
+        remove_list_node(&skb->queue_node);
+        pcb->sock->send_queue.element_number--;
+    }
+    if (in_retransmit_tree)
+        tcp_skb_tree_remove(&pcb->retransmit_tree, skb,
+                            offsetof(skbuff, retransmit_node));
+    if (in_rack_queue)
+        tcp_rack_queue_remove(pcb, skb);
+
+    if (seq_len < data_len) {
+        tail = skb_split(skb, seq_len);
+    } else {
+        /* The split is between payload and FIN (or after SYN). */
+        tail = tcp_alloc_skb(pcb->sock, 0);
+    }
+    if (!tail) {
+        tcp_sack_set_state(pcb, skb, sack_state);
+        if (in_send_queue) {
+            add_list_node(send_prev, &skb->queue_node);
+            pcb->sock->send_queue.element_number++;
+        }
+        if (in_retransmit_tree) {
+            tcp_skb_tree_insert(&pcb->retransmit_tree, skb,
+                                offsetof(skbuff, retransmit_node));
+        }
+        if (in_rack_queue)
+            tcp_rack_update_skb(pcb, skb);
+        return NULL;
+    }
+
+    tail->l4_private = skb->l4_private;
+    /* Both pieces belong to the same original transmission. */
+    tail->l4_private.tcp.pkt_send_ms = pkt_send_ms;
+    tail->l4_private.tcp.seq = split_seq;
+    tail->l4_private.tcp.seq_end = skb->l4_private.tcp.seq_end;
+    if (skb->l4_private.tcp.flag & TCP_FLAG_SYN)
+        tail->l4_private.tcp.flag &= ~TCP_FLAG_SYN;
+
+    skb->l4_private.tcp.seq_end = split_seq;
+    skb->l4_private.tcp.flag &= ~TCP_FLAG_FIN;
+
+    tcp_sack_set_state(pcb, skb, sack_state);
+    tcp_sack_set_state(pcb, tail, sack_state);
+
+    if (in_send_queue) {
+        add_list_node(send_prev, &skb->queue_node);
+        add_list_node(&skb->queue_node, &tail->queue_node);
+        pcb->sock->send_queue.element_number += 2;
+    }
+    if (in_retransmit_tree) {
+        tcp_skb_tree_insert(&pcb->retransmit_tree, skb,
+                            offsetof(skbuff, retransmit_node));
+        tcp_skb_tree_insert(&pcb->retransmit_tree, tail,
+                            offsetof(skbuff, retransmit_node));
+    }
+    if (in_rack_queue) {
+        tcp_rack_update_skb(pcb, skb);
+        tcp_rack_update_skb(pcb, tail);
+    }
+    return tail;
 }
 
 static void tcp_commit_fin_send(tcp_pcb* pcb)
@@ -2230,76 +2371,10 @@ static void tcp_commit_fin_send(tcp_pcb* pcb)
     }
 }
 
-static int tcp_xmit_new_skb(tcp_pcb* pcb, skbuff* skb,
-                            uint32_t seq_budget, bool push)
+static int tcp_send_new(tcp_pcb* pcb)
 {
     Socket* sock = pcb->sock;
-    uint32_t seq_len = tcp_skb_seq_len(skb);
-    seq_budget = min(seq_budget, seq_len);
-
-    /* Prepare any unsent tail before submitting the packet.  Once output
-     * succeeds, queue/sequence commit below cannot fail due to allocation. */
-    if (seq_budget < seq_len) {
-        skbuff* tail_skb;
-
-        if (seq_budget < skb_data_len(skb)) {
-            tail_skb = skb_split(skb, seq_budget);
-        } else {
-            tail_skb = tcp_alloc_skb(sock, tcp_max_hdr_reserve_len(sock));
-            if (tail_skb)
-                tail_skb->l4_private = skb->l4_private;
-        }
-
-        if (!tail_skb) {
-            tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
-                             get_current_time_ms() +
-                                 TCP_NAGLE_INTERVAL_MS_DEFAULT,
-                             false);
-            return -ENOMEM;
-        }
-
-        skb->l4_private.tcp.flag &= ~TCP_FLAG_FIN;
-        tail_skb->l4_private.tcp.seq =
-            skb->l4_private.tcp.seq + seq_budget;
-        skb->l4_private.tcp.seq_end =
-            skb->l4_private.tcp.seq + seq_budget;
-
-        (void)pop_queue(&sock->send_queue);
-        add_queue_first(&sock->send_queue, &tail_skb->queue_node);
-        add_queue_first(&sock->send_queue, &skb->queue_node);
-    }
-
-    int ret = tcp_xmit_segment(pcb, skb, seq_budget, push);
-    if (ret < 0) {
-        /* This data never left the host, so keep it on send_queue and retry
-         * soon rather than starting an RTO for it. */
-        tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
-                         get_current_time_ms() +
-                             TCP_NAGLE_INTERVAL_MS_DEFAULT,
-                         false);
-        return ret;
-    }
-    pcb->snd_nxt += seq_budget;
-    tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
-                     get_current_time_ms() + pcb->retransmit_timeout, false);
-    if (skb->l4_private.tcp.flag & TCP_FLAG_FIN)
-        tcp_commit_fin_send(pcb);
-
-    if (!pcb->rtt_meas_time) {
-        pcb->rtt_meas_time = get_current_time_ms();
-        pcb->rtt_meas_seq = skb->l4_private.tcp.seq;
-    }
-
-    (void)pop_queue(&sock->send_queue);
-    (void)tcp_retransmit_enqueue(pcb, skb);
-    return ret;
-}
-
-/* Transmit queued segments up to the per-callback burst limit. */
-static int tcp_write_xmit(tcp_pcb* pcb)
-{
-    Socket* sock = pcb->sock;
-    uint32_t sent_count = 0;
+    uint32_t sent_bytes = 0;
     int ret = 0;
 
     while (sock->send_queue.element_number) {
@@ -2311,19 +2386,31 @@ static int tcp_write_xmit(tcp_pcb* pcb)
             break;
         }
 
-        uint32_t data_len = skb_data_len(skb);
-        uint32_t seq_budget = tcp_skb_seq_budget(pcb, skb, false);
+        uint32_t seq_budget = tcp_skb_budget(pcb, skb);
         if (!seq_budget)
             break;
 
-        ret = tcp_xmit_new_skb(
-            pcb, skb, seq_budget,
-            seq_budget == tcp_skb_seq_len(skb) && data_len &&
-                sock->send_queue.element_number == 1);
-        if (ret < 0)
-            return ret;
+        uint32_t seq_len = tcp_skb_seq_len(skb);
+        seq_budget = min(seq_budget, seq_len);
+        if (seq_budget < seq_len) {
+            skbuff* tail_skb = tcp_skb_split(pcb, skb, seq_budget);
+            if (!tail_skb) {
+                tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
+                                 get_current_time_ms() +
+                                     TCP_NAGLE_INTERVAL_MS_DEFAULT,
+                                 false);
+                ret = -ENOMEM;
+                break;
+            }
+        }
 
-        if (++sent_count >= TCP_OUTPUT_BURST_MAX) {
+        tcp_xmit_skb(pcb, skb, pcb->rcv_nxt,
+                     TCP_XMIT_FLAG_NEW_TRANSMIT);
+
+        (void)pop_queue(&sock->send_queue);
+
+        sent_bytes += seq_budget;
+        if (sent_bytes >= TCP_OUTPUT_BURST_MAX * pcb->snd_mss) {
             if (sock->send_queue.element_number)
                 tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
                                  get_current_time_ms(), false);
@@ -2333,71 +2420,32 @@ static int tcp_write_xmit(tcp_pcb* pcb)
     return ret;
 }
 
-/* Limit one transmitted skb by sequence length, MSS and the peer window.
- * New data is additionally bounded by cwnd.  Retransmitted data uses the
- * RFC 6675 pipe estimate for congestion control instead of treating cwnd as
- * a sequence-number right edge.  A zero-window probe bypasses both. */
-static uint32_t tcp_skb_seq_budget(tcp_pcb* pcb, skbuff* skb, bool probe)
+
+static inline uint32_t tcp_skb_budget(tcp_pcb* pcb, skbuff* skb)
 {
-    uint32_t seq_len = tcp_skb_seq_len(skb);
-    if (probe)
-        return min(seq_len, 1u);
-    if (skb->l4_private.tcp.flag & TCP_FLAG_SYN)
-        return seq_len;
-
-    bool retransmit = SEQ_LT(skb->l4_private.tcp.seq, pcb->snd_nxt);
-    uint32_t send_window = retransmit || pcb->snd_wnd <= pcb->snd_cwnd
-        ? pcb->snd_wnd : (uint32_t)pcb->snd_cwnd;
-    uint32_t send_window_end = pcb->snd_una + send_window;
-    if (!send_window ||
-        SEQ_GEQ(skb->l4_private.tcp.seq, send_window_end))
+    if(SEQ_GEQ(skb->l4_private.tcp.seq, pcb->snd_una + tcp_win_limit(pcb)))
         return 0;
-
-    uint32_t data_len = skb_data_len(skb);
-    uint32_t packet_mss = tcp_data_mss(pcb);
-    uint32_t sack_len = tcp_sack_option_len(
-        pcb, skb->l4_private.tcp.flag);
-    packet_mss = packet_mss > sack_len ? packet_mss - sack_len : 0u;
-    uint32_t packet_cap = min(data_len, packet_mss);
-    if ((skb->l4_private.tcp.flag & TCP_FLAG_FIN) && packet_cap == data_len)
-        packet_cap++;
-
-    return min(seq_len,
-               min(packet_cap,
-                   send_window_end - skb->l4_private.tcp.seq));
+    uint32_t t = pcb->snd_una + tcp_win_limit(pcb) - skb->l4_private.tcp.seq;
+    uint32_t mss = pcb->snd_mss;
+    return t - t % mss;
+    
 }
 
-static int tcp_retransmit_skb(tcp_pcb* pcb, skbuff* skb, bool probe)
+void tcp_retransmit_skb(tcp_pcb* pcb, skbuff* skb)
 {
-    uint32_t seq_budget = tcp_skb_seq_budget(pcb, skb, probe);
-    if (!seq_budget)
-        return 0;
-
-    /* A cumulative ACK after this retransmission is ambiguous.  Timestamp
-     * RTT samples remain usable, but the sequence-based sample does not. */
-    pcb->rtt_meas_time = 0;
-    return tcp_xmit_segment(pcb, skb, seq_budget, false);
-}
-
-static int tcp_send_probe(tcp_pcb* pcb)
-{
-    skbuff* skb;
-    if (pcb->retransmit_queue.element_number) {
-        skb = SKB_FROM_NODE(
-            get_queue_first(&pcb->retransmit_queue), queue_node);
-        return tcp_retransmit_skb(pcb, skb, true);
+    uint64_t budget = tcp_skb_budget(pcb, skb);
+    if(budget < tcp_skb_seq_len(skb)){
+        WARN_LOG("send win or cwnd win decrease ???");
     }
-
-    skb = SKB_FROM_NODE(get_queue_first(&pcb->sock->send_queue), queue_node);
-    return tcp_xmit_new_skb(
-        pcb, skb, tcp_skb_seq_budget(pcb, skb, true), false);
+    pcb->rtt_meas_time = 0;
+    tcp_xmit_skb(pcb, skb, pcb->rcv_nxt,
+                 TCP_XMIT_FLAG_RETRANSMIT);
 }
-static void tcp_send_fin(tcp_pcb* pcb){
+static void tcp_send_new_fin(tcp_pcb* pcb){
     Socket* sock = pcb->sock;
     skbuff* last_send_skb = SKB_FROM_NODE(get_queue_last(&sock->send_queue), queue_node);
     if(!last_send_skb){
-        uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-        last_send_skb = tcp_alloc_skb(sock, reserve_len);
+        last_send_skb = tcp_alloc_skb(sock, 0);
         if(!last_send_skb){
             ERR_LOG("Failed to allocate skb for sending FIN");
             tcp_destroy_socket(sock);
@@ -2405,11 +2453,11 @@ static void tcp_send_fin(tcp_pcb* pcb){
         }
         last_send_skb->l4_private.tcp.seq = pcb->snd_end;
         last_send_skb->l4_private.tcp.flag = TCP_FLAG_ACK;
-        tcp_skb_refresh_seq_end(last_send_skb);
+        tcp_skb_update_seq_end(last_send_skb);
         add_queue(&sock->send_queue, &last_send_skb->queue_node);
     }
     last_send_skb->l4_private.tcp.flag |= TCP_FLAG_FIN;
-    tcp_skb_refresh_seq_end(last_send_skb);
+    tcp_skb_update_seq_end(last_send_skb);
     pcb->snd_end++;
 
     if (pcb->nagle_deadline_ms == TCP_TIMER_STOP &&
@@ -2431,8 +2479,6 @@ static int tcp_connect(Socket *sock, req* req, const sockaddr_in *addr, socklen_
 
     if (req->status == REQ_WAITING_CONNECT)
         goto retry;
-    if (!addr)
-        return -EFAULT;
     if (addrlen < required)
         return -EINVAL;
     if (addr->sin_family != sock->family)
@@ -2545,7 +2591,7 @@ static int tcp_connect(Socket *sock, req* req, const sockaddr_in *addr, socklen_
     }
 
     pcb->state = TCP_STATE_SYN_SENT;
-    ret = tcp_send_syn(sock, false);
+    ret = tcp_send_new_syn(sock);
     if (ret < 0) {
         ret = ret == -ENOMEM ? -ENOMEM : -ENETUNREACH;
         pcb->state = TCP_STATE_CLOSED;
@@ -2638,7 +2684,7 @@ static int tcp_accept(Socket* sock,req* r, sockaddr_in *addr, socklen_t *addrlen
         goto exit;
     }
     if(!pcb->accept_list_num){
-        if(sock->file_flags & O_NONBLOCK){
+        if(!r || (sock->file_flags & O_NONBLOCK)){
             ret = -EAGAIN;
             goto exit;
         }
@@ -2743,7 +2789,7 @@ static int tcp_read(Socket* sock,req* req,void *buf,uint32_t len)
     }
     /* If the receive queue is empty, either return EOF or wait. */
     if (!sock->recv_queue.element_number) {
-        if (sock->file_flags & O_NONBLOCK) {
+        if (!req || (sock->file_flags & O_NONBLOCK)) {
             ret = -EAGAIN;
             goto exit;
         }
@@ -2773,7 +2819,6 @@ static int tcp_read(Socket* sock,req* req,void *buf,uint32_t len)
 
         uint32_t n = (avail <= (len - copied)) ? avail : (len - copied);
 
-        /* 使用 skb_copy_bits 正确处理 scatter-gather 多缓冲区 */
         if (!skb_copy_bits(skb, 0, (uint8_t*)buf + copied, n)) {
             ERR_LOG("tcp_read: skb_copy_bits failed");
             if (!copied) {
@@ -2783,24 +2828,19 @@ static int tcp_read(Socket* sock,req* req,void *buf,uint32_t len)
             break;
         }
         copied += n;
-
         sock->recv_buffer_len -= n;
 
         if (n < avail) {
-            /* 没读完：consume 截断开头（跨 fragment 安全），skb 留在队首 */
             skb_consume(skb, n, false);
             break;
         }
 
-        /* 完全读完：出队释放 */
         pop_queue(&sock->recv_queue);
         PUT_REF(skb);
     }
     uint32_t old_wnd = pcb->rcv_wnd;
-    pcb->rcv_wnd = tcp_receive_space(pcb);
+    pcb->rcv_wnd = SOCKET_USEABLE_RECV_BUFF_SIZE(sock);
     if (pcb->rcv_wnd > old_wnd) {
-        /* A blocked peer needs a prompt window update after userspace drains
-         * the receive queue; otherwise it can wait for a persist probe. */
         tcp_update_timer(pcb, &pcb->ack_deadline_ms, get_current_time_ms(), false);
     }
 
@@ -2827,10 +2867,6 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
 		return -EPIPE;
 	}
 
-    if(!buf){
-        ret = -EFAULT;
-        goto exit;
-    }
     if(!sock->flag.is_connected || !sock->flag.is_bound){
         ret = -ENOTCONN;
         goto exit;
@@ -2840,8 +2876,6 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
         case TCP_STATE_CLOSE_WAIT:
         case TCP_STATE_SYN_SENT:
         case TCP_STATE_SYN_RECEIVED:
-            /* Established sockets can send immediately; data queued during
-             * the handshake is sent once the connection is established. */
             break;
         case TCP_STATE_FIN_WAIT_1:
         case TCP_STATE_FIN_WAIT_2:
@@ -2856,10 +2890,10 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
             ret = -ENOTCONN;
             goto exit;
     }
-    /* Check send buffer space (blocking/non-blocking). */
+
     if(sock->send_buffer_len >= sock->send_buffer_len_max
         || pcb->state == TCP_STATE_SYN_SENT || pcb->state == TCP_STATE_SYN_RECEIVED){
-        if(sock->file_flags & O_NONBLOCK){
+        if(!req || (sock->file_flags & O_NONBLOCK)){
             ret = -EAGAIN;
             goto exit;
         }
@@ -2881,48 +2915,42 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
         goto exit;
     }
 
-    /* Cap total bytes to available send buffer space. */
-    uint32_t space = sock->send_buffer_len_max - sock->send_buffer_len;
-    if (len > space) {
-        DEBUG_LOG("TCP send buffer only has %u bytes, truncating write from %u", space, len);
-        len = space;
-    }
+    /* Treat send_buffer_len_max as a high-water mark for a write request.
+     * Once a request starts while the buffer is below the mark, enqueue the
+     * whole request.  This keeps async writes from completing one MSS at a
+     * time when only a small amount of space remains.  The next request will
+     * wait until ACKs drain the queue below the mark again. */
 
-    /* Effective per-segment data limit = MSS minus current TCP options. */
-    uint32_t seg_limit = tcp_data_mss(pcb);
 
-    /* Loop: append data across one or more skbs. */
+    uint32_t seg_limit = pcb->snd_mss;
+
+
+    uint32_t skb_capacity = tcp_skb_capacity(pcb);
+
     while (send_len < len) {
         uint32_t chunk = (len - send_len);
-        if (chunk > seg_limit)
-            chunk = seg_limit;
+        if (chunk > skb_capacity)
+            chunk = skb_capacity;
 
         skbuff* skb = SKB_FROM_NODE(get_queue_last(&sock->send_queue), queue_node);
-
-        /* Need a new skb if the last one is full or doesn't exist. */
-        if (!skb || skb_data_len(skb) + chunk > seg_limit) {
-            /* Reserve one complete MSS of payload capacity.  A short first
-             * write (for example an HTTP header) can then be extended by the
-             * next write without turning one TCP segment into a multi-data
-             * skb that must be linearized at the non-SG XDP TX boundary. */
-            uint32_t reserve_len = tcp_max_hdr_reserve_len(sock);
-            skb = tcp_alloc_skb(sock, reserve_len + seg_limit);
+        if (!skb || skb_data_len(skb) + chunk > skb_capacity) {
+            skb = tcp_alloc_skb(sock, skb_capacity);
             if (!skb) {
                 ERR_LOG("Failed to allocate skb for TCP write");
                 break;
             }
             skb->l4_private.tcp.seq = pcb->snd_end;
             skb->l4_private.tcp.flag = TCP_FLAG_ACK;
-            tcp_skb_refresh_seq_end(skb);
+            tcp_skb_update_seq_end(skb);
             add_queue(&sock->send_queue, &skb->queue_node);
         }
 
-        if (!skb_data_append(skb, (uint8_t*)buf + send_len, chunk, 0, seg_limit)) {
+        if (!skb_data_append(skb, (uint8_t*)buf + send_len, chunk, seg_limit)) {
             ERR_LOG("Failed to append data to skb for TCP write");
             break;
         }
 
-        tcp_skb_refresh_seq_end(skb);
+        tcp_skb_update_seq_end(skb);
         pcb->snd_end += chunk;
         sock->send_buffer_len += chunk;
         send_len += chunk;
@@ -2936,7 +2964,7 @@ static int tcp_write(Socket* sock, req* req, const void *buf, uint32_t len)
     skbuff* first_skb = SKB_FROM_NODE(get_queue_first(&sock->send_queue), queue_node);
     if (skb_data_len(first_skb) >= (seg_limit / 2)
         || sock->send_queue.element_number > 1) {
-        (void)tcp_write_xmit(pcb);
+        (void)tcp_send_new(pcb);
     } else {
         tcp_update_timer(pcb, &pcb->nagle_deadline_ms,
                          get_current_time_ms() + pcb->nagle_interval,
@@ -2961,7 +2989,7 @@ static int tcp_release(Socket* sock, req* req){
         pcb->state != TCP_STATE_CLOSED &&
         pcb->state != TCP_STATE_LISTEN &&
         pcb->state != TCP_STATE_TIME_WAIT) {
-            (void)tcp_send_flag(sock, pcb->snd_nxt, pcb->rcv_nxt,
+            (void)tcp_send_new_flag(sock, pcb->snd_nxt, pcb->rcv_nxt,
                                 TCP_FLAG_RST | TCP_FLAG_ACK);
         pcb->state = TCP_STATE_CLOSED;
         tcp_destroy_socket(sock);
@@ -2980,15 +3008,13 @@ static int tcp_release(Socket* sock, req* req){
         case TCP_STATE_CLOSE_WAIT:
             if (!sock->flag.close_send) {
                 sock->flag.close_send = 1;
-                tcp_send_fin(pcb);
+                tcp_send_new_fin(pcb);
             }
             break;
         case TCP_STATE_FIN_WAIT_1:
         case TCP_STATE_CLOSING:
         case TCP_STATE_LAST_ACK:
-            /* Already sent FIN — socket is now orphan.
-             * Reduce persist retries so a dead peer doesn't
-             * keep the socket alive forever.  (Linux tcp_orphan_retries) */
+
             pcb->retries_max = TCP_ORPHAN_RETRIES_DEFAULT;
             break;
         case TCP_STATE_FIN_WAIT_2:
@@ -2997,10 +3023,6 @@ static int tcp_release(Socket* sock, req* req){
                 get_current_time_ms() + pcb->finwait2_timeout, true);
             break;
         case TCP_STATE_TIME_WAIT:
-            /* The peer FIN has already been acknowledged.  Keep the PCB
-             * alive until the existing TIME-WAIT timer expires so duplicate
-             * segments can still be answered; closing the user fd needs no
-             * further TCP action. */
             break;
         default:
             ERR_LOG("tcp_release: unexpected TCP state %d on release", pcb->state);
@@ -3031,7 +3053,7 @@ static int tcp_setsockopt(Socket* sock,req* req,int level,int optname,const void
 
         if (optname == SO_RCVBUF) {
             uint32_t old_wnd = pcb->rcv_wnd;
-            pcb->rcv_wnd = tcp_receive_space(pcb);
+            pcb->rcv_wnd = SOCKET_USEABLE_RECV_BUFF_SIZE(sock);
             if (old_wnd != pcb->rcv_wnd && sock->owner &&
                 pcb->state >= TCP_STATE_SYN_RECEIVED &&
                 pcb->state != TCP_STATE_TIME_WAIT) {
@@ -3067,7 +3089,6 @@ static int tcp_setsockopt(Socket* sock,req* req,int level,int optname,const void
         return -EINVAL;
 
     bool enabled = *(const int*)optval != 0;
-    pcb->tcp_options.nodelay = enabled;
     pcb->nagle_interval = enabled ? 0 : TCP_NAGLE_INTERVAL_MS_DEFAULT;
     return 0;
 }
@@ -3083,7 +3104,7 @@ static int tcp_getsockopt(Socket* sock,req* req,int level,int optname,void* optv
     if (*optlen < sizeof(int))
         return -EINVAL;
 
-    int value = pcb->tcp_options.nodelay;
+    int value = pcb->nagle_interval == 0;
     memcpy(optval, &value, sizeof(value));
     *optlen = sizeof(value);
     return 0;
@@ -3091,8 +3112,6 @@ static int tcp_getsockopt(Socket* sock,req* req,int level,int optname,void* optv
 
 static int tcp_getsockname(Socket* sock,req* r,sockaddr_in* addr,socklen_t* addrlen){
     (void)r;
-    if (!addr || !addrlen)
-        return -EFAULT;
     struct sockaddr_storage out;
     socklen_t required;
     memset(&out, 0, sizeof(out));
@@ -3118,8 +3137,6 @@ static int tcp_getsockname(Socket* sock,req* r,sockaddr_in* addr,socklen_t* addr
 }
 static int tcp_getpeername(Socket* sock,req* r,sockaddr_in* addr,socklen_t* addrlen){
     (void)r;
-    if (!addr || !addrlen)
-        return -EFAULT;
     if(!sock->flag.is_connected)
         return -ENOTCONN;
     struct sockaddr_storage out;
@@ -3146,7 +3163,7 @@ static int tcp_getpeername(Socket* sock,req* r,sockaddr_in* addr,socklen_t* addr
     return 0;
 }
 
-/* ── ICMP 错误和 shutdown 回调 ──────────────────────────── */
+/* ── ICMP 错误�?shutdown 回调 ──────────────────────────── */
 
 static int tcp_icmp_process(Socket* sock, const icmp_error_info* info, int err)
 {
@@ -3159,11 +3176,11 @@ static int tcp_icmp_process(Socket* sock, const icmp_error_info* info, int err)
 
     sock->error = err;
 
-    /* 根据当前状态决定处理方式 */
+
     switch (pcb->state) {
         case TCP_STATE_SYN_SENT:
         case TCP_STATE_SYN_RECEIVED:
-            /* 握手阶段：ICMP 错误意味着连接失败，销毁 socket */
+
             tcp_destroy_socket(sock);
             break;
 
@@ -3177,7 +3194,7 @@ static int tcp_icmp_process(Socket* sock, const icmp_error_info* info, int err)
         case TCP_STATE_CLOSING:
         case TCP_STATE_LAST_ACK:
         case TCP_STATE_TIME_WAIT:
-            /* 已在关闭流程中：直接销毁 */
+
             tcp_destroy_socket(sock);
             break;
 
@@ -3212,14 +3229,13 @@ static int tcp_shutdown(struct Socket* sock, req* req, int how)
 
     if ((how == SHUT_WR || how == SHUT_RDWR) && !sock->flag.close_send) {
         sock->flag.close_send = 1;
-        tcp_send_fin(pcb);
+        tcp_send_new_fin(pcb);
         ret = 0;
     }
 
     return ret;
 }
 
-/* 保持操作表在文件末尾，便于核对所有回调的完整性。 */
 protocol_ops tcp_protocol_ops = {
     .protocol = IPPROTO_TCP,
     .pcb_init = tcp_pcb_init,

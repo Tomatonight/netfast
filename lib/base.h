@@ -32,7 +32,8 @@ typedef struct ref_info {
 } ref_info;
 
 static inline void ref_inc(ref_info* r) {
-    atomic_fetch_add_explicit(&r->ref_cnt, 1, memory_order_acq_rel);
+    /* The caller already owns a live reference. */
+    atomic_fetch_add_explicit(&r->ref_cnt, 1, memory_order_relaxed);
 }
 
 static inline bool ref_inc_not_zero(ref_info* r) {

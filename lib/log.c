@@ -135,9 +135,6 @@ int log_init(void)
 
 void log_out(const char *format, ...)
 {
-    if (!format)
-        return;
-
     va_list args;
     va_start(args, format);
     log_vout(format, args, 0);
@@ -146,9 +143,6 @@ void log_out(const char *format, ...)
 
 void log_out_limited(log_rate_limit *limit, const char *format, ...)
 {
-    if (!limit || !format)
-        return;
-
     uint64_t suppressed;
     if (!log_rate_limit_allow(limit, &suppressed))
         return;

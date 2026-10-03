@@ -56,6 +56,7 @@ static inline int RB_EMPTY_ROOT(const struct rb_root *root)
 /* 遍历：最左/最右/前驱/后继 */
 struct rb_node *rb_first(const struct rb_root *root);
 struct rb_node *rb_last(const struct rb_root *root);
+/* node must be non-NULL; reaching the end of traversal returns NULL. */
 struct rb_node *rb_next(const struct rb_node *node);
 struct rb_node *rb_prev(const struct rb_node *node);
 

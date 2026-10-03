@@ -14,52 +14,45 @@ int skb_send_frags(skbuff* skb)
 
 	/* 发送首片 */
 	if (route->if_info->ops->send(route->if_info, skb) < 0)
-		goto cleanup;
+		return -1;
 
 	/* 发送其余分片 */
 	skbuff* frag;
 	list_node* tmp;
 	FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, tmp, skbuff, frag_list) {
 		remove_list_node(&frag->frag_list);
-		if (frag->route->if_info->ops->send(frag->route->if_info, frag) < 0)
-			WARN_LOG("Failed to send fragment");
+		if (frag->route->if_info->ops->send(frag->route->if_info, frag) < 0) {
+			WARN_LOG("Failed to send fragment; stopping fragment transmission");
+			PUT_REF(frag);
+			/* Release every fragment that has not been sent yet. */
+			FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, tmp,
+			                         skbuff, frag_list) {
+				remove_list_node(&frag->frag_list);
+				PUT_REF(frag);
+			}
+			return -1;
+		}
 		PUT_REF(frag);
 	}
 	return 0;
-
-cleanup:
-	{
-		skbuff* f;
-		list_node* t;
-		FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, f, t, skbuff, frag_list) {
-			remove_list_node(&f->frag_list);
-			PUT_REF(f);
-		}
-	}
-	return -1;
 }
 
-uint32_t skb_consume(skbuff* skb, uint32_t size, bool linear)
+uint8_t* skb_consume(skbuff* skb, uint32_t size, bool linear)
 {
-	uint32_t consumed = min(size, skb->data_total_len);
-	if (!consumed)
-		return 0;
+	uint8_t* start = skb_start(skb);
+	if (size > skb->data_total_len)
+		return NULL;
+	if (!size)
+		return start;
 	if (linear) {
-		consumed = min(consumed, skb_data0_len(skb));
-		skb->data0.start += consumed;
-		if (!skb_data0_len(skb) && skb->data_num > 1) {
-			frame_slot* old_slot = skb->data0.slot;
-			data_info* next = skb->data0.next;
-			skb->data0 = *next;
-			free(next);
-			skb->data_num--;
-			PUT_REF(old_slot);
-		}
-		skb->data_total_len -= consumed;
-		return consumed;
+		if (size > skb_data0_len(skb))
+			return NULL;
+		skb->data0.start += size;
+		skb->data_total_len -= size;
+		return start;
 	}
 
-	uint32_t remaining = consumed;
+	uint32_t remaining = size;
 	while (remaining) {
 		uint32_t len = skb_data0_len(skb);
 		if (remaining < len) {
@@ -68,20 +61,14 @@ uint32_t skb_consume(skbuff* skb, uint32_t size, bool linear)
 		}
 		remaining -= len;
 		frame_slot* old_slot = skb->data0.slot;
-		if (skb->data_num == 1) {
-			/* Keep one empty data_info/frame_slot so the skb can be reused
-			 * for header prepend or cloned after all payload is consumed. */
-			skb->data0.start = skb->data0.end;
-			break;
-		}
 		data_info* next = skb->data0.next;
 		skb->data0 = *next;
 		free(next);
 		PUT_REF(old_slot);
 		skb->data_num--;
 	}
-	skb->data_total_len -= consumed;
-	return consumed;
+	skb->data_total_len -= size;
+	return start;
 }
 //linger
 bool skb_data_expand(skbuff* skb, uint32_t size, bool begin)
@@ -107,38 +94,64 @@ bool skb_data_expand(skbuff* skb, uint32_t size, bool begin)
 	return false;
 }
 
-uint8_t* skb_data_push(skbuff* skb, uint32_t size)
+uint8_t* skb_data_push(skbuff* skb, uint32_t size, uint32_t alloc_size)
 {
 	if (skb_data_expand(skb, size, true))
 		return skb_start(skb);
-	if (skb->data_num >= SKB_DATA_MAX_NUM)
+	if (!alloc_size || alloc_size < size)
 		return NULL;
 
 	data_info* old_first = malloc(sizeof(*old_first));
 	if (!old_first)
 		return NULL;
-	frame_slot* slot = frame_slot_alloc(size);
+	frame_slot* slot = frame_slot_alloc(alloc_size);
 	if (!slot) {
 		free(old_first);
 		return NULL;
 	}
 	*old_first = skb->data0;
 	skb->data0.slot = slot;
-	skb->data0.start = slot->data;
-	skb->data0.end = slot->data + size;
+	skb->data0.buf_start = slot->data;
+	skb->data0.buf_end = slot->data + slot->slot_size;
+	skb->data0.start = slot->data + alloc_size - size;
+	skb->data0.end = slot->data + alloc_size;
 	skb->data0.next = old_first;
-	skb->data0.size = slot->slot_size;
 	skb->data_num++;
 	skb->data_total_len += size;
 	return skb_start(skb);
 }
 
-uint8_t* skb_data_put(skbuff* skb, uint32_t size)
+uint8_t* skb_data_put(skbuff* skb, uint32_t size, uint32_t alloc_size)
 {
-	uint8_t* end = skb_end(skb);
-	if(!skb_data_expand(skb, size, false))
+	data_info* target = &skb->data0;
+	data_info* tail = &skb->data0;
+	for (data_info* di = &skb->data0; di; di = di->next) {
+		if (di->end != di->start)
+			target = di;
+		tail = di;
+	}
+
+	for (data_info* di = target; di; di = di->next) {
+		uint32_t available = (uint32_t)
+			(di->buf_end - di->end);
+		if (available < size)
+			continue;
+		uint8_t* data = di->end;
+		di->end += size;
+		skb->data_total_len += size;
+		return data;
+	}
+	if (!alloc_size || alloc_size < size)
 		return NULL;
-	return end;
+
+	data_info* added = alloc_data_info(alloc_size);
+	if (!added)
+		return NULL;
+	added->end = added->start + size;
+	tail->next = added;
+	skb->data_num++;
+	skb->data_total_len += size;
+	return added->start;
 }
 
 void skb_truncate(skbuff* skb, uint32_t new_len)
@@ -170,10 +183,7 @@ void skb_truncate(skbuff* skb, uint32_t new_len)
 		cum += len;
 		di = di->next;
 	}
-	if (!di) {
-		ERR_LOG("skb_truncate: data chain shorter than data_total_len");
-		return;
-	}
+
 	data_info* next = di->next;
 	di->next = NULL;
 	while(next){
@@ -186,65 +196,75 @@ void skb_truncate(skbuff* skb, uint32_t new_len)
 }
 
 bool skb_data_append(skbuff* skb, const void* buf, uint32_t size,
-                     uint32_t pre_size, uint32_t seg_len)
+                     uint32_t alloc_size)
 {
+	if (!size)
+		return true;
+
 	const uint8_t* src = (const uint8_t*)buf;
 	uint32_t remaining = size;
 
-	uint32_t capacity = seg_len - pre_size;
-
-	data_info* last_data_info = skb_end_data_info(skb);
-	data_info* last = last_data_info;
-	uint8_t* original_end = last_data_info->end;
-	uint32_t original_total = skb->data_total_len;
-	uint8_t original_count = skb->data_num;
-	uint32_t end_space = skb_end_space(skb);
-	if ((uint64_t)end_space + (uint64_t)capacity *
-	    (SKB_DATA_MAX_NUM - skb->data_num) < remaining)
-		return false;
-
-	/* An empty initial data_info can hold the first chunk.  Never extend a
-	 * non-empty one: seg_len defines the caller's segment boundary. */
-	if (end_space) {
-		uint32_t use = min(remaining, end_space);
-		uint8_t* dst = skb_data_put(skb, use);
-		memcpy(dst, src, use);
-		src += use;
-		remaining -= use;
+	/* 从最后一个已有数据的节点开始，后面的空节点均为 skb_alloc()
+	 * 预先分配的容量。 */
+	data_info* append = &skb->data0;
+	data_info* chain_tail = &skb->data0;
+	for (data_info* di = &skb->data0; di; di = di->next) {
+		if (di->end != di->start)
+			append = di;
+		chain_tail = di;
 	}
 
-	/* Allocate new data_infos for remaining data. */
-	while (remaining > 0) {
-		uint32_t chunk = remaining < capacity ? remaining : capacity;
-		data_info* di = alloc_data_info(seg_len);
-		if (!di)
-			goto rollback;
+	uint64_t available = 0;
+	for (data_info* di = append; di; di = di->next)
+		available += (uint32_t)(di->buf_end - di->end);
 
-		di->start = di->slot->data + pre_size;
-		di->end   = di->start + chunk;
+	/* 先分配所有缺少的 slot，失败时 skb 保持不变。单个 slot 的大小
+	 * 仍受 frame cache 限制，但 skb 的 slot 数量不再设固定上限。 */
+	data_info* added = NULL;
+	data_info* added_tail = NULL;
+	uint32_t added_count = 0;
+	if (available < remaining) {
+		if (!alloc_size)
+			return false;
+		uint32_t capacity = alloc_size;
+		uint64_t needed = remaining - available;
+
+		while (needed) {
+			data_info* di = alloc_data_info(alloc_size);
+			if (!di) {
+				while (added) {
+					data_info* next = added->next;
+					free_data_info(added);
+					added = next;
+				}
+				return false;
+			}
+			if (added_tail)
+				added_tail->next = di;
+			else
+				added = di;
+			added_tail = di;
+			added_count++;
+			needed -= min(needed, (uint64_t)capacity);
+		}
+
+		chain_tail->next = added;
+		skb->data_num += added_count;
+	}
+
+	for (data_info* di = append; di && remaining; di = di->next) {
+		uint32_t available_in_slot = (uint32_t)
+			(di->buf_end - di->end);
+		uint32_t chunk = min(remaining, available_in_slot);
+		if (!chunk)
+			continue;
+		memcpy(di->end, src, chunk);
+		di->end += chunk;
 		skb->data_total_len += chunk;
-		memcpy(di->start, src, chunk);
 		src += chunk;
 		remaining -= chunk;
-		last->next = di;
-		last = di;
-		skb->data_num++;
 	}
-	return true;
-
-rollback:
-	last = last_data_info->next;
-	last_data_info->next = NULL;
-	while (last) {
-		data_info* tmp = last;
-		last = last->next;
-		free_data_info(tmp);
-	}
-	last_data_info->end = original_end;
-
-	skb->data_total_len = original_total;
-	skb->data_num = original_count;
-	return false;
+	return remaining == 0;
 }
 
 /* ── original skbuff.c ── */
@@ -376,44 +396,49 @@ skbuff* skb_alloc(uint32_t size)
 	CREATE_REF(skbuff, skb, skb_destroy);
 	if (!skb)
 		return NULL;
-	frame_slot* slot = frame_slot_alloc(size);
+
+	uint32_t chunk = min(size, (uint32_t)FRAME_SLOT_MAX_SIZE);
+	frame_slot* slot = frame_slot_alloc(chunk);
 	if (!slot) {
 		PUT_REF(skb);
 		return NULL;
 	}
 	skb->data0.slot  = slot;
-	skb->data0.start = slot->data;
-	skb->data0.end   = slot->data;      /* empty, ready for reserve/push/put */
-	skb->data0.size  = size ? size : slot->slot_size;
+	skb->data0.buf_start = slot->data;
+	skb->data0.buf_end = slot->data + slot->slot_size;
+	skb->data0.start = skb->data0.buf_start;
+	skb->data0.end   = skb->data0.start; /* empty, ready for reserve/push/put */
 	skb->data0.next  = NULL;
 	skb->data_num    = 1;
 	skb->data_total_len = 0;
+
+	uint32_t remaining = size - chunk;
+	data_info* tail = &skb->data0;
+	while (remaining) {
+		chunk = min(remaining, (uint32_t)FRAME_SLOT_MAX_SIZE);
+		data_info* di = alloc_data_info(chunk);
+		if (!di) {
+			PUT_REF(skb);
+			return NULL;
+		}
+		tail->next = di;
+		tail = di;
+		skb->data_num++;
+		remaining -= chunk;
+	}
 	return skb;
 }
 
-skbuff* skb_alloc_with_data_info(data_info** infos)
+skbuff* skb_alloc_with_data_info(data_info* infos)
 {
-
 	CREATE_REF(skbuff, skb, skb_destroy);
 	if (!skb)
 		return NULL;
 
-	data_info* prev = NULL;
-	for (int i = 0; i < SKB_DATA_MAX_NUM; i++) {
-		if (!infos[i])
-			break;
-		uint32_t len = (uint32_t)(infos[i]->end - infos[i]->start);
-		if (i == 0) {
-			skb->data0 = *infos[i];
-			skb->data0.next = NULL;
-			free(infos[i]);
-			prev = &skb->data0;
-		} else {
-			prev->next = infos[i];
-			prev = infos[i];
-			prev->next = NULL;
-		}
-		skb->data_total_len += len;
+	skb->data0 = *infos;
+	free(infos);
+	for (data_info* di = &skb->data0; di; di = di->next) {
+		skb->data_total_len += (uint32_t)(di->end - di->start);
 		skb->data_num++;
 	}
 	return skb;
@@ -447,9 +472,10 @@ skbuff* skb_clone(skbuff* skb){
 		}
 		dst->slot  = orig->slot;
 		INC_REF(orig->slot);
+		dst->buf_start = orig->buf_start;
+		dst->buf_end = orig->buf_end;
 		dst->start = orig->start;
 		dst->end   = orig->end;
-		dst->size  = orig->size;
 		dst->next  = NULL;
 		prev = dst;
 		new_skb->data_num++;
@@ -466,6 +492,9 @@ skbuff* skb_clone(skbuff* skb){
 
 	GET_REF(new_skb->recv_if,    skb->recv_if);
 	GET_REF(new_skb->route, skb->route);
+	new_skb->route_generation = skb->route_generation;
+	memcpy(new_skb->route_dest, skb->route_dest, sizeof(new_skb->route_dest));
+	new_skb->route_scope_id = skb->route_scope_id;
 
 	return new_skb;
 }
@@ -486,24 +515,29 @@ skbuff* skb_copy(skbuff* skb)
 	data_info* prev = NULL;
 	while (orig) {
 		uint32_t n = orig->end - orig->start;
-		uint32_t headroom = (uint32_t)(orig->start - orig->slot->data);
+		uint32_t buf_start = (uint32_t)(orig->buf_start - orig->slot->data);
+		uint32_t buf_end = (uint32_t)(orig->buf_end - orig->slot->data);
+		uint32_t headroom = (uint32_t)(orig->start - orig->buf_start);
 		data_info* dst;
 
 		if (!prev) {
 			dst = &new_skb->data0;
-			frame_slot* slot = frame_slot_alloc(orig->size);
+			frame_slot* slot = frame_slot_alloc(buf_end);
 			if (!slot) {
 				PUT_REF(new_skb);
 				return NULL;
 			}
 			dst->slot  = slot;
-			dst->start = slot->data + headroom;
+			dst->buf_start = slot->data + buf_start;
+			dst->buf_end = dst->buf_start + (buf_end - buf_start);
+			dst->start = dst->buf_start + headroom;
 			dst->end   = dst->start + n;
-			dst->size  = orig->size;
 		} else {
-			dst = alloc_data_info(orig->size);
+			dst = alloc_data_info(buf_end);
 			if (dst) {
-				dst->start = dst->slot->data + headroom;
+				dst->buf_start = dst->slot->data + buf_start;
+				dst->buf_end = dst->buf_start + (buf_end - buf_start);
+				dst->start = dst->buf_start + headroom;
 				dst->end = dst->start + n;
 				prev->next = dst;
 			}
@@ -529,11 +563,27 @@ skbuff* skb_copy(skbuff* skb)
 
 	GET_REF(new_skb->recv_if,    skb->recv_if);
 	GET_REF(new_skb->route, skb->route);
+	new_skb->route_generation = skb->route_generation;
+	memcpy(new_skb->route_dest, skb->route_dest, sizeof(new_skb->route_dest));
+	new_skb->route_scope_id = skb->route_scope_id;
 
 	return new_skb;
 }
 
+void skb_free_frag_list(skbuff* skb)
+{
+	skbuff* frag;
+	list_node* next;
+	FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, next,
+	                         skbuff, frag_list) {
+		remove_list_node(&frag->frag_list);
+		PUT_REF(frag);
+	}
+}
+
 void skb_destroy(skbuff* skb){
+	/* A fragment list is owned by its root skb. */
+	skb_free_frag_list(skb);
 
 	PUT_REF(skb->recv_if);
 	PUT_REF(skb->route);
@@ -547,6 +597,24 @@ void skb_destroy(skbuff* skb){
 	}
 	PUT_REF(skb->data0.slot);
 	free(skb);
+}
+
+bool skb_frag(skbuff * skb, uint32_t frag_len)
+{
+       /* skb is an owned packet; only a zero fragment length is invalid. */
+       if (!frag_len)
+		return false;
+
+	list_node* list_tail = &skb->frag_list;
+	while (skb_data_len(skb) > frag_len) {
+		skbuff* frag_tail = skb_split(skb, frag_len);
+		if (!frag_tail)
+			return false;
+		add_list_node(list_tail, &frag_tail->frag_list);
+		list_tail = &frag_tail->frag_list;
+		skb = frag_tail;
+	}
+	return true;
 }
 
 skbuff* skb_split(skbuff* skb, uint32_t len)
@@ -576,24 +644,30 @@ skbuff* skb_split(skbuff* skb, uint32_t len)
 	if (!tail)
 		return NULL;
 
-	uint8_t tail_count = 0;
+	uint32_t tail_count = 0;
 	if (cut && split_di) {
-		uint32_t tail_len = (uint32_t)(split_di->end - (split_di->start + cut));
-		uint32_t headroom = (uint32_t)(split_di->start - split_di->slot->data);
-		data_info* di = alloc_data_info(split_di->size);
+		uint8_t* split = split_di->start + cut;
+		data_info* di = malloc(sizeof(*di));
 		if (!di) {
 			PUT_REF(tail);
 			return NULL;
 		}
-		di->start = di->slot->data + headroom;
-		di->end   = di->start + tail_len;
-		memcpy(di->start, split_di->start + cut, tail_len);
+		di->slot = split_di->slot;
+		INC_REF(di->slot);
+		/* Split both the data range and the writable range.  The two
+		 * data_info nodes then share storage without sharing writable bytes. */
+		di->buf_start = split;
+		di->buf_end = split_di->buf_end;
+		di->start = split;
+		di->end = split_di->end;
+		di->next = NULL;
 		tail->data0 = *di;
 		free(di);
 		tail_count = 1;
 		data_info* rest = split_di->next;
 		tail->data0.next = rest;
-		split_di->end = split_di->start + cut;
+		split_di->buf_end = split;
+		split_di->end = split;
 		split_di->next = NULL;
 		for (data_info* di_it = rest; di_it; di_it = di_it->next)
 			tail_count++;
@@ -620,46 +694,98 @@ skbuff* skb_split(skbuff* skb, uint32_t len)
 	tail->l4_private = skb->l4_private;
 	GET_REF(tail->recv_if, skb->recv_if);
 	GET_REF(tail->route,  skb->route);
+	tail->route_generation = skb->route_generation;
+	memcpy(tail->route_dest, skb->route_dest, sizeof(tail->route_dest));
+	tail->route_scope_id = skb->route_scope_id;
 
 	return tail;
 }
 
-bool skb_append_skb(skbuff* a, skbuff* b, bool data_copy)
+bool skb_append_skb(skbuff* a, skbuff* b)
 {
-	if (!data_copy && a->data_num + b->data_num > SKB_DATA_MAX_NUM)
-		return false;
-
-    if (data_copy) {
-        /* Copy b's data into a's tail space. */
-        uint32_t b_len = b->data_total_len;
-        uint8_t* dst = skb_data_put(a, b_len);
-        if (!dst)
-            return false;
-
-        /* Copy all data from b into the expanded region. */
-        const data_info* b_di = &b->data0;
-        while (b_di && b_len) {
-            uint32_t n = b_di->end - b_di->start;
-            memcpy(dst, b_di->start, n);
-            dst += n;
-            b_len -= n;
-            b_di = b_di->next;
-        }
+	if (!b->data_total_len) {
 		PUT_REF(b);
-        return true;
-    }
+		return true;
+	}
 
-	data_info* first = malloc(sizeof(*first));
-	if (!first)
+	data_info* tail = skb_end_data_info(a);
+	uint32_t tail_space = tail->buf_end && tail->end
+	    ? (uint32_t)(tail->buf_end - tail->end) : 0;
+	uint32_t copy_len = min(tail_space, b->data_total_len);
+	data_info* move_head = NULL;
+	data_info* move_prev = NULL;
+	data_info* partial = NULL;
+	uint32_t move_skip = 0;
+
+	/* Locate the first byte that will remain zero-copy.  Allocate the only
+	 * metadata node that may be needed before changing either skb, so an
+	 * allocation failure leaves both packets untouched. */
+	uint32_t skip = copy_len;
+	data_info* di = &b->data0;
+	data_info* prev = NULL;
+	while (di && skip) {
+		uint32_t len = (uint32_t)(di->end - di->start);
+		if (skip < len)
+			break;
+		skip -= len;
+		prev = di;
+		di = di->next;
+	}
+	while (di && di->start == di->end && di->next) {
+		prev = di;
+		di = di->next;
+	}
+	if (di && di == &b->data0) {
+		partial = malloc(sizeof(*partial));
+		if (!partial)
+			return false;
+		copy_data_info(partial, di);
+		partial->start += skip;
+		partial->next = di->next;
+		move_head = partial;
+		move_prev = prev;
+	} else if (di) {
+		move_head = di;
+		move_prev = prev;
+		move_skip = skip;
+	}
+
+	if (copy_len && !skb_copy_bits(b, 0, tail->end, copy_len)) {
+		if (partial)
+			free_data_info(partial);
 		return false;
-	*first = b->data0;
-	skb_end_data_info(a)->next = first;
+	}
 
-	a->data_num += b->data_num;
-	a->data_total_len += b->data_total_len;
-	memset(&b->data0, 0, sizeof(b->data0));
-	b->data_num = 0;
-	b->data_total_len = 0;
+	if (copy_len) {
+		tail->end += copy_len;
+		a->data_total_len += copy_len;
+	}
+	if (move_head && move_head != partial && move_skip)
+		move_head->start += move_skip;
+
+	if (!move_head) {
+		PUT_REF(b);
+		return true;
+	}
+
+	if (move_head == partial) {
+		/* b->data0 is embedded, so the first remaining data_info must use a
+		 * heap node while retaining b's frame slot through a ref. */
+		b->data0.next = NULL;
+	} else {
+		move_prev->next = NULL;
+	}
+
+	data_info* moved_tail = move_head;
+	uint32_t moved_count = 1;
+	while (moved_tail->next) {
+		moved_tail = moved_tail->next;
+		moved_count++;
+	}
+	tail->next = move_head;
+	a->data_num += moved_count;
+	a->data_total_len += b->data_total_len - copy_len;
+
 	PUT_REF(b);
 	return true;
 }

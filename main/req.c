@@ -13,6 +13,7 @@
 #include "req_socket.h"
 #include "fd_entry.h"
 #include "log.h"
+#include "socket.h"
 #include "worker.h"
 
 req* req_create(void)
@@ -286,6 +287,66 @@ int net_shutdown(int fd, int how)
     int ret = entry->ops->shutdown(entry, how);
     PUT_REF(entry);
     return ret;
+}
+
+typedef struct callback_request {
+    fd_entry *entry;
+    net_event_mask events;
+    net_callback callback;
+    void *arg;
+} callback_request;
+
+static int set_callback_on_worker(void *arg)
+{
+    callback_request *request = arg;
+    Socket *sock = request->entry->value;
+    return socket_set_callback(sock, request->events,
+                               request->callback, request->arg);
+}
+
+int net_set_callback(int fd, net_event_mask events,
+                     net_callback callback, void *arg)
+{
+    fd_entry *entry = hold_fd_entry(fd);
+    if (!entry || entry->ops != &socket_fd_ops) {
+        PUT_REF(entry);
+        errno = entry ? ENOTSOCK : EBADF;
+        return -1;
+    }
+
+    worker *owner = fd_entry_get_worker(entry);
+    if (!owner) {
+        PUT_REF(entry);
+        errno = EBADF;
+        return -1;
+    }
+
+    callback_request request = {
+        .entry = entry,
+        .events = events,
+        .callback = callback,
+        .arg = arg,
+    };
+
+    req r;
+    req_init(&r);
+    r.entry = entry;
+    r.type = REQ_WORKER_REQ;
+    r.argv.worker_req.argv = &request;
+    r.argv.worker_req.cb = set_callback_on_worker;
+    int ret = req_push_wait(owner, &r);
+
+    PUT_REF(entry);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return 0;
+}
+
+int net_clear_callback(int fd)
+{
+    return net_set_callback(fd, 0, NULL, NULL);
 }
 
 void req_notify(req* r, int ret)

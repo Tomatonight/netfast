@@ -16,10 +16,7 @@ static int req_copy_sockaddr(struct sockaddr_storage *dst,
                              const struct sockaddr *src,
                              socklen_t addrlen)
 {
-    if (!dst || !src) {
-        errno = EFAULT;
-        return -1;
-    }
+    /* The request entry points validate src and always provide dst. */
     if (addrlen < (socklen_t)sizeof(sa_family_t) ||
         addrlen > (socklen_t)sizeof(*dst)) {
         errno = EINVAL;

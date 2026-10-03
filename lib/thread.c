@@ -87,10 +87,9 @@ static inline void wheel_add_timer_at_locked(thread* t, task* tk,
 static inline void wheel_requeue_timer_locked(thread* t, task* tk,
 											   uint64_t now_ms)
 {
-	list_node* tail = wheel_timer_slot(t, tk, now_ms);
-	while (tail->next)
-		tail = tail->next;
-	add_list_node(tail, &tk->timer_list);
+	/* Timer order within one slot is irrelevant.  Head insertion avoids
+	 * traversing the slot while holding wheel_lock. */
+	add_list_node(wheel_timer_slot(t, tk, now_ms), &tk->timer_list);
 }
 
 static inline void wheel_cascade_l1(thread* t)
@@ -161,6 +160,13 @@ thread* create_thread(void)
 		free(t);
 		return NULL;
 	}
+	if (pthread_spin_init(&t->socket_timer_lock, PTHREAD_PROCESS_PRIVATE) != 0) {
+		ERR_LOG("create thread failed: pthread_spin_init socket timer lock");
+		pthread_spin_destroy(&t->wheel_lock);
+		close(t->epoll_fd);
+		free(t);
+		return NULL;
+	}
 	current_time_ms = read_now_ms();
 	t->last_timer_check_ms = get_current_time_ms();
 	frame_cache_init(&t->frame_cache);
@@ -174,9 +180,36 @@ void destroy_thread(thread* t)
 		return;
 	if (t->epoll_fd >= 0)
 		close(t->epoll_fd);
+	pthread_spin_destroy(&t->socket_timer_lock);
 	pthread_spin_destroy(&t->wheel_lock);
 	frame_cache_reset(&t->frame_cache);
 	free(t);
+}
+
+void thread_enqueue_socket_timer(thread* t, list_node* node)
+{
+	pthread_spin_lock(&t->socket_timer_lock);
+	if (!LIST_ATTACHED(node))
+		add_list_node(&t->socket_timer_queue, node);
+	pthread_spin_unlock(&t->socket_timer_lock);
+}
+
+void thread_remove_socket_timer(thread* t, list_node* node)
+{
+	pthread_spin_lock(&t->socket_timer_lock);
+	if (LIST_ATTACHED(node))
+		remove_list_node(node);
+	pthread_spin_unlock(&t->socket_timer_lock);
+}
+
+list_node* thread_pop_socket_timer(thread* t)
+{
+	pthread_spin_lock(&t->socket_timer_lock);
+	list_node* node = t->socket_timer_queue.next;
+	if (node)
+		remove_list_node(node);
+	pthread_spin_unlock(&t->socket_timer_lock);
+	return node;
 }
 
 static void thread_unregister_loop_task(task* tk)
@@ -194,10 +227,6 @@ static void thread_unregister_loop_task(task* tk)
 
 int register_task(thread* t, task* tk)
 {
-	if (!t || !tk) {
-		ERR_LOG("register task failed: invalid argument");
-		return -1;
-	}
 	if (tk->task_type == TASK_TYPE_LOOP) {
 		if (tk->registered) {
 			if (tk->parent_thread == t)
@@ -384,6 +413,7 @@ static int thread_fire_timer_task(task* tk, uint64_t now_ms)
 		return 0;
 
 	tk->registered = 0;
+	tk->timeout = 0;
 	if (!tk->cb_timer)
 		return 0;
 
@@ -455,14 +485,10 @@ int thread_step(thread* t)
 void thread_loop(thread* t)
 {
 	for (;;) {
-		/* Only skip sleeping when the previous pass explicitly left runnable
-		 * work behind.  A normal fd event alone is not a reason to issue a
-		 * fixed series of empty epoll_wait(0) calls. */
-		int timeout_ms = t->work_pending ? 0 : THREAD_EPOLL_WAIT_TIME;
-		t->work_pending = 0;
 
 		(void)thread_process_loop_tasks(t);
 		(void)thread_process_timer_tasks(t);
-		(void)thread_process_fd_tasks(t, timeout_ms);
+
+		(void)thread_process_fd_tasks(t, THREAD_EPOLL_WAIT_TIME);
 	}
 }

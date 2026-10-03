@@ -74,6 +74,7 @@ static inline req_status notify_event_to_status(enum notify_event e)
     if (e & notify_data_read)      s |= REQ_WAITING_READ;
     if (e & notify_recv_fin)       s |= REQ_WAITING_READ;
     if (e & notify_data_write)     s |= REQ_WAITING_WRITE | REQ_WAITING_CONNECT;
+    if (e & notify_connect)        s |= REQ_WAITING_CONNECT;
     if (e & notify_new_connection) s |= REQ_WAITING_ACCEPT;
     return s ? s : REQ_STATUS_ALL;
 }

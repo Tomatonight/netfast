@@ -60,6 +60,7 @@ SRC_MAIN := \
 	main/tcp.c \
 	main/tcp_congestion.c \
 	main/tcp_metrics.c \
+	main/tcp_rack.c \
 	main/tcp_sack.c \
 	main/udp.c \
 	main/worker.c
@@ -79,8 +80,13 @@ BPF_CFLAGS ?= $(PROFILE_BPF_CFLAGS) -target bpf -D__TARGET_ARCH_$(BPF_ARCH)
 BPF_MULTIARCH ?= $(shell $(CC) -print-multiarch 2>/dev/null)
 ifneq ($(strip $(BPF_MULTIARCH)),)
 BPF_CFLAGS += -I/usr/include/$(BPF_MULTIARCH)
+ifeq ($(BPF_ARCH),x86)
+# Clang's BPF target does not define the host x86_64 macro.  Glibc's Linux
+# headers otherwise select the unavailable 32-bit stubs header.
+BPF_CFLAGS += -D__x86_64__
 endif
-LDLIBS ?= -lbpf -lelf -lz -pthread -lxdp -lcjson
+endif
+LDLIBS ?= -lbpf -lelf -lz -pthread -lxdp -lcjson -lm
 
 
 PREFIX ?= /usr/local

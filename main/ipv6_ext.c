@@ -48,7 +48,6 @@ static void ipv6_frag_piece_free(ipq6_frag* frag)
 static void ipv6_frag_queue_destroy(ipq6* q)
 {
     hash_del_node(ipv6_frag_queue_table(), &q->hash_node);
-
     ipq6_frag* frag;
     list_node* next;
     FOR_EACH_LIST_SAFE_OFFSET(&q->frag_head, frag, next, ipq6_frag, node) {
@@ -259,8 +258,9 @@ skbuff* ipv6_defrag(skbuff* skb)
 
     /* 还未收齐 */
     if (!(q->flag.first_recved && q->flag.last_recved &&
-          q->received_len >= q->total_len))
+          q->received_len >= q->total_len)) {
         return NULL;
+    }
 
     if (q->received_len != q->total_len) {
         DEBUG_LOG("IPv6 received_len %u != total_len %u", q->received_len, q->total_len);
@@ -305,7 +305,7 @@ skbuff* ipv6_defrag(skbuff* skb)
             return NULL;
         }
 
-        if (skb_consume(f->skb, strip_all, false) != strip_all) {
+        if (!skb_consume(f->skb, strip_all, false)) {
             PUT_REF(f->skb);
             free(f);
             PUT_REF(reassembled);
@@ -315,7 +315,7 @@ skbuff* ipv6_defrag(skbuff* skb)
         if (!reassembled) {
             reassembled = f->skb;
         } else {
-            if (!skb_append_skb(reassembled, f->skb, false)) {
+            if (!skb_append_skb(reassembled, f->skb)) {
                 PUT_REF(f->skb);
                 free(f);
                 PUT_REF(reassembled);
@@ -340,7 +340,8 @@ skbuff* ipv6_defrag(skbuff* skb)
         return NULL;
     }
 
-    uint8_t* unfrag_header = skb_data_push(reassembled, unfrag_len);
+    uint8_t* unfrag_header = skb_data_push(
+        reassembled, unfrag_len, unfrag_len);
     if (!unfrag_header) {
         PUT_REF(reassembled);
         ipv6_frag_queue_destroy(q);
@@ -366,7 +367,8 @@ static bool ipv6_push_fragment_headers(skbuff* skb, const uint8_t fixed_header[]
                               uint32_t payload_len)
 {
     uint8_t* headers = skb_data_push(
-        skb, IPV6_HDR_LEN + sizeof(ipv6_frag_hdr));
+        skb, IPV6_HDR_LEN + sizeof(ipv6_frag_hdr),
+        IPV6_HDR_LEN + sizeof(ipv6_frag_hdr));
     if (!headers)
         return false;
 
@@ -385,21 +387,10 @@ static bool ipv6_push_fragment_headers(skbuff* skb, const uint8_t fixed_header[]
     return true;
 }
 
-static void ipv6_free_fragment_list(skbuff* skb)
-{
-    skbuff* frag;
-    list_node* next;
-    FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, next,
-                              skbuff, frag_list) {
-        remove_list_node(&frag->frag_list);
-        PUT_REF(frag);
-    }
-}
-
 bool ipv6_frag(skbuff* skb)
 {
     ipv6_hdr* ip6 = skb->ipv6_hdr;
-    uint32_t mtu = skb->route->if_info->mtu;
+    uint32_t mtu = get_route_mtu(skb->route);
     uint32_t tot_len = skb_data_len(skb);
 
     if (mtu < 1280 || tot_len <= IPV6_HDR_LEN)
@@ -414,44 +405,32 @@ bool ipv6_frag(skbuff* skb)
     memcpy(fixed_header, ip6, sizeof(fixed_header));
     uint8_t orig_next_hdr = ip6->next_hdr;
 
-    if (skb_consume(skb, IPV6_HDR_LEN, true) != IPV6_HDR_LEN)
+    if (!skb_consume(skb, IPV6_HDR_LEN, true))
         return false;
-    skbuff* cur = skb_split(skb, frag_payload);
-    if (!cur)
+
+    if (!skb_frag(skb, frag_payload)) {
+        skb_free_frag_list(skb);
         return false;
+    }
 
     static _Atomic(uint32_t) next_frag_id = 1;
     uint32_t id = htonl(atomic_fetch_add_explicit(
         &next_frag_id, 1, memory_order_relaxed));
     if (!ipv6_push_fragment_headers(skb, fixed_header, orig_next_hdr, id, 0, true,
                            frag_payload)) {
-        PUT_REF(cur);
+        skb_free_frag_list(skb);
         return false;
     }
     uint32_t offset_bytes = frag_payload;
-    list_node* list_tail = &skb->frag_list;
-
-    while (cur) {
-        uint32_t cur_payload = skb_data_len(cur);
-        skbuff* next = NULL;
-        if (cur_payload > frag_payload) {
-            next = skb_split(cur, frag_payload);
-            if (!next)
-                goto fail;
-            cur_payload = frag_payload;
-        }
-
-        if (!ipv6_push_fragment_headers(cur, fixed_header, orig_next_hdr, id,
-                               (uint16_t)(offset_bytes / 8u), next != NULL,
-                               cur_payload)) {
-            PUT_REF(next);
+    skbuff* frag;
+    FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
+        uint32_t cur_payload = skb_data_len(frag);
+        if (!ipv6_push_fragment_headers(frag, fixed_header, orig_next_hdr, id,
+                               (uint16_t)(offset_bytes / 8u),
+                               frag->frag_list.next != NULL, cur_payload)) {
             goto fail;
         }
-        add_list_node(list_tail, &cur->frag_list);
-        list_tail = &cur->frag_list;
-
         offset_bytes += cur_payload;
-        cur = next;
     }
 
     /* Individual IP fragments are not complete L4 packets and therefore
@@ -461,7 +440,6 @@ bool ipv6_frag(skbuff* skb)
     return true;
 
 fail:
-    PUT_REF(cur);
-    ipv6_free_fragment_list(skb);
-    return false;
+	skb_free_frag_list(skb);
+	return false;
 }

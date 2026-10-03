@@ -42,9 +42,8 @@ static ipq* ipv4_frag_queue_create(uint16_t id,uint32_t src_ip,uint32_t dst_ip,u
     hash* h = ipv4_frag_queue_table();
 
     ipq* new_ipq=calloc(1,sizeof(ipq));
-    if(!new_ipq){
+    if (!new_ipq)
         return NULL;
-    }
 
     memset(&new_ipq->key, 0, sizeof(new_ipq->key));
     new_ipq->key.id=id;
@@ -59,10 +58,9 @@ static ipq* ipv4_frag_queue_create(uint16_t id,uint32_t src_ip,uint32_t dst_ip,u
     }
     return new_ipq;
 }
+
 static void ipv4_frag_queue_destroy(ipq* ipq){
     hash* h = ipv4_frag_queue_table();
-
-    //DEBUG_LOG("Destroying IPQ: id=%u src=" IP_STR " dst=" IP_STR " proto=%u", ipq->key.id, IP_ARG(ipq->key.src_ip), IP_ARG(ipq->key.dst_ip), ipq->key.protocol);
     hash_del_node(h, &ipq->hash_node);
     list_node* node;
     list_node* tmp;
@@ -73,6 +71,7 @@ static void ipv4_frag_queue_destroy(ipq* ipq){
     }
     free(ipq);
 }
+
 static ipq* ipv4_frag_queue_find(uint16_t id,uint32_t src_ip,uint32_t dst_ip,uint8_t protocol){
     hash* h = ipv4_frag_queue_table();
 
@@ -98,8 +97,9 @@ void ipq_timer(task* tk){
             hash_node* next = node->next;
             ipq* queue = HASH_CONTAINER_OF(node, ipq, hash_node);
             if ((uint32_t)(get_current_time_ms() - queue->last_update_time) >
-                IPQ_TIMEOUT)
+                IPQ_TIMEOUT) {
                 ipv4_frag_queue_destroy(queue);
+            }
             node = next;
         }
     }
@@ -130,6 +130,7 @@ skbuff* ipv4_defrag(skbuff* skb){
     uint32_t payload_len = ntohs(ip->tot_len) - ipv4_hdr_len;
     uint32_t offset_bytes = (ipv4_get_frag_offset(ip)) * 8;
 
+
     if((ipv4_get_flag_mf(ip) && (payload_len & 7u)) || ipv4_get_flag_df(ip)){
         DEBUG_LOG("Invalid fragment: DF set or payload not 8-byte aligned");
         return NULL;
@@ -158,6 +159,7 @@ skbuff* ipv4_defrag(skbuff* skb){
         q->flag.first_recved = 1;
     }
     q->received_len += payload_len;
+
 
     /* Not all fragments received yet */
     if(!(q->flag.first_recved && q->flag.last_recved && q->received_len >= q->total_len)){
@@ -190,9 +192,7 @@ skbuff* ipv4_defrag(skbuff* skb){
             ipv4_hdr* frag_ip = frag->ipv4_hdr;
             uint32_t iphdr_len = (uint32_t)IPV4_VHL_IHL(frag_ip->vhl) * 4u;
             uint32_t frag_payload_len = ntohs(frag_ip->tot_len) - iphdr_len;
-            skb_consume(frag, iphdr_len, true);
-            if (reassembled->data_num + frag->data_num > SKB_DATA_MAX_NUM) {
-                DEBUG_LOG("Too many fragments to reassemble");
+            if (!skb_consume(frag, iphdr_len, true)) {
                 PUT_REF(frag);
                 PUT_REF(reassembled);
                 ipv4_frag_queue_destroy(q);
@@ -265,49 +265,49 @@ bool ipv4_frag(skbuff* skb){
     const uint32_t base_offset =
         (uint32_t)(original_field & IPV4_FRAG_OFF_MASK) * 8u;
     const bool original_more = (original_field & IPV4_FRAG_MF) != 0;
+    skbuff* cur;
 
-    /* Keep the original skb as the first fragment.  skb_split returns the
-       remaining payload, from which subsequent fragments are produced. */
-    skbuff* cur = skb_split(skb, ipv4_hdr_len + frag_payload);
-    if (!cur)
+    /* Remove the original header, split the payload, then put a header on
+     * every fragment.  The first skb keeps its original data buffer, so
+     * skb_data_push() can restore the consumed header in place when possible. */
+    if (!skb_consume(skb, ipv4_hdr_len, true))
         return false;
+    if (!skb_frag(skb, frag_payload)) {
+        skb_free_frag_list(skb);
+        return false;
+    }
+
+    uint32_t l2_len = skb->route->if_info->l2_len;
+    uint32_t payload_len = skb_data_len(skb);
+    ipv4_hdr* first_ip = (ipv4_hdr*)skb_data_push(
+        skb, ipv4_hdr_len, l2_len + ipv4_hdr_len);
+    if (!first_ip)
+        goto fail;
+    memcpy(first_ip, header, ipv4_hdr_len);
+    first_ip->frag_off = htons((uint16_t)((base_offset / 8u) |
+                                          IPV4_FRAG_MF));
+    first_ip->tot_len = htons((uint16_t)(ipv4_hdr_len + payload_len));
+    first_ip->check = 0;
+    first_ip->check = checksum(first_ip, ipv4_hdr_len, 0);
+    skb->ipv4_hdr = first_ip;
 
     uint32_t offset = frag_payload;
-    list_node* list_tail = &skb->frag_list;
-    ip->frag_off = htons((uint16_t)((base_offset / 8u) | IPV4_FRAG_MF));
-    ip->tot_len = htons((uint16_t)skb_data_len(skb));
-    ip->check = 0;
-    ip->check = checksum(ip, ipv4_hdr_len, 0);
-
-    while (cur) {
-        uint32_t payload_len = skb_data_len(cur);
-        skbuff* next = NULL;
-        if (payload_len > frag_payload) {
-            next = skb_split(cur, frag_payload);
-            if (!next)
-                goto fail;
-            payload_len = frag_payload;
-        }
-
-        ipv4_hdr* frag_ip = (ipv4_hdr*)skb_data_push(cur, ipv4_hdr_len);
-        if (!frag_ip) {
-            PUT_REF(next);
+    FOR_EACH_LIST_OFFSET(&skb->frag_list, cur, skbuff, frag_list) {
+        payload_len = skb_data_len(cur);
+        ipv4_hdr* frag_ip = (ipv4_hdr*)skb_data_push(
+            cur, ipv4_hdr_len, l2_len + ipv4_hdr_len);
+        if (!frag_ip)
             goto fail;
-        }
         memcpy(frag_ip, header, ipv4_hdr_len);
         uint16_t field = (uint16_t)((base_offset + offset) / 8u);
-        if (next || original_more)
+        if (cur->frag_list.next || original_more)
             field |= IPV4_FRAG_MF;
         frag_ip->frag_off = htons(field);
         frag_ip->tot_len = htons((uint16_t)(ipv4_hdr_len + payload_len));
         frag_ip->check = 0;
         frag_ip->check = checksum(frag_ip, ipv4_hdr_len, 0);
         cur->ipv4_hdr = frag_ip;
-        add_list_node(list_tail, &cur->frag_list);
-        list_tail = &cur->frag_list;
-
         offset += payload_len;
-        cur = next;
     }
     /* Individual IP fragments are not complete L4 packets and therefore
      * must not request AF_XDP L4 checksum offload. */
@@ -316,14 +316,6 @@ bool ipv4_frag(skbuff* skb){
     return true;
 
 fail:
-	PUT_REF(cur);
-	{
-		skbuff* frag;
-		list_node* tmp;
-		FOR_EACH_LIST_SAFE_OFFSET(&skb->frag_list, frag, tmp, skbuff, frag_list) {
-			remove_list_node(&frag->frag_list);
-			PUT_REF(frag);
-		}
-	}
+	skb_free_frag_list(skb);
 	return false;
 }

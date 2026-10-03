@@ -18,6 +18,7 @@ enum notify_event {
     notify_new_connection  = (1 << 2),
     notify_err             = (1 << 3),
     notify_recv_fin        = (1 << 4),
+    notify_connect         = (1 << 5),
 };
 
 typedef struct pending_node {

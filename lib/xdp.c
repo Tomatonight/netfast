@@ -527,12 +527,24 @@ static void xdp_tx_kick_loop(task* tk)
     xdp_tx_flush(ix);
 }
 
+static uint32_t xdp_skb_frame_count(const skbuff* skb)
+{
+    uint32_t frames = 0;
+    for (const data_info* di = &skb->data0; di; di = di->next) {
+        if (di->end != di->start)
+            frames++;
+    }
+    return frames;
+}
+
 /* Submit an skb without retaining skb itself.  The TX descriptors retain the
  * data_buf references until they are returned through the completion ring. */
 static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
 {
     uint8_t* packet = skb_start(skb);
-    uint32_t frames = skb->data_num;
+    uint32_t frames = xdp_skb_frame_count(skb);
+    if (!frames)
+        return -EINVAL;
 
     uint32_t tx_idx = 0;
     xdp_umem_refill_fill_ring(ix, &ix->fq);
@@ -556,16 +568,19 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
         meta->request.csum_offset = skb->tx_checksum_offset;
     }
 
-    data_info* di = &skb->data0;
-    for (uint32_t i = 0; i < frames; ++i, di = di->next) {
+    uint32_t i = 0;
+    for (data_info* di = &skb->data0; di; di = di->next) {
+        if (di->end == di->start)
+            continue;
         frame_slot* slot = di->slot;
         struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
         d->addr = xdp_umem_tx_addr(slot, di->start);
         d->len = di->end - di->start;
-        d->options = 0;
+        d->options = i + 1u < frames ? XDP_PKT_CONTD : 0;
         if (i == 0 && meta->flags)
             d->options |= XDP_TX_METADATA;
         INC_REF(slot);
+        i++;
     }
 
     xsk_ring_prod__submit(&ix->tx, frames);
@@ -577,12 +592,14 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
 
 static int xdp_tx_enqueue(if_xdp* ix, skbuff* skb)
 {
-    if (ix->pending_tx_frames >= XDP_TX_PENDING_FRAME_LIMIT)
+    uint32_t frames = xdp_skb_frame_count(skb);
+    if (frames > XDP_TX_PENDING_FRAME_LIMIT ||
+        ix->pending_tx_frames > XDP_TX_PENDING_FRAME_LIMIT - frames)
         return 0;
 
     INC_REF(skb);
     add_queue(&ix->pending_tx_queue, &skb->tx_node);
-    ix->pending_tx_frames++;
+    ix->pending_tx_frames += frames;
     xdp_tx_update_watch(ix);
     return 0;
 }
@@ -607,7 +624,7 @@ static void xdp_tx_drain_pending(if_xdp* ix)
             break;
 
         (void)pop_queue(&ix->pending_tx_queue);
-        ix->pending_tx_frames--;
+        ix->pending_tx_frames -= xdp_skb_frame_count(skb);
         if (ret < 0) {
             WARN_LOG("xdp: drop pending TX skb if=%s q=%u err=%d",
                      ix->info ? ix->info->name : "?", ix->queue_id, -ret);
@@ -899,6 +916,10 @@ static int xdp_interface_bind_socket(if_xdp* ix)
 
     uint32_t xdp_flags = xdp_interface_mode_flags(ix->xdp_attach_mode);
 
+    /* Keep generic-XDP interfaces on the zero-copy bind path when the
+     * driver provides it.  XDP_USE_SG is retained so a packet may span
+     * multiple UMEM frames; if the device rejects multi-frame support the
+     * caller can retry without this flag. */
     uint16_t bind_flags = XDP_USE_NEED_WAKEUP | XDP_USE_SG;
 
     struct xsk_socket_config cfg = {
@@ -964,7 +985,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
     /* Interfaces omitted from open_if do not own AF_XDP queues.  A single
      * queue needs no traffic distribution and may legitimately expose no
      * ETHTOOL_GRSSH/SRSSH support, as with a one-queue virtio-net device. */
-    if (!info || queues <= 1)
+    if (queues <= 1)
         return 0;
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1189,10 +1210,8 @@ int xdp_if_start(if_info *info)
 {
     /* Netlink reports every link, whereas only open_if entries are AF_XDP
      * interfaces.  Leave all other links untouched. */
-    if (!info)
-        return 0;
-
     int queues = config_get_interface_queues(info->name);
+    info->xdp_queue_count = queues > 0 ? (uint32_t)queues : 0;
     if (queues <= 0)
         return 0;
 
@@ -1288,8 +1307,10 @@ int xdp_if_stop(if_info *info)
 {
     int queues = config_get_interface_queues(info->name);
 
-    if (queues <= 0)
+    if (queues <= 0) {
+        info->xdp_queue_count = 0;
         return 0;
+    }
 
     worker* w = get_current_worker();
     int w_idx = (int)(w - g_workers);
@@ -1332,6 +1353,7 @@ int xdp_if_stop(if_info *info)
             prev = &it->next;
             it = it->next;
         }
+        info->xdp_queue_count = 0;
     }
 
     return 0;
@@ -1397,7 +1419,8 @@ void xdp_if_read(task *tk)
             continue;
         }
         /* ---- build scatter-gather skb: collect first frame + all CONTD frames ---- */
-        data_info*  infos[SKB_DATA_MAX_NUM];
+        data_info*  infos = NULL;
+        data_info*  infos_tail = NULL;
         uint32_t    frame_count = 0;
 		bool packet_bad = false;
 
@@ -1444,7 +1467,7 @@ void xdp_if_read(task *tk)
 				if (!more) break;
 				continue;
             }
-			if (packet_bad || d->len > cap || frame_count >= SKB_DATA_MAX_NUM) {
+			if (packet_bad || d->len > cap) {
 				xdp_umem_release_addr(frame_addr);
 				packet_bad = true;
 				i++;
@@ -1466,7 +1489,8 @@ void xdp_if_read(task *tk)
              * existing frame reference to data_info; taking another one here
              * would keep every received frame permanently out of the pool. */
             uint32_t pkt_offset = (uint32_t)(payload - slot->data);
-            data_info* ni = create_data_info(slot, pkt_offset, pkt_offset + chunk);
+            data_info* ni = create_data_info(slot, 0, slot->slot_size,
+                                             pkt_offset, pkt_offset + chunk);
             if (!ni) {
                 PUT_REF(slot);
 				packet_bad = true;
@@ -1474,7 +1498,12 @@ void xdp_if_read(task *tk)
 				if (!more) break;
 				continue;
             }
-            infos[frame_count++] = ni;
+			if (infos_tail)
+				infos_tail->next = ni;
+			else
+				infos = ni;
+			infos_tail = ni;
+			frame_count++;
             i++;
 
 			/* XDP_PKT_CONTD on the current descriptor means another follows. */
@@ -1489,23 +1518,25 @@ void xdp_if_read(task *tk)
         } while (1);
 
 		if (packet_bad) {
-			for (uint32_t f = 0; f < frame_count; ++f)
-				free_data_info(infos[f]);
+			while (infos) {
+				data_info* next = infos->next;
+				free_data_info(infos);
+				infos = next;
+			}
 			continue;
 		}
 
         if (frame_count == 0)
             continue;
 
-        /* terminate the info array */
-        if (frame_count < SKB_DATA_MAX_NUM)
-            infos[frame_count] = NULL;
-
 		skbuff* skb = skb_alloc_with_data_info(infos);
 	        if (!skb) {
 	            ERR_LOG("xdp: skb allocation failed\n");
-	            for (uint32_t f = 0; f < frame_count; f++)
-	                free_data_info(infos[f]);
+	            while (infos) {
+	                data_info* next = infos->next;
+	                free_data_info(infos);
+	                infos = next;
+	            }
 	            continue;
 	        }
         /* Only native and HW-offload modes guarantee HW checksum validation.
@@ -1547,14 +1578,15 @@ static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb)
 {
     worker* w = get_current_worker();
     int w_idx = (int)(w - g_workers);
-    int queues = config_get_interface_queues(info->name);
+    uint32_t queues = info->xdp_queue_count;
 
-    if (w_idx >= queues)
+    if (queues == 0 || (uint32_t)w_idx >= queues)
         return NULL;
 
-    int n_owned = 1 + (queues - 1 - w_idx) / g_worker_num;
+    uint32_t n_owned = 1 + (queues - 1 - (uint32_t)w_idx) /
+                       (uint32_t)g_worker_num;
     uint32_t pick = (uint32_t)((uintptr_t)skb) % (uint32_t)n_owned;
-    int q = w_idx + (int)pick * g_worker_num;
+    uint32_t q = (uint32_t)w_idx + pick * (uint32_t)g_worker_num;
     return (if_xdp*)info->xdp_data[q];
 }
 
@@ -1578,12 +1610,12 @@ int xdp_transmit_skb(struct if_info *info, skbuff *skb)
     if (ix)
         return xdp_tx_send(ix, skb);
 
-    int queues = config_get_interface_queues(info->name);
+    uint32_t queues = info->xdp_queue_count;
     if (queues <= 0)
         return -ENETDOWN;
     uint32_t h = (uint32_t)((uintptr_t)skb);
-    int pick = (int)(h % (uint32_t)queues);
-    worker* txw = &g_workers[pick % g_worker_num];
+    uint32_t pick = h % queues;
+    worker* txw = &g_workers[pick % (uint32_t)g_worker_num];
 
     worker_enqueue_skb(txw, skb, xdp_process_queued_send);
     return 0;

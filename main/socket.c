@@ -20,7 +20,7 @@
 /* Default buffer sizes are page-aligned (4 KB × N) for efficient memory
  * allocation and zero-copy page-flipping. */
 #define SOCKET_DEFAULT_RECV_SIZE (4096 * 64)   /* 256 KB, 64 pages */
-#define SOCKET_DEFAULT_SEND_SIZE (4096 * 64)   /* 256 KB, 64 pages */
+#define SOCKET_DEFAULT_SEND_SIZE (4 * 1024 * 1024) /* 4 MB */
 
 #define BIND_BUCKET_COUNT 16384u
 #define BIND_PORT_COUNT 65536u
@@ -378,29 +378,82 @@ Socket* create_socket(int family, int type, int protocol){
 
 /* ── worker 上执行的同步 Socket 请求处理器 ─────────────── */
 
+static void socket_cancel_timer_migration(Socket* sock)
+{
+    if (sock->owner)
+        thread_remove_socket_timer(sock->owner->master,
+                                   &sock->timer_migrate_node);
+}
+
+void socket_process_timer_migrations(task* tk)
+{
+    thread* master = tk->parent_thread;
+    list_node* node;
+    while ((node = thread_pop_socket_timer(master))) {
+        Socket* sock = (Socket*)((uint8_t*)node -
+                                 offsetof(Socket, timer_migrate_node));
+
+        if (sock->pending_task && sock->pending_task->timeout)
+            register_task(master, sock->pending_task);
+
+        if (sock->protocol == IPPROTO_TCP) {
+            tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
+            if (pcb->timer_task->timeout)
+                register_task(master, pcb->timer_task);
+        }
+    }
+}
+
 void set_socket_worker(Socket* sock, worker* w)
 {
     if (sock->fd_entry)
         fd_entry_set_worker(sock->fd_entry, w);
 
-    sock->owner = w;
+    if (sock->owner == w)
+        return;
 
-    if (sock->pending_task && sock->pending_task->parent_thread != w->master){
+    /* Remove from the old owner's queue before changing owner. */
+    socket_cancel_timer_migration(sock);
+
+    bool migrate = false;
+    if (sock->pending_task) {
         unregister_task(sock->pending_task);
-        register_task(w->master, sock->pending_task);
+        migrate = sock->pending_task->timeout != 0;
     }
 
-    if (sock->protocol == IPPROTO_TCP && sock->pcb) {
+    if (sock->protocol == IPPROTO_TCP) {
         tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
-
-        if (pcb->timer_task && pcb->timer_task->parent_thread != w->master) {
-            unregister_task(pcb->timer_task);
-            register_task(w->master, pcb->timer_task);
-        }
+        unregister_task(pcb->timer_task);
+        migrate |= pcb->timer_task->timeout != 0;
     }
+
+    sock->owner = w;
+    if (migrate)
+        thread_enqueue_socket_timer(w->master, &sock->timer_migrate_node);
+}
+
+int socket_set_callback(Socket *sock, net_event_mask events,
+                        net_callback cb, void *arg)
+{
+    if (!sock || !sock->fd_entry)
+        return -EBADF;
+
+    if (!cb || !events) {
+        sock->callback = NULL;
+        sock->callback_arg = NULL;
+        sock->callback_events = 0;
+        return 0;
+    }
+
+    sock->callback = cb;
+    sock->callback_arg = arg;
+    sock->callback_events = events;
+    return 0;
 }
 
 void destroy_socket(Socket* sock){
+    socket_cancel_timer_migration(sock);
+
     destroy_task(sock->pending_task);
     sock->pending_task = NULL;
 
@@ -433,6 +486,9 @@ void socket_detach_with_fd_entry(Socket* sock){
     }
     entry->value = NULL;
     sock->fd_entry = NULL;
+    sock->callback = NULL;
+    sock->callback_arg = NULL;
+    sock->callback_events = 0;
 
     pending_node* pn;
     list_node* t;
@@ -944,7 +1000,7 @@ bool install_tuple(Socket* sock, hash* table)
 
     tuple_key key = {0};
     uint32_t key_len = socket_tuple_key(sock, &key);
-    if (!table || table->key_len != key_len)
+    if (table->key_len != key_len)
         return false;
 
     uint32_t value = socket_tuple_hash(&key, key_len);
@@ -1015,7 +1071,7 @@ bool uninstall_tuple(Socket* sock, hash* table)
     if (!sock->flag.is_hash)
         return true;
     tuple_entry* entry = sock->tuple_entry;
-    if (!table || !entry) {
+    if (!entry) {
         ERR_LOG("uninstall_tuple: not found");
         return false;
     }
@@ -1094,8 +1150,6 @@ bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table)
 int socket_bind_local(Socket* sock, const struct sockaddr_in* addr,
                       socklen_t addrlen, bind_table* bound_table)
 {
-    if (!addr)
-        return -EFAULT;
     if (sock->flag.is_bound)
         return -EINVAL;
 
@@ -1223,31 +1277,66 @@ Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
 
 /* ── 路由和 SOL_SOCKET 选项 ────────────────────────────── */
 
+bool socket_route_is_valid(const Socket* sock, const uint8_t* dest_ip,
+                           uint32_t scope_id)
+{
+    return route_cache_key_matches(sock->route, sock->route_generation,
+                                   sock->family, sock->route_dest,
+                                   sock->route_scope_id, dest_ip, scope_id);
+}
+
 int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id)
 {
+    uint64_t generation = route_table_generation(sock->family);
+
     if (sock->family == AF_INET6) {
-        if (sock->route && route_info_is_valid(sock->route))
+        if (socket_route_is_valid(sock, dest_ip, scope_id))
             return 0;
 
-        PUT_REF(sock->route);
-        sock->route = NULL;
         route_key key = { .ip_family = AF_INET6 };
         key.ifindex = scope_id;
         memcpy(key.dip, dest_ip, 16);
         route_info* route = search_route_table(&key);
-        MOVE_REF(sock->route, route);
-        return sock->route ? 0 : -1;
+        if (!route) {
+            PUT_REF(sock->route);
+            sock->route = NULL;
+            sock->route_generation = generation;
+            return -1;
+        }
+        if (route == sock->route) {
+            PUT_REF(route);
+        } else {
+            PUT_REF(sock->route);
+            sock->route = route;
+        }
+        sock->route_generation = generation;
+        memcpy(sock->route_dest, dest_ip, 16);
+        sock->route_scope_id = scope_id;
+        return 0;
     }
 
     /* IPv4 */
-    if (sock->route && route_info_is_valid(sock->route))
+    if (socket_route_is_valid(sock, dest_ip, scope_id))
         return 0;
-    PUT_REF(sock->route);
     route_key key = { .ip_family = AF_INET };
     memcpy(key.dip, dest_ip, 4);
     route_info* route = search_route_table(&key);
-    MOVE_REF(sock->route, route);
-    return sock->route != NULL ? 0 : -1;
+    if (!route) {
+        PUT_REF(sock->route);
+        sock->route = NULL;
+        sock->route_generation = generation;
+        return -1;
+    }
+    if (route == sock->route) {
+        PUT_REF(route);
+    } else {
+        PUT_REF(sock->route);
+        sock->route = route;
+    }
+    sock->route_generation = generation;
+    memcpy(sock->route_dest, dest_ip, 4);
+    sock->route_scope_id = 0;
+    return 0;
 }
 
 static bool socket_timeval_valid(const struct timeval* tv)
@@ -1343,8 +1432,6 @@ int socket_setsockopt(struct Socket* sock, int level, int optname, const void* o
  */
 int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval, socklen_t* optlen)
 {
-    if (!sock || !optval || !optlen)
-        return -EFAULT;
     if (level != SOL_SOCKET)
         return -ENOPROTOOPT;
     if (*optlen == 0)
@@ -1420,7 +1507,9 @@ int socket_auto_bind(Socket* sock, bind_table* bound_table,
                      const addr_key* local_key, const uint8_t* dest_ip,
                      uint16_t dest_port, uint32_t scope_id)
 {
-    if (!sock || !bound_table || sock->bind_reservation ||
+    /* sock and bound_table are supplied by the protocol/socket layer.
+     * dest_ip is required when local_key is NULL. */
+    if (sock->bind_reservation ||
         (local_key && (local_key->port || local_key->family != sock->family)))
         return -EINVAL;
 
@@ -1428,7 +1517,7 @@ int socket_auto_bind(Socket* sock, bind_table* bound_table,
     if (local_key) {
         key = *local_key;
     } else {
-        if (!dest_ip || set_socket_route(sock, dest_ip, scope_id) < 0) {
+        if (set_socket_route(sock, dest_ip, scope_id) < 0) {
             DEBUG_LOG("Failed to set Socket route for auto bind");
             return -EHOSTUNREACH;
         }
@@ -1473,26 +1562,15 @@ int socket_auto_bind(Socket* sock, bind_table* bound_table,
 /* ── 负载均衡和 skb 关联 ──────────────────────────────── */
 
 Socket* socket_select(Socket* first_sock, uint32_t hash){
-
-    int sock_num = 1;
-    list_node *n;
-    for (n = first_sock->tuple_node.next; n; n = n->next) {
-        sock_num++;
-    }
-
-    if (sock_num <= 1) {
-        return first_sock;
-    }
-
-    int idx = (int)(hash % (uint32_t)sock_num);
-
     Socket *aim = first_sock;
-    n = &first_sock->tuple_node;
-    while (idx-- > 0 && n->next) {
-        n = n->next;
-        aim = (Socket *)((uint8_t *)n - offsetof(Socket, tuple_node));
+    uint32_t count = 1;
+    for (list_node* n = first_sock->tuple_node.next; n; n = n->next) {
+        count++;
+        /* Reservoir sampling selects one tuple member in a single pass. */
+        hash = hash * 1664525u + 1013904223u;
+        if (hash % count == 0)
+            aim = (Socket*)((uint8_t*)n - offsetof(Socket, tuple_node));
     }
-
     return aim;
 }
 void set_skb_by_socket(skbuff* skb, Socket* sock){
@@ -1501,5 +1579,8 @@ void set_skb_by_socket(skbuff* skb, Socket* sock){
     skb->protocol = sock->protocol;
     PUT_REF(skb->route);
     GET_REF(skb->route, sock->route);
+    skb->route_generation = sock->route_generation;
+    memcpy(skb->route_dest, sock->route_dest, sizeof(skb->route_dest));
+    skb->route_scope_id = sock->route_scope_id;
 }
 

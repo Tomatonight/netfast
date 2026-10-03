@@ -13,6 +13,7 @@ typedef struct hash_node {
     struct hash_node* next;
     struct hash_node** pprev;
     uint32_t hash;
+    struct hash* owner;
 } hash_node;
 
 typedef struct hash {
@@ -22,6 +23,7 @@ typedef struct hash {
     uint32_t mask;
     ptrdiff_t key_offset;
     uint32_t key_len;
+    atomic_uint element_count;
 } hash;
 
 #define HASH_KEY_OFFSET(type, node_member, key_member)                         \

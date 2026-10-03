@@ -23,7 +23,7 @@ static bool icmp_checksum_ok(const skbuff* skb, uint32_t len)
 static int icmp_extract_inner4(const uint8_t* payload, uint32_t payload_len,
                                icmp_error_info* info)
 {
-    if (!payload || payload_len < sizeof(ipv4_hdr))
+    if (payload_len < sizeof(ipv4_hdr))
         return -1;
 
     const ipv4_hdr* ip = (const ipv4_hdr*)payload;
@@ -61,7 +61,7 @@ static int icmp_extract_inner4(const uint8_t* payload, uint32_t payload_len,
 static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
                                icmp_error_info* info)
 {
-    if (!payload || payload_len < sizeof(ipv6_hdr))
+    if (payload_len < sizeof(ipv6_hdr))
         return -1;
 
     const ipv6_hdr* ip6 = (const ipv6_hdr*)payload;
@@ -128,8 +128,13 @@ static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
     return 0;
 }
 
-static int icmp_code_to_errno(uint8_t code)
+static int icmp_code_to_errno(uint8_t type, uint8_t code)
 {
+    if (type == ICMP_TIME_EXCEEDED)
+        return EHOSTUNREACH;
+    if (type == ICMP_PARAMETERPROB)
+        return EPROTO;
+
     switch (code) {
     case ICMP_NET_UNREACH:
         return ENETUNREACH;
@@ -137,6 +142,8 @@ static int icmp_code_to_errno(uint8_t code)
         return EHOSTUNREACH;
     case ICMP_PORT_UNREACH:
         return ECONNREFUSED;
+    case ICMP_FRAG_NEEDED:
+        return EMSGSIZE;
     case ICMP_PROT_UNREACH:
         return EPROTONOSUPPORT;
     default:
@@ -225,7 +232,9 @@ int icmp_recv(skbuff* skb)
     if (!icmp_checksum_ok(skb, icmp_len))
         return -1;
 
-    if (icmp->type != ICMP_DEST_UNREACH)
+    if (icmp->type != ICMP_DEST_UNREACH &&
+        icmp->type != ICMP_TIME_EXCEEDED &&
+        icmp->type != ICMP_PARAMETERPROB)
         return 0;
 
     /* Need at least: icmp_hdr + quoted ipv4 hdr + 8 bytes */
@@ -237,8 +246,8 @@ int icmp_recv(skbuff* skb)
     uint8_t code = icmp->code;
     uint32_t payload_len = icmp_len - (uint32_t)sizeof(icmp_hdr);
 
-    uint32_t quote_len = min(payload_len, (uint32_t)(MAX_IP_HDR_WITH_OPT_LEN + 8));
-    uint8_t quote[MAX_IP_HDR_WITH_OPT_LEN + 8];
+    uint32_t quote_len = min(payload_len, (uint32_t)(sizeof(ipv4_hdr) + 8));
+    uint8_t quote[sizeof(ipv4_hdr) + 8];
     if (!skb_copy_bits(skb, sizeof(icmp_hdr), quote, quote_len))
         return -1;
 
@@ -247,7 +256,10 @@ int icmp_recv(skbuff* skb)
         return 0;
     }
 
-    int err = icmp_code_to_errno(code);
+    int err = icmp_code_to_errno(icmp->type, code);
+    if (icmp->type == ICMP_DEST_UNREACH &&
+        code == ICMP_FRAG_NEEDED)
+        info.mtu = ntohs(icmp->un.frag.mtu);
 
     icmp_deliver_error(skb, &info, err, icmp_recv);
 
@@ -302,25 +314,19 @@ int icmp6_recv(skbuff* skb)
  */
 int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
 {
-	if (!orig_skb || !orig_skb->ipv4_hdr)
-		return -1;
     ipv4_hdr* oip = orig_skb->ipv4_hdr;
 
     /* Only generate errors for unicast IPv4 packets (best-effort). */
     if (oip->saddr == 0 || oip->daddr == 0)
         return -1;
 
-    /* How many bytes of original packet to quote: ip header (including options) + 8 bytes */
+    /* 引用原始 IPv4 基本头和其后 8 字节。 */
     uint32_t oihl = (uint32_t)IPV4_VHL_IHL(oip->vhl) * 4u;
-    if (oihl < sizeof(ipv4_hdr) || oihl > MAX_IP_HDR_WITH_OPT_LEN) {
+    if (oihl != sizeof(ipv4_hdr)) {
         return -1;
     }
 
-	if (!orig_skb->l4_hdr) {
-        return -1;
-	}
-
-	uint8_t quote[MAX_IP_HDR_WITH_OPT_LEN + 8];
+	uint8_t quote[sizeof(ipv4_hdr) + 8];
 	memcpy(quote, oip, oihl);
 	memcpy(quote + oihl, orig_skb->l4_hdr, 8);
 	uint32_t icmp_payload_len = oihl + 8u;
@@ -332,13 +338,13 @@ int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
 	route_info* icmp_route = search_route_table(&rkey);
 	uint32_t icmp_l2_len = icmp_route ? icmp_route->if_info->l2_len
 	                                  : (uint32_t)sizeof(ether_hdr);
-	uint32_t alloc_len = icmp_l2_len + MAX_IP_HDR_WITH_OPT_LEN + icmp_len;
+	uint32_t alloc_len = icmp_l2_len + sizeof(ipv4_hdr) + icmp_len;
 	skbuff* skb = skb_alloc(alloc_len);
     if (!skb) {
         PUT_REF(icmp_route);
         return -1;
 	}
-	skb_reserve(skb, icmp_l2_len + MAX_IP_HDR_WITH_OPT_LEN);
+	skb_reserve(skb, icmp_l2_len + sizeof(ipv4_hdr));
 
 	skb->route = icmp_route;  /* ipv4_output will use this route */
     skb->family = AF_INET;
@@ -351,7 +357,7 @@ int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
 
 
     /* Build ICMP message */
-    icmp_hdr* icmp = (icmp_hdr*)skb_data_put(skb, icmp_len);
+	icmp_hdr* icmp = (icmp_hdr*)skb_data_put(skb, icmp_len, 0);
 	if (!icmp) {
 		PUT_REF(skb);
 		return -1;
@@ -369,5 +375,86 @@ int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
 	skb->sock = NULL;
     PUT_REF(skb);
 
+    return ret;
+}
+
+int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu)
+{
+    if (!mtu)
+        return -1;
+
+    ipv6_hdr* original = orig_skb->ipv6_hdr;
+    static const uint8_t zero[16];
+    if (memcmp(original->saddr, zero, sizeof(zero)) == 0 ||
+        original->daddr[0] == 0xff)
+        return -1;
+
+    /* RFC 4443: include as much of the invoking packet as fits in the
+     * minimum IPv6 MTU.  The IPv6 and ICMPv6 headers consume 48 bytes. */
+    uint32_t quote_len = min(skb_data_len(orig_skb), 1280u -
+                             IPV6_HDR_LEN - (uint32_t)sizeof(icmp_hdr));
+    uint8_t quote[1280u - IPV6_HDR_LEN - sizeof(icmp_hdr)];
+    if (!skb_copy_bits(orig_skb, 0, quote, quote_len))
+        return -1;
+
+    route_key key = { .ip_family = AF_INET6 };
+    if (orig_skb->recv_if)
+        key.ifindex = (uint32_t)orig_skb->recv_if->ifindex;
+    memcpy(key.dip, original->saddr, sizeof(key.dip));
+    route_info* route = search_route_table(&key);
+    if (!route)
+        return -1;
+
+    uint8_t source[16];
+    static const uint8_t route_zero[16];
+    if (memcmp(route->prefsrc, route_zero, sizeof(source)) != 0) {
+        memcpy(source, route->prefsrc, sizeof(source));
+    } else if (!if_search_best_saddr_by_daddr(
+                   route->if_info, AF_INET6, original->saddr, source)) {
+        PUT_REF(route);
+        return -1;
+    }
+
+    uint32_t l2_len = route->if_info->l2_len;
+    uint32_t icmp_len = (uint32_t)sizeof(icmp_hdr) + quote_len;
+    skbuff* reply = skb_alloc(l2_len + IPV6_HDR_LEN + icmp_len);
+    if (!reply) {
+        PUT_REF(route);
+        return -1;
+    }
+    skb_reserve(reply, l2_len + IPV6_HDR_LEN);
+
+    icmp_hdr* icmp = (icmp_hdr*)skb_data_put(reply, icmp_len, 0);
+    if (!icmp) {
+        PUT_REF(reply);
+        PUT_REF(route);
+        return -1;
+    }
+    memset(icmp, 0, sizeof(*icmp));
+    icmp->type = ICMP6_PACKET_TOO_BIG;
+    icmp->code = 0;
+    icmp->un.unused32 = htonl(mtu);
+    memcpy((uint8_t*)icmp + sizeof(*icmp), quote, quote_len);
+
+    Socket tmp = {0};
+    tmp.family = AF_INET6;
+    tmp.protocol = IPPROTO_ICMPV6;
+    memcpy(tmp.sip6, source, sizeof(tmp.sip6));
+    memcpy(tmp.dip6, original->saddr, sizeof(tmp.dip6));
+    tmp.dip6_scope_id = key.ifindex;
+
+    reply->sock = &tmp;
+    reply->family = AF_INET6;
+    reply->protocol = IPPROTO_ICMPV6;
+    reply->route = route;
+    reply->route_generation = route_table_generation(AF_INET6);
+    memcpy(reply->route_dest, tmp.dip6, sizeof(reply->route_dest));
+    reply->route_scope_id = key.ifindex;
+
+    icmp->checksum = skb_checksum_protocol6(
+        reply, icmp_len, tmp.sip6, tmp.dip6, IPPROTO_ICMPV6);
+    int ret = ipv6_output(reply);
+    reply->sock = NULL;
+    PUT_REF(reply);
     return ret;
 }

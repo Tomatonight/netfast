@@ -112,18 +112,17 @@ static void stack_request_task_cb(task *t)
         stack_process_request(r);
     }
     if (!notify_queue_is_empty(&s->req_msg)) {
-        t->parent_thread->work_pending = 1;
         notify_queue_notify(&s->req_msg);
     }
 }
 
-#define PKT_TASK_BUDGET 1024u
+#define PKT_TASK_BUDGET 1024 * 16u
 #define TUPLE_BUCKET_COUNT (128U * 1024U)
 
 static void stack_time_task_cb(task* t)
 {
-    (void)t;
     current_time_ms = read_now_ms();
+    socket_process_timer_migrations(t);
 }
 
 static void stack_packet_task_cb(task *t)
@@ -142,7 +141,6 @@ static void stack_packet_task_cb(task *t)
         PUT_REF(skb);
     }
     if (!notify_queue_is_empty(&s->pkt_msg)) {
-        t->parent_thread->work_pending = 1;
         notify_queue_notify(&s->pkt_msg);
     }
 }
@@ -206,11 +204,6 @@ static void stack_instance_cleanup_failed_init(stack_instance* s)
 
 int stack_instance_init(stack_instance *s, thread *master)
 {
-    if (!s || !master) {
-        errno = EINVAL;
-        return -1;
-    }
-
     memset(s, 0, sizeof(*s));
     s->netlink_fd = -1;
     s->req_msg.efd = -1;
@@ -361,15 +354,35 @@ static void stack_socket_pending_task_cb(task* tk)
     uint32_t events = sock->notified_events;
     sock->notified_events = 0;
 
+    net_event_mask callback_events = 0;
+    if (events & notify_data_read)
+        callback_events |= NET_EVENT_READ;
+    if (events & notify_data_write)
+        callback_events |= NET_EVENT_WRITE;
+    if (events & notify_new_connection)
+        callback_events |= NET_EVENT_ACCEPT;
+    if (events & notify_connect)
+        callback_events |= NET_EVENT_CONNECT;
+    if (events & notify_recv_fin)
+        callback_events |= NET_EVENT_FIN | NET_EVENT_READ;
+    if (events & notify_err)
+        callback_events |= NET_EVENT_ERROR;
+
+    net_callback callback = sock->callback;
+    void *callback_arg = sock->callback_arg;
+    net_event_mask callback_mask = sock->callback_events;
+
     /* Callbacks remove themselves only when the event satisfies their wait.
      * Leaving unmatched waiters attached prevents an unrelated notification
      * from losing a pending request. */
     pending_node* pn;
     list_node* tmp;
     FOR_EACH_LIST_SAFE_OFFSET(&sock->pending, pn, tmp, pending_node, node) {
-        if (pn->cb)
-            pn->cb(sock, pn->value, (enum notify_event)events);
+        pn->cb(sock, pn->value, (enum notify_event)events);
     }
+
+    if (callback_events & callback_mask)
+        callback(sock, callback_events & callback_mask, callback_arg);
 }
 
 void socket_notify_event(Socket* sock, enum notify_event event)
@@ -381,7 +394,7 @@ void socket_notify_event(Socket* sock, enum notify_event event)
 
 	/* No waiter can consume this notification yet.  Keep the
 	 * readiness bits, but avoid allocating and scheduling a timer task. */
-	if (!sock->pending.next)
+	if (!sock->pending.next && !sock->callback)
 		return;
 	if (!owner || !owner->master)
 		return;

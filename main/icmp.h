@@ -54,6 +54,7 @@ typedef struct icmp_hdr {
 #define ICMP_HOST_UNREACH     1
 #define ICMP_PROT_UNREACH     2
 #define ICMP_PORT_UNREACH     3
+#define ICMP_FRAG_NEEDED      4
 
 /* ICMPv6 error types and Destination Unreachable codes (RFC 4443). */
 #define ICMP6_DEST_UNREACH          1
@@ -72,5 +73,6 @@ typedef struct icmp_hdr {
 int icmp_recv(skbuff* skb);
 int icmp6_recv(skbuff* skb);
 int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code);
+int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu);
 
 #endif /* ICMP_H */

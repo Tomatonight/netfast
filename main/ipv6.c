@@ -13,8 +13,34 @@
 #include "icmp.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
+
+static bool ipv6_build_output_header(skbuff* skb, const uint8_t sip[16],
+                                     const uint8_t dip[16])
+{
+    if (skb_data_len(skb) > UINT16_MAX)
+        return false;
+
+    uint32_t l2_len = skb->route && skb->route->if_info
+        ? skb->route->if_info->l2_len : 0;
+    ipv6_hdr* ip6 = (ipv6_hdr*)skb_data_push(
+        skb, IPV6_HDR_LEN, IPV6_HDR_LEN + l2_len);
+    if (!ip6)
+        return false;
+    memset(ip6, 0, IPV6_HDR_LEN);
+    ip6->vtf = ipv6_make_vtf(
+        (uint8_t)(skb->l4_private.tcp.ip_ecn & 0x03u), 0);
+    ip6->payload_len = htons((uint16_t)(skb_data_len(skb) - IPV6_HDR_LEN));
+    ip6->next_hdr = (uint8_t)skb->protocol;
+    ip6->hop_limit = 64;
+    memcpy(ip6->saddr, sip, 16);
+    memcpy(ip6->daddr, dip, 16);
+    skb->ipv6_hdr = ip6;
+    skb->family = AF_INET6;
+    return true;
+}
 
 int ipv6_init(void)
 {
@@ -75,7 +101,7 @@ done:
     if (offset > 0) {
         /* Extension headers may straddle UMEM frames.  Consume across the
          * complete skb rather than requiring the whole chain in data[0]. */
-        if (skb_consume(skb, offset, false) != offset)
+        if (!skb_consume(skb, offset, false))
             return -1;
     }
     return 0;
@@ -124,6 +150,8 @@ int ipv6_recv(skbuff* skb)
 
     ipv6_hdr* ip6 = (ipv6_hdr*)skb_start(skb);
     skb->ipv6_hdr = ip6;
+    skb->l4_private.tcp.ip_ecn =
+        (uint8_t)(IPV6_TRAFFIC_CLASS(ip6) & 0x03u);
 
     if (!ipv6_validate_header(skb))
         return -1;
@@ -156,7 +184,7 @@ int ipv6_recv(skbuff* skb)
 
     uint8_t initial_next_hdr = skb->ipv6_hdr->next_hdr;
 
-    if (skb_consume(skb, IPV6_HDR_LEN, false) != IPV6_HDR_LEN)
+    if (!skb_consume(skb, IPV6_HDR_LEN, false))
         goto fail_reassembled;
 
     /* 处理扩展头，找到 L4 协议 */
@@ -208,29 +236,36 @@ int ipv6_output(skbuff* skb)
             return -1;
         route = skb->route;
 
-        if (skb_data_len(skb) > UINT16_MAX)
-            return -1;
-        ipv6_hdr* ip6 = (ipv6_hdr*)skb_data_push(skb, IPV6_HDR_LEN);
-        if (!ip6)
-            return -1;
+        if (skb->protocol == IPPROTO_TCP &&
+            route->if_info->mtu > IPV6_HDR_LEN &&
+            skb_data_len(skb) > route->if_info->mtu - IPV6_HDR_LEN) {
+            if (!tcp_skb_frag(skb, route->if_info->mtu))
+                return -1;
+        }
 
-        memset(ip6, 0, IPV6_HDR_LEN);
-        ip6->vtf = ipv6_make_vtf(0, 0);
-        ip6->payload_len = htons((uint16_t)(skb_data_len(skb) - IPV6_HDR_LEN));
-        ip6->next_hdr = (uint8_t)skb->protocol;
-        ip6->hop_limit = 64;
-        memcpy(ip6->saddr, sip, 16);
-        memcpy(ip6->daddr, dip, 16);
-
-        skb->ipv6_hdr = ip6;
-        skb->family = AF_INET6;
+        if (!ipv6_build_output_header(skb, sip, dip))
+            return -1;
+        if (skb->frag_list.next) {
+            skbuff* frag;
+            FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
+                if (!ipv6_build_output_header(frag, sip, dip))
+                    return -1;
+            }
+        }
     }
 
     uint32_t total_size = skb_data_len(skb);
-    if (total_size > route->if_info->mtu) {
+    uint32_t mtu = get_route_mtu(route);
+    if (skb->frag_list.next)
+        return skb_send_frags(skb);
+    if (total_size > mtu) {
+        if (skb->flag.is_forward) {
+            (void)icmp6_send_packet_too_big(skb, mtu);
+            return -EMSGSIZE;
+        }
         if (!ipv6_frag(skb)) {
             WARN_LOG("IPv6 fragmentation failed size=%u mtu=%u",
-                     total_size, route->if_info->mtu);
+                     total_size, mtu);
             return -1;
         }
         return skb_send_frags(skb);
@@ -249,6 +284,13 @@ int ipv6_forward(skbuff* skb)
     if (skb->ipv6_hdr->hop_limit <= 1) {
         DEBUG_LOG("Cannot forward IPv6 packet with expired hop limit");
         return -1;
+    }
+
+    /* IPv6 routers never fragment.  Report the outgoing MTU before changing
+     * the hop limit so the quoted packet is the packet that was received. */
+    if (skb->route && skb_data_len(skb) > get_route_mtu(skb->route)) {
+        (void)icmp6_send_packet_too_big(skb, get_route_mtu(skb->route));
+        return -EMSGSIZE;
     }
 
     skb->flag.is_forward = 1;

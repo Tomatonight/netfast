@@ -107,7 +107,8 @@ int ether_recv(if_info* info, skbuff* skb)
 
     ether_hdr ether;
     memcpy(&ether, skb_start(skb), sizeof(ether));
-    skb_consume(skb, sizeof(ether), true);
+    if (!skb_consume(skb, sizeof(ether), true))
+        return -1;
 
     if (!ether_mac_equal(ether.dmac, info->l2_addr) &&
         !ether_mac_is_broadcast(ether.dmac))
@@ -125,7 +126,8 @@ int ether_recv(if_info* info, skbuff* skb)
         ether_vlan_hdr vlan;
         memcpy(&vlan, skb_start(skb), sizeof(vlan));
         ethertype = ntohs(vlan.encap_proto);
-        skb_consume(skb, sizeof(vlan), true);
+        if (!skb_consume(skb, sizeof(vlan), true))
+            return -1;
     }
 
     switch (ethertype) {
@@ -168,7 +170,8 @@ int ether_send(if_info* info, skbuff* skb)
         return ret;
     }
 
-    ether_hdr* eth = (ether_hdr*)skb_data_push(skb, sizeof(ether_hdr));
+    ether_hdr* eth = (ether_hdr*)skb_data_push(
+        skb, sizeof(ether_hdr), sizeof(ether_hdr));
     if (!eth) {
         PUT_REF(neighbor);
         return -ENOMEM;

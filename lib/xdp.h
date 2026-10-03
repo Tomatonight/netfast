@@ -34,9 +34,9 @@ typedef struct req req;
 
 #define XDP_COMP_QUEUE_SIZE 2048U // COMP队列大小
 
-#define XDP_RX_QUEUE_SIZE 1024U      // 每个XSK的RX队列大小
+#define XDP_RX_QUEUE_SIZE 1024 * 4U      // 每个XSK的RX队列大小
 
-#define XDP_TX_QUEUE_SIZE 1024U     // 每个XSK的TX队列大小
+#define XDP_TX_QUEUE_SIZE 1024 * 4U     // 每个XSK的TX队列大小
 
 #define XDP_TX_KICK_THRESHOLD 64U
 

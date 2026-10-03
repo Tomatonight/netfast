@@ -11,8 +11,6 @@
 typedef struct skbuff skbuff;
 typedef struct task task;
 
-#define MAX_IP6_HDR_WITH_EXT_LEN 64
-
 #define IPQ6_TIMER_INTERVAL 1000u  /* ms */
 #define IPQ6_TIMEOUT        5000u  /* ms */
 
@@ -23,6 +21,9 @@ typedef struct ipv6_frag_hdr {
     uint16_t frag_off;   /* offset(13) | res(2) | M(1), network order */
     uint32_t id;         /* 32-bit Identification */
 } __attribute__((packed)) ipv6_frag_hdr;
+
+/* 默认只预留 IPv6 基本头和一个 Fragment 扩展头。 */
+#define MAX_IP6_HDR_WITH_EXT_LEN (IPV6_HDR_LEN + sizeof(ipv6_frag_hdr))
 
 #define IPV6_FRAG_OFFSET_MASK  0xFFF8u
 #define IPV6_FRAG_MF_MASK      0x0001u

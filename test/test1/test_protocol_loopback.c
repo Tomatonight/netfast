@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -397,17 +398,16 @@ static int wait_for_queued_fin(int fd)
         if (!entry)
             return -1;
         tcp_pcb *pcb = ((Socket*)entry->value)->pcb;
-        skbuff* queued = SKB_FROM_NODE(
-            pcb->unordered_skb_list.next, tcp_list);
+        skbuff* queued = TCP_TREE_FIRST(pcb, reorder);
         bool done = queued && !pcb->tcp_flag.recv_fin &&
                     (queued->l4_private.tcp.flag & TCP_FLAG_FIN) &&
                     queued->l4_private.tcp.seq_end ==
                         queued->l4_private.tcp.seq +
                         skb_data_len(queued) + 1u &&
-                    pcb->recv_sack_count &&
-                    pcb->recv_sacks[0].left ==
+                    pcb->sack.notify_sack_count &&
+                    pcb->sack.notify_sacks[0].left ==
                         queued->l4_private.tcp.seq &&
-                    pcb->recv_sacks[0].right ==
+                    pcb->sack.notify_sacks[0].right ==
                         queued->l4_private.tcp.seq_end &&
                     SEQ_GT(queued->l4_private.tcp.seq, pcb->rcv_nxt);
         PUT_REF(entry);
@@ -483,6 +483,64 @@ static int test_skb_multisegment_clone_copy(void)
     TEST_ASSERT(allocation_worker.master);
     set_current_worker(&allocation_worker);
 
+    uint32_t large_len = FRAME_SLOT_MAX_SIZE * 33u + 123u;
+    uint8_t* large_payload = malloc(large_len);
+    uint8_t* large_copy = malloc(large_len);
+    TEST_ASSERT(large_payload && large_copy);
+    for (uint32_t i = 0; i < large_len; ++i)
+        large_payload[i] = (uint8_t)(i * 13u + 5u);
+
+    skbuff* large = skb_alloc(large_len);
+    TEST_ASSERT(large);
+    TEST_ASSERT(large->data_num == 34u);
+    uint32_t total_capacity = 0;
+    for (data_info* di = &large->data0; di; di = di->next)
+        total_capacity += (uint32_t)(di->buf_end - di->buf_start);
+    TEST_ASSERT(total_capacity >= large_len);
+    TEST_ASSERT(skb_data_append(large, large_payload, large_len,
+                                FRAME_SLOT_MAX_SIZE));
+    TEST_ASSERT(skb_data_len(large) == large_len);
+    TEST_ASSERT(skb_copy_bits(large, 0, large_copy, large_len));
+    TEST_ASSERT(memcmp(large_payload, large_copy, large_len) == 0);
+    PUT_REF(large);
+    free(large_copy);
+    free(large_payload);
+
+    skbuff* put_skb = skb_alloc(FRAME_SLOT_MAX_SIZE);
+    TEST_ASSERT(put_skb);
+    TEST_ASSERT(skb_data_put(put_skb, FRAME_SLOT_MAX_SIZE, 0));
+    TEST_ASSERT(!skb_data_put(put_skb, 32, 0));
+    TEST_ASSERT(skb_data_len(put_skb) == FRAME_SLOT_MAX_SIZE);
+    TEST_ASSERT(!skb_data_put(put_skb, FRAME_SLOT_MAX_SIZE + 1,
+                              FRAME_SLOT_MAX_SIZE + 1));
+    TEST_ASSERT(skb_data_len(put_skb) == FRAME_SLOT_MAX_SIZE);
+    uint8_t* put_data = skb_data_put(put_skb, 32, 32);
+    TEST_ASSERT(put_data);
+    TEST_ASSERT(put_skb->data_num == 2);
+    TEST_ASSERT(put_data == put_skb->data0.next->start);
+    TEST_ASSERT((uint32_t)(put_skb->data0.next->end - put_data) == 32);
+    TEST_ASSERT(skb_data_len(put_skb) == FRAME_SLOT_MAX_SIZE + 32);
+    PUT_REF(put_skb);
+
+    skbuff* push_skb = skb_alloc(0);
+    TEST_ASSERT(push_skb);
+    TEST_ASSERT(!skb_data_push(push_skb, 16, 0));
+    uint8_t* push_data = skb_data_push(push_skb, 16, 64);
+    TEST_ASSERT(push_data);
+    TEST_ASSERT(push_data == push_skb->data0.start);
+    TEST_ASSERT(push_data == push_skb->data0.slot->data + 64 - 16);
+    TEST_ASSERT((uint32_t)(push_skb->data0.end - push_data) == 16);
+    TEST_ASSERT(push_skb->data_num == 2);
+    PUT_REF(push_skb);
+
+    data_info* ranged = create_data_info(NULL, 16, 64, 24, 32);
+    TEST_ASSERT(ranged);
+    TEST_ASSERT(ranged->buf_start == ranged->slot->data + 16);
+    TEST_ASSERT(ranged->buf_end == ranged->slot->data + 64);
+    TEST_ASSERT(ranged->start == ranged->slot->data + 24);
+    TEST_ASSERT(ranged->end == ranged->slot->data + 32);
+    free_data_info(ranged);
+
     uint8_t payload[3000];
     uint8_t copied[3000];
     for (uint32_t i = 0; i < sizeof(payload); ++i)
@@ -490,7 +548,7 @@ static int test_skb_multisegment_clone_copy(void)
 
     skbuff *source = skb_alloc(128);
     TEST_ASSERT(source);
-    TEST_ASSERT(skb_data_append(source, payload, sizeof(payload), 0, 1024));
+    TEST_ASSERT(skb_data_append(source, payload, sizeof(payload), 1024));
     uint32_t total = 0;
     TEST_ASSERT(source->data_num > 1);
     TEST_ASSERT(skb_chain_count(source, &total) == source->data_num);
@@ -518,7 +576,7 @@ static int test_skb_multisegment_clone_copy(void)
     TEST_ASSERT(memcmp(copied, payload, sizeof(payload)) == 0);
 
     void *l4_hdr = source->l4_hdr;
-    TEST_ASSERT(skb_data_push(source, 20));
+    TEST_ASSERT(skb_data_push(source, 20, 20));
     TEST_ASSERT(source->l4_hdr == l4_hdr);
     TEST_ASSERT(source->tx_checksum_offset == 16);
 
@@ -526,8 +584,12 @@ static int test_skb_multisegment_clone_copy(void)
     TEST_ASSERT(skb_chain_count(clone, &total) == clone->data_num);
     TEST_ASSERT(total == 1500 && total == skb_data_len(clone));
 
+    TEST_ASSERT(!skb_consume(clone, 1501, false));
+    TEST_ASSERT(skb_data_len(clone) == 1500);
     frame_slot* retained_slot = skb_end_data_info(clone)->slot;
-    TEST_ASSERT(skb_consume(clone, skb_data_len(clone), false) == 1500);
+    uint8_t* consume_start = skb_start(clone);
+    TEST_ASSERT(skb_consume(clone, skb_data_len(clone), false) ==
+                consume_start);
     TEST_ASSERT(skb_data_len(clone) == 0);
     TEST_ASSERT(clone->data_num == 1);
     TEST_ASSERT(clone->data0.slot == retained_slot);
@@ -535,17 +597,32 @@ static int test_skb_multisegment_clone_copy(void)
 
     skbuff* empty_clone = skb_clone(clone);
     TEST_ASSERT(empty_clone);
-    TEST_ASSERT(skb_data_push(empty_clone, 20));
+    TEST_ASSERT(skb_data_push(empty_clone, 20, 20));
     frame_slot* linear_retained_slot = empty_clone->data0.slot;
-    TEST_ASSERT(skb_consume(empty_clone, 20, true) == 20);
+    uint8_t* linear_consume_start = skb_start(empty_clone);
+    TEST_ASSERT(skb_consume(empty_clone, 20, true) == linear_consume_start);
     TEST_ASSERT(skb_data_len(empty_clone) == 0);
     TEST_ASSERT(empty_clone->data_num == 1);
     TEST_ASSERT(empty_clone->data0.slot == linear_retained_slot);
     TEST_ASSERT(empty_clone->data0.start == empty_clone->data0.end);
     PUT_REF(empty_clone);
 
+    data_info *split_info = &copy->data0;
+    uint32_t split_offset = 0;
+    while (split_info && split_offset +
+               (uint32_t)(split_info->end - split_info->start) <= 1500) {
+        split_offset += (uint32_t)(split_info->end - split_info->start);
+        split_info = split_info->next;
+    }
+    TEST_ASSERT(split_info);
+    frame_slot *split_slot = split_info->slot;
+    uint8_t *split_ptr = split_info->start + (1500 - split_offset);
+
     skbuff *tail = skb_split(copy, 1500);
     TEST_ASSERT(tail);
+    TEST_ASSERT(tail->data0.slot == split_slot);
+    TEST_ASSERT(tail->data0.buf_start == split_ptr);
+    TEST_ASSERT(split_info->buf_end == split_ptr);
     TEST_ASSERT(skb_chain_count(copy, &total) == copy->data_num);
     TEST_ASSERT(total == 1500 && total == skb_data_len(copy));
     TEST_ASSERT(skb_chain_count(tail, &total) == tail->data_num);
@@ -580,7 +657,7 @@ static skbuff *make_ipv6_packet(uint32_t payload_len, uint8_t next_header,
 
     skbuff *skb = skb_alloc(128);
     if (!skb || !skb_data_append(skb, packet, IPV6_HDR_LEN + payload_len,
-                                 0, segment_len)) {
+                                 segment_len)) {
         PUT_REF(skb);
         skb = NULL;
     }
@@ -704,14 +781,14 @@ static int test_tcp_unit_defaults_and_boundaries(void)
     TEST_ASSERT(SEQ_LEQ(7, 7) && SEQ_GEQ(7, 7));
 
     current_time_ms = read_now_ms();
-    pcb->fast_retransmit_deadline_ms = current_time_ms;
+    pcb->recovery_deadline_ms = current_time_ms;
     pcb->nagle_deadline_ms = current_time_ms;
     pcb->retransmit_deadline_ms = current_time_ms;
     pcb->persist_deadline_ms = current_time_ms;
     pcb->finwait2_deadline_ms = current_time_ms;
     pcb->keepalive_deadline_ms = current_time_ms;
     pcb->timer_task->cb_timer(pcb->timer_task);
-    TEST_ASSERT(pcb->fast_retransmit_deadline_ms == TCP_TIMER_STOP);
+    TEST_ASSERT(pcb->recovery_deadline_ms == TCP_TIMER_STOP);
     TEST_ASSERT(pcb->nagle_deadline_ms == TCP_TIMER_STOP);
     TEST_ASSERT(pcb->retransmit_deadline_ms == TCP_TIMER_STOP);
     TEST_ASSERT(pcb->persist_deadline_ms == TCP_TIMER_STOP);
@@ -928,8 +1005,12 @@ static int test_tcp_loopback(void)
     TEST_ASSERT(tcp_window_scale_negotiated(accepted_pcb));
     TEST_ASSERT(client_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
     TEST_ASSERT(accepted_pcb->snd_wnd_scale == TCP_RCV_WND_SCALE_DEFAULT);
-    TEST_ASSERT(client_pcb->snd_mss == accepted_pcb->rcv_mss);
-    TEST_ASSERT(accepted_pcb->snd_mss == client_pcb->rcv_mss);
+    uint32_t max_tcp_options = MAX_TCP_HDR_LEN - sizeof(tcp_hdr);
+    uint32_t max_ip_options = MAX_IP_HDR_WITH_OPT_LEN - sizeof(ipv4_hdr);
+    TEST_ASSERT(client_pcb->snd_mss + max_tcp_options + max_ip_options ==
+                accepted_pcb->rcv_mss);
+    TEST_ASSERT(accepted_pcb->snd_mss + max_tcp_options + max_ip_options ==
+                client_pcb->rcv_mss);
     TEST_ASSERT(client_pcb->rcv_mss > 536u);
     TEST_ASSERT(accepted_sock->recv_buffer_len_max ==
                 (uint32_t)listener_rcvbuf);
@@ -1017,7 +1098,7 @@ typedef struct test_tcp_timer_snapshot {
     int result;
     uint32_t retransmits_out;
     uint32_t retransmit_timeout;
-    uint32_t retransmit_queue_len;
+    uint32_t retransmit_tree_count;
     uint64_t snd_cwnd;
     uint32_t ca_mss;
     enum tcp_ca_status ca_status;
@@ -1037,10 +1118,10 @@ static int test_capture_tcp_timer(void *opaque)
     tcp_pcb *pcb = ((Socket *)entry->value)->pcb;
     snapshot->retransmits_out = pcb->retransmits_out;
     snapshot->retransmit_timeout = pcb->retransmit_timeout;
-    snapshot->retransmit_queue_len =
-        pcb->retransmit_queue.element_number;
+    snapshot->retransmit_tree_count =
+        pcb->retransmit_tree.count;
     snapshot->snd_cwnd = pcb->snd_cwnd;
-    snapshot->ca_mss = tcp_data_mss(pcb);
+    snapshot->ca_mss = pcb->snd_mss;
     snapshot->ca_status = pcb->ca.status;
     snapshot->now_ms = get_current_time_ms();
     snapshot->retransmit_deadline_ms =
@@ -1087,7 +1168,7 @@ static int test_tcp_rto_backoff_deadline(void)
     fd_entry *client_entry = hold_fd_entry(client);
     TEST_ASSERT(client_entry);
     tcp_pcb *client_pcb = ((Socket *)client_entry->value)->pcb;
-    uint32_t segment = tcp_data_mss(client_pcb);
+    uint32_t segment = client_pcb->snd_mss;
     uint32_t first_seq = client_pcb->snd_nxt;
     client_pcb->snd_cwnd = max(client_pcb->snd_cwnd, segment * 2u);
     client_pcb->retransmit_timeout = TCP_RTO_MIN_MS;
@@ -1115,7 +1196,7 @@ static int test_tcp_rto_backoff_deadline(void)
     TEST_ASSERT(initial.result == 0);
     TEST_ASSERT(initial.retransmits_out == 0u);
     TEST_ASSERT(initial.retransmit_timeout == TCP_RTO_MIN_MS);
-    TEST_ASSERT(initial.retransmit_queue_len == 1u);
+    TEST_ASSERT(initial.retransmit_tree_count == 1u);
     TEST_ASSERT(initial.retransmit_deadline_ms > initial.now_ms);
     TEST_ASSERT(initial.task_deadline_ms ==
                 initial.retransmit_deadline_ms);
@@ -1127,7 +1208,7 @@ static int test_tcp_rto_backoff_deadline(void)
     TEST_ASSERT(test_wait_for_rto_backoff(
         client, backed_off_timeout, &backed_off) == 0);
     TEST_ASSERT(test_tcp_drop_rule_attempts(0u) == 2u);
-    TEST_ASSERT(backed_off.retransmit_queue_len == 1u);
+    TEST_ASSERT(backed_off.retransmit_tree_count == 1u);
     TEST_ASSERT(backed_off.ca_status == TCP_CA_STATUS_LOST);
     TEST_ASSERT(backed_off.snd_cwnd == backed_off.ca_mss);
 
@@ -1173,7 +1254,8 @@ static int test_tcp_sack_ignores_partial_skb(void)
     set_current_worker(&allocation_worker);
 
     tcp_pcb pcb = {0};
-    init_queue(&pcb.retransmit_queue);
+    pcb.retransmit_tree.root = RB_ROOT;
+    pcb.retransmit_tree.count = 0;
     pcb.tcp_flag.sack_permitted_sent = 1;
     pcb.snd_una = FIRST_SEQ;
     pcb.snd_nxt = FIRST_SEQ + 2u * SEGMENT_LEN;
@@ -1182,8 +1264,8 @@ static int test_tcp_sack_ignores_partial_skb(void)
     skbuff* partial = skb_alloc(SEGMENT_LEN);
     skbuff* covered = skb_alloc(SEGMENT_LEN);
     TEST_ASSERT(partial && covered);
-    TEST_ASSERT(skb_data_put(partial, SEGMENT_LEN));
-    TEST_ASSERT(skb_data_put(covered, SEGMENT_LEN));
+    TEST_ASSERT(skb_data_put(partial, SEGMENT_LEN, 0));
+    TEST_ASSERT(skb_data_put(covered, SEGMENT_LEN, 0));
 
     partial->l4_private.tcp.seq = FIRST_SEQ;
     partial->l4_private.tcp.seq_end = FIRST_SEQ + SEGMENT_LEN;
@@ -1191,8 +1273,14 @@ static int test_tcp_sack_ignores_partial_skb(void)
     covered->l4_private.tcp.seq = FIRST_SEQ + SEGMENT_LEN;
     covered->l4_private.tcp.seq_end = FIRST_SEQ + 2u * SEGMENT_LEN;
     covered->l4_private.tcp.flag = TCP_FLAG_ACK;
-    add_queue(&pcb.retransmit_queue, &partial->queue_node);
-    add_queue(&pcb.retransmit_queue, &covered->queue_node);
+    /* Insert out of order: the retransmit RB-tree must restore seq order. */
+    TCP_TREE_INSERT(&pcb, retransmit, covered);
+    TCP_TREE_INSERT(&pcb, retransmit, partial);
+    TEST_ASSERT(TCP_TREE_FIRST(&pcb, retransmit) == partial);
+    TEST_ASSERT(TCP_TREE_LAST(&pcb, retransmit) == covered);
+    TEST_ASSERT(TCP_TREE_LOWER_BOUND(
+                    &pcb, retransmit,
+                    FIRST_SEQ + SEGMENT_LEN / 2u) == covered);
 
     struct {
         tcp_hdr hdr;
@@ -1215,6 +1303,7 @@ static int test_tcp_sack_ignores_partial_skb(void)
     TEST_ASSERT(newly_sacked == 0);
     TEST_ASSERT(partial->l4_private.tcp.sack_state == 0);
     TEST_ASSERT(covered->l4_private.tcp.sack_state == 0);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 0);
 
     right = htonl(FIRST_SEQ + 2u * SEGMENT_LEN);
     memcpy(&packet.options[6], &right, sizeof(right));
@@ -1227,9 +1316,14 @@ static int test_tcp_sack_ignores_partial_skb(void)
                 FIRST_SEQ + SEGMENT_LEN);
     TEST_ASSERT(skb_data_len(partial) == SEGMENT_LEN);
     TEST_ASSERT(covered->l4_private.tcp.sack_state == TCP_SACKED_ACKED);
-    TEST_ASSERT(pcb.retransmit_queue.element_number == 2);
+    TEST_ASSERT(pcb.retransmit_tree.count == 2);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 1);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].left == FIRST_SEQ + SEGMENT_LEN);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].right ==
+                FIRST_SEQ + 2u * SEGMENT_LEN);
 
     tcp_sack_clear_scoreboard(&pcb);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 0);
     left = htonl(FIRST_SEQ);
     right = htonl(FIRST_SEQ + SEGMENT_LEN + SEGMENT_LEN / 2u);
     memcpy(&packet.options[2], &left, sizeof(left));
@@ -1241,14 +1335,17 @@ static int test_tcp_sack_ignores_partial_skb(void)
     TEST_ASSERT(partial->l4_private.tcp.sack_state == TCP_SACKED_ACKED);
     TEST_ASSERT(covered->l4_private.tcp.sack_state == 0);
     TEST_ASSERT(skb_data_len(covered) == SEGMENT_LEN);
-    TEST_ASSERT(pcb.retransmit_queue.element_number == 2);
+    TEST_ASSERT(pcb.retransmit_tree.count == 2);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 1);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].left == FIRST_SEQ);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].right == FIRST_SEQ + SEGMENT_LEN);
 
     skbuff* fin = skb_alloc(1u);
     TEST_ASSERT(fin);
     fin->l4_private.tcp.seq = FIRST_SEQ + 2u * SEGMENT_LEN;
     fin->l4_private.tcp.seq_end = fin->l4_private.tcp.seq + 1u;
     fin->l4_private.tcp.flag = TCP_FLAG_ACK | TCP_FLAG_FIN;
-    add_queue(&pcb.retransmit_queue, &fin->queue_node);
+    TCP_TREE_INSERT(&pcb, retransmit, fin);
     pcb.snd_nxt = fin->l4_private.tcp.seq_end;
 
     left = htonl(fin->l4_private.tcp.seq);
@@ -1260,14 +1357,27 @@ static int test_tcp_sack_ignores_partial_skb(void)
                                          &newly_sacked));
     TEST_ASSERT(newly_sacked == 0);
     TEST_ASSERT(fin->l4_private.tcp.sack_state == TCP_SACKED_ACKED);
-    TEST_ASSERT(pcb.retransmit_queue.element_number == 3);
+    TEST_ASSERT(pcb.retransmit_tree.count == 3);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 2);
 
-    list_node* node = pop_queue(&pcb.retransmit_queue);
-    PUT_REF(SKB_FROM_NODE(node, queue_node));
-    node = pop_queue(&pcb.retransmit_queue);
-    PUT_REF(SKB_FROM_NODE(node, queue_node));
-    node = pop_queue(&pcb.retransmit_queue);
-    PUT_REF(SKB_FROM_NODE(node, queue_node));
+    left = htonl(covered->l4_private.tcp.seq);
+    right = htonl(covered->l4_private.tcp.seq_end);
+    memcpy(&packet.options[2], &left, sizeof(left));
+    memcpy(&packet.options[6], &right, sizeof(right));
+    newly_sacked = 0;
+    TEST_ASSERT(tcp_sack_process_options(&pcb, &packet.hdr,
+                                         &newly_sacked));
+    TEST_ASSERT(newly_sacked == SEGMENT_LEN);
+    TEST_ASSERT(pcb.sack.peer_sack_count == 1);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].left == FIRST_SEQ);
+    TEST_ASSERT(pcb.sack.peer_sacks[0].right ==
+                fin->l4_private.tcp.seq_end);
+
+    skbuff* queued;
+    while ((queued = TCP_TREE_FIRST(&pcb, retransmit))) {
+        TCP_TREE_REMOVE(&pcb, retransmit, queued);
+        PUT_REF(queued);
+    }
     set_current_worker(NULL);
     destroy_thread(allocation_worker.master);
     return 0;
@@ -1300,7 +1410,7 @@ static int test_tcp_sack_recovery(void)
     TEST_ASSERT(client_pcb->tcp_flag.peer_sack_ok);
     TEST_ASSERT(accepted_pcb->tcp_flag.peer_sack_ok);
 
-    uint32_t segment = tcp_data_mss(client_pcb);
+    uint32_t segment = client_pcb->snd_mss;
     TEST_ASSERT(segment && segment <= UINT32_MAX / TEST_SACK_SEGMENTS);
     uint32_t total = segment * TEST_SACK_SEGMENTS;
     uint32_t first_seq = client_pcb->snd_nxt;
@@ -1358,13 +1468,10 @@ static int test_tcp_sack_recovery(void)
     TEST_ASSERT(client_entry && accepted_entry);
     client_pcb = ((Socket *)client_entry->value)->pcb;
     accepted_pcb = ((Socket *)accepted_entry->value)->pcb;
-    TEST_ASSERT(client_pcb->sack_blocks_received >= 1u);
-    TEST_ASSERT(client_pcb->sack_retransmits == 1u);
-    TEST_ASSERT(client_pcb->sack_rto_events == 0u);
-    TEST_ASSERT(client_pcb->retransmit_queue.element_number == 0);
+    TEST_ASSERT(client_pcb->retransmit_tree.count == 0);
     TEST_ASSERT(accepted_pcb->sack_blocks_sent >= 1u);
-    TEST_ASSERT(accepted_pcb->recv_sack_count == 0u);
-    TEST_ASSERT(accepted_pcb->unordered_skb_count == 0u);
+    TEST_ASSERT(accepted_pcb->sack.notify_sack_count == 0u);
+    TEST_ASSERT(accepted_pcb->reorder_tree.count == 0u);
     PUT_REF(accepted_entry);
     PUT_REF(client_entry);
 
@@ -1388,7 +1495,7 @@ static int test_tcp_out_of_order_fin(void)
     fd_entry *client_entry = hold_fd_entry(client);
     TEST_ASSERT(client_entry);
     tcp_pcb *client_pcb = ((Socket*)client_entry->value)->pcb;
-    uint32_t segment = tcp_data_mss(client_pcb);
+    uint32_t segment = client_pcb->snd_mss;
     client_pcb->snd_cwnd = max(client_pcb->snd_cwnd, segment * 4u);
     PUT_REF(client_entry);
 

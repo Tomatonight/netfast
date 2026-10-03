@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <linux/neighbour.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -14,6 +15,25 @@
 #include "netlink.h"
 #include "skbuff.h"
 #include "socket.h"
+
+/* Route users cache a selected route.  A successful route-table mutation
+ * advances this generation so the next send performs a fresh lookup. */
+static _Atomic(uint64_t) g_route4_generation = 1;
+static _Atomic(uint64_t) g_route6_generation = 1;
+
+uint64_t route_table_generation(sa_family_t family)
+{
+    _Atomic(uint64_t)* generation = family == AF_INET6
+        ? &g_route6_generation : &g_route4_generation;
+    return atomic_load_explicit(generation, memory_order_acquire);
+}
+
+static void route_table_changed(sa_family_t family)
+{
+    _Atomic(uint64_t)* generation = family == AF_INET6
+        ? &g_route6_generation : &g_route4_generation;
+    atomic_fetch_add_explicit(generation, 1, memory_order_release);
+}
 
 /* ── ARP 邻居探测限速 ─────────────────────────────────────
  * Don't probe the same (ip, ifindex) more than once per cooldown
@@ -161,8 +181,6 @@ static void ndp_info_destroy(void* ptr)
 
 static ndp_info* ndp_info_create(const ndp_info* in)
 {
-    if (!in)
-        return NULL;
     CREATE_REF(ndp_info, ndp, ndp_info_destroy);
     if (!ndp)
         return NULL;
@@ -175,9 +193,6 @@ static bool route_info_equal(const route_info* a, const route_info* b)
 {
     if (a == b)
         return true;
-    if (!a || !b)
-        return false;
-
     if (a->ip_family != b->ip_family)
         return false;
     if (a->type != b->type)
@@ -295,7 +310,7 @@ static uint64_t route4_search_cb(trie_node* node, void* argv)
 static uint64_t route6_search_cb_impl(trie_node* node, void* argv)
 {
     const route_key* key = (const route_key*)argv;
-    if (!node || !node->exist_element)
+    if (!node->exist_element)
         return 0;
 
     list_node* head = (list_node*)node->element;
@@ -432,14 +447,14 @@ route_info* search_route_table(const route_key* key)
 /* ── 统一设置 skb 路由（v4 / v6）──────────────────────── */
 int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
 {
+    uint64_t generation = route_table_generation(family);
     route_info* route = skb->route;
-    if (route_info_is_valid(route))
+    uint32_t scope_id = family == AF_INET6 && skb->sock
+        ? skb->sock->dip6_scope_id : 0;
+    if (route_cache_key_matches(route, skb->route_generation, family,
+                                skb->route_dest, skb->route_scope_id,
+                                dip, scope_id))
         return 0;
-    if (route) {
-        PUT_REF(skb->route);
-        skb->route = NULL;
-        route = NULL;
-    }
 
     route_key key = { .ip_family = family };
 
@@ -453,10 +468,28 @@ int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
 
     route = search_route_table(&key);
     if (!route) {
+        PUT_REF(skb->route);
+        skb->route = NULL;
+        skb->route_generation = generation;
+        memset(skb->route_dest, 0, sizeof(skb->route_dest));
+        skb->route_scope_id = 0;
         DEBUG_LOG("No route found");
         return -1;
     }
+
+    if (route == skb->route) {
+        PUT_REF(route);
+        skb->route_generation = generation;
+        memcpy(skb->route_dest, dip, family == AF_INET6 ? 16 : 4);
+        skb->route_scope_id = key.ifindex;
+        return 0;
+    }
+
+    PUT_REF(skb->route);
     skb->route = route;
+    skb->route_generation = generation;
+    memcpy(skb->route_dest, dip, family == AF_INET6 ? 16 : 4);
+    skb->route_scope_id = key.ifindex;
     return 0;
 }
 
@@ -525,24 +558,38 @@ int ndp_delete_entry(const ndp_info* info)
 
 int route_add_entry(const route_info* info)
 {
-    if (info->ip_family == AF_INET6)
-        return add_trie_element(&ipv6_route_table,
-                                (uint64_t)(uintptr_t)info->dst_ip,
-                                info->dst_mask, (uint64_t)info);
-    uint32_t dst;
-    memcpy(&dst, info->dst_ip, sizeof(dst));
-    return add_trie_element(&ipv4_route_table, dst, info->dst_mask, (uint64_t)info);
+    int ret;
+    if (info->ip_family == AF_INET6) {
+        ret = add_trie_element(&ipv6_route_table,
+                               (uint64_t)(uintptr_t)info->dst_ip,
+                               info->dst_mask, (uint64_t)info);
+    } else {
+        uint32_t dst;
+        memcpy(&dst, info->dst_ip, sizeof(dst));
+        ret = add_trie_element(&ipv4_route_table, dst, info->dst_mask,
+                               (uint64_t)info);
+    }
+    if (ret == 0)
+        route_table_changed(info->ip_family);
+    return ret;
 }
 
 int route_delete_entry(const route_info* info)
 {
-    if (info->ip_family == AF_INET6)
-        return delete_trie_element(&ipv6_route_table,
-                                   (uint64_t)(uintptr_t)info->dst_ip,
-                                   info->dst_mask, (uint64_t)info);
-    uint32_t dst;
-    memcpy(&dst, info->dst_ip, sizeof(dst));
-    return delete_trie_element(&ipv4_route_table, dst, info->dst_mask, (uint64_t)info);
+    int ret;
+    if (info->ip_family == AF_INET6) {
+        ret = delete_trie_element(&ipv6_route_table,
+                                  (uint64_t)(uintptr_t)info->dst_ip,
+                                  info->dst_mask, (uint64_t)info);
+    } else {
+        uint32_t dst;
+        memcpy(&dst, info->dst_ip, sizeof(dst));
+        ret = delete_trie_element(&ipv4_route_table, dst, info->dst_mask,
+                                  (uint64_t)info);
+    }
+    if (ret == 0)
+        route_table_changed(info->ip_family);
+    return ret;
 }
 
 static void route_parse_metrics(route_info* info, const struct rtattr* metrics)
@@ -665,9 +712,26 @@ int parse_neighbor_event(struct nlmsghdr *nlh)
     return ndp_delete_entry(&info);
 }
 
-bool route_info_is_valid(const route_info* info)
+bool route_info_is_valid(const route_info* info, uint64_t cached_generation)
 {
-    return REF_USABLE(info) && REF_USABLE(info->if_info);
+    return info &&
+           cached_generation == route_table_generation(info->ip_family) &&
+           REF_USABLE(info) && REF_USABLE(info->if_info);
+}
+
+bool route_cache_key_matches(const route_info* route, uint64_t generation,
+                             sa_family_t family, const uint8_t* cached_dest,
+                             uint32_t cached_scope_id,
+                             const uint8_t* dest, uint32_t scope_id)
+{
+    if (!route_info_is_valid(route, generation) ||
+        route->ip_family != family ||
+        memcmp(cached_dest, dest, family == AF_INET6 ? 16u : 4u) != 0 ||
+        cached_scope_id != (family == AF_INET6 ? scope_id : 0u) ||
+        !route_include_nexthop(route, dest))
+        return false;
+
+    return family != AF_INET6 || !scope_id || route->ifindex == scope_id;
 }
 
 bool search_best_saddr_by_daddr(const route_key* key, route_key* answer)
@@ -735,6 +799,8 @@ void route_arp_clear_tables(void)
     trie_clear(&ipv6_route_table, route_element_destroy);
     trie_clear(&arp_table, arp_element_destroy);
     trie_clear(&ndp_table, arp_element_destroy);
+    route_table_changed(AF_INET);
+    route_table_changed(AF_INET6);
 }
 
 uint32_t get_route_mtu(const route_info* info)
