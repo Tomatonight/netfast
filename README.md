@@ -333,6 +333,37 @@ net_read(fd, response, response_capacity);
 net_close(fd);
 ```
 
+### Socket callbacks
+
+Applications that already have an event loop can register one callback for a
+socket instead of submitting a readiness request for every event:
+
+```c
+static void on_socket_event(Socket *sock, net_event_mask events, void *arg)
+{
+    struct app_state *state = arg;
+
+    if (events & NET_EVENT_READ)
+        handle_readable(state, sock);
+    if (events & NET_EVENT_WRITE)
+        handle_writable(state, sock);
+    if (events & NET_EVENT_ERROR)
+        handle_error(state, sock);
+}
+
+net_set_callback(fd, NET_EVENT_READ | NET_EVENT_WRITE |
+                       NET_EVENT_ERROR, on_socket_event, state);
+```
+
+The callback runs on the worker that owns the socket, so socket state and
+protocol processing remain serialized with packet handling. Notifications are
+coalesced until the worker runs the callback; the `events` mask can contain
+multiple bits. The callback receives the opaque `Socket *` associated with the
+event and the application-provided `arg`. Call `net_clear_callback(fd)` to
+remove it. A callback must not block or use the socket from another thread;
+submit regular asynchronous requests when work needs to run outside the
+owning worker.
+
 ## Repository Layout
 
 ```text

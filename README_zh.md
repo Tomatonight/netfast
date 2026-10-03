@@ -308,6 +308,35 @@ net_read(fd, response, response_capacity);
 net_close(fd);
 ```
 
+### Socket callback
+
+如果应用已经有自己的事件循环，可以为 socket 注册一个 callback，直接接收
+就绪通知，而不必为每次事件提交一个等待请求：
+
+```c
+static void on_socket_event(Socket *sock, net_event_mask events, void *arg)
+{
+    struct app_state *state = arg;
+
+    if (events & NET_EVENT_READ)
+        handle_readable(state, sock);
+    if (events & NET_EVENT_WRITE)
+        handle_writable(state, sock);
+    if (events & NET_EVENT_ERROR)
+        handle_error(state, sock);
+}
+
+net_set_callback(fd, NET_EVENT_READ | NET_EVENT_WRITE |
+                       NET_EVENT_ERROR, on_socket_event, state);
+```
+
+callback 在 socket 所属的 worker 线程上执行，因此 socket 状态和报文处理仍然
+由同一个 worker 串行化。worker 执行 callback 前会合并已经产生的通知，
+`events` 可能同时包含多个位。callback 会收到对应的 opaque `Socket *` 和
+应用传入的 `arg`。使用 `net_clear_callback(fd)` 可以移除 callback。callback
+不应阻塞，也不应从其他线程直接操作该 socket；需要在 worker 外执行的工作，
+请使用常规异步请求提交。
+
 ## 目录结构
 
 ```text
