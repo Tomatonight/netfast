@@ -27,7 +27,7 @@ enum tcp_sack_state {
     TCP_SACKED_LOST    = 1u << 2,
 };
 
-typedef struct tcp_sack{
+typedef struct tcp_sack {
     tcp_sack_block notify_sacks[TCP_MAX_SACK_BLOCKS];
     uint8_t notify_sack_count;
 
@@ -42,22 +42,22 @@ struct tcp_hdr;
 struct tcp_pcb;
 struct tcp_options;
 
-void tcp_sack_recv_ooo_skb(struct tcp_pcb* pcb,
-                              const struct skbuff* skb);
-void tcp_sack_rcv_nxt_advance(struct tcp_pcb* pcb);
-uint32_t tcp_sack_option_len(const struct tcp_pcb* pcb, uint8_t flags);
-void tcp_sack_write_option(struct tcp_pcb* pcb, uint8_t flags,
-                           uint8_t* out);
-void tcp_sack_process_options(struct tcp_pcb* pcb,
-                              const struct tcp_options* options);
-uint64_t tcp_sack_acked_bytes(const struct tcp_pcb* pcb);
-uint64_t tcp_sack_retransmited_bytes(const struct tcp_pcb* pcb);
+void tcp_sack_recv_ooo_skb(struct tcp_pcb *pcb,
+                              const struct skbuff *skb);
+void tcp_sack_rcv_nxt_advance(struct tcp_pcb *pcb);
+uint32_t tcp_sack_option_len(const struct tcp_pcb *pcb, uint8_t flags);
+void tcp_sack_write_option(struct tcp_pcb *pcb, uint8_t flags,
+                           uint8_t *out);
+void tcp_sack_process_options(struct tcp_pcb *pcb,
+                              const struct tcp_options *options);
+uint64_t tcp_sack_acked_bytes(const struct tcp_pcb *pcb);
+uint64_t tcp_sack_retransmited_bytes(const struct tcp_pcb *pcb);
 
 
-void tcp_sack_reset(struct tcp_pcb* pcb);
+void tcp_sack_reset(struct tcp_pcb *pcb);
 
 
-void tcp_sack_set_state(struct tcp_pcb* pcb, struct skbuff* skb, uint8_t state);
+void tcp_sack_set_state(struct tcp_pcb *pcb, struct skbuff *skb, uint8_t state);
 
 
-#endif
+#endif /* TCP_SACK_H */

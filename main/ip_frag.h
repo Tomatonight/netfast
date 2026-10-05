@@ -1,8 +1,8 @@
 #ifndef IP_FRAG
 #define IP_FRAG
 
-#include "ip.h"
 #include "hash.h"
+#include "ip.h"
 #include "list.h"
 
 typedef struct skbuff skbuff;
@@ -12,7 +12,7 @@ typedef struct task task;
 
 #define IPQ_TIMEOUT 5000u /* ms */
 
-typedef struct ipq_key{
+typedef struct ipq_key {
     uint16_t id;
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -20,7 +20,7 @@ typedef struct ipq_key{
 }ipq_key;
 
 
-typedef struct ipq{
+typedef struct ipq {
     ipq_key key;
     hash_node hash_node;
     uint32_t total_len;       /* payload total length (bytes), not include ip header */
@@ -33,8 +33,8 @@ typedef struct ipq{
     list_node frag_head;     /* ipq_frag::node */
 }ipq;
 
-bool ipv4_is_frag(const ipv4_hdr* ip);
-skbuff* ipv4_defrag(skbuff* skb);
-bool ipv4_frag(skbuff* skb);
-void ipq_timer(task* tk);
-#endif
+bool ipv4_is_frag(const ipv4_hdr *ip);
+skbuff *ipv4_defrag(skbuff *skb);
+bool ipv4_frag(skbuff *skb);
+void ipq_timer(task *tk);
+#endif /* IP_FRAG */

@@ -1,38 +1,38 @@
 #include "stack.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdlib.h>
 
-#include "worker.h"
-#include "req.h"
-#include "socket.h"
-#include "udp.h"
-#include "xdp.h"
-#include "fd_entry.h"
 #include "base.h"
+#include "fd_entry.h"
 #include "ip_frag.h"
 #include "ipv6_frag.h"
 #include "log.h"
+#include "req.h"
 #include "skbuff.h"
+#include "socket.h"
+#include "udp.h"
+#include "worker.h"
+#include "xdp.h"
 
-stack_maps* g_stack_maps;
+stack_maps *g_stack_maps;
 
 void stack_process_request(req *r)
 {
-    if(r->flag.async_cancel){
+    if (r->flag.async_cancel) {
         req_notify(r, -ECANCELED);
         return;
     }
-    fd_entry* sock_entry=fd_entry_from_request(r);
-    if(sock_entry){
-        worker* entry_worker = fd_entry_get_worker(sock_entry);
+    fd_entry *sock_entry=fd_entry_from_request(r);
+    if (sock_entry) {
+        worker *entry_worker = fd_entry_get_worker(sock_entry);
         if (!entry_worker) {
             req_notify(r, -EBADF);
             return;
         }
-        if(entry_worker != get_current_worker()){
+        if (entry_worker != get_current_worker()) {
             worker_move_request(r, entry_worker);
             return;
         }
@@ -119,7 +119,7 @@ static void stack_request_task_cb(task *t)
 #define PKT_TASK_BUDGET 1024 * 16u
 #define TUPLE_BUCKET_COUNT (128U * 1024U)
 
-static void stack_time_task_cb(task* t)
+static void stack_time_task_cb(task *t)
 {
     current_time_ms = read_now_ms();
     socket_process_timer_migrations(t);
@@ -136,7 +136,7 @@ static void stack_packet_task_cb(task *t)
         if (!n)
             break;
 
-        skbuff* skb = (skbuff*)n;
+        skbuff *skb = (skbuff*)n;
         skb->process(skb);
         PUT_REF(skb);
     }
@@ -148,7 +148,7 @@ static void stack_packet_task_cb(task *t)
 
 static int stack_maps_init(void)
 {
-    stack_maps* maps = calloc(1, sizeof(*maps));
+    stack_maps *maps = calloc(1, sizeof(*maps));
     if (!maps)
         return -1;
 
@@ -184,7 +184,7 @@ fail:
     return -1;
 }
 
-static void stack_instance_cleanup_failed_init(stack_instance* s)
+static void stack_instance_cleanup_failed_init(stack_instance *s)
 {
     destroy_task(s->pkt_task);
     destroy_task(s->req_task);
@@ -208,7 +208,7 @@ int stack_instance_init(stack_instance *s, thread *master)
     s->netlink_fd = -1;
     s->req_msg.efd = -1;
     s->pkt_msg.efd = -1;
-    if(!g_stack_maps){
+    if (!g_stack_maps) {
         if (stack_maps_init() < 0)
             return -1;
     }
@@ -282,10 +282,10 @@ fail:
 
 /* stack_request_pending_cb: callback installed in req->pn, invoked by socket_notify_event.
  * With bit flags, checks if any of the events intersect the request's wait mask. */
-void stack_request_pending_cb(Socket* sock, void* value, enum notify_event event)
+void stack_request_pending_cb(Socket *sock, void *value, enum notify_event event)
 {
     (void)sock;
-    req* r = (req*)value;
+    req *r = (req*)value;
     if (r->status == REQ_WAITING_CLOSE)
         return;
     req_status expected = notify_event_to_status(event);
@@ -298,55 +298,55 @@ void stack_request_pending_cb(Socket* sock, void* value, enum notify_event event
 
 void stack_wait_request(Socket *sock, req *r, req_status status)
 {
-	r->status = status;
-	r->wait_sock = sock;
-	if (!LIST_ATTACHED(&r->pn.node)) {
-		r->pn.value = r;
-		r->pn.cb    = stack_request_pending_cb;
-		add_list_node(&sock->pending, &r->pn.node);
-	}
+    r->status = status;
+    r->wait_sock = sock;
+    if (!LIST_ATTACHED(&r->pn.node)) {
+        r->pn.value = r;
+        r->pn.cb    = stack_request_pending_cb;
+        add_list_node(&sock->pending, &r->pn.node);
+    }
 }
 
 void stack_wait_timeout_cb(task *tk)
 {
-	req *r = (req *)tk->argv;
-	stack_process_request(r);
+    req *r = (req *)tk->argv;
+    stack_process_request(r);
 }
 
 void stack_wait_request_until(Socket *sock, req *r, req_status status, uint64_t expire)
 {
-	r->status = status;
-	r->wait_sock = sock;
+    r->status = status;
+    r->wait_sock = sock;
 
-	if (!r->timeout_task) {
-		r->timeout_task = create_task(TASK_TYPE_TIMER);
+    if (!r->timeout_task) {
+        r->timeout_task = create_task(TASK_TYPE_TIMER);
         if (!r->timeout_task) {
             req_notify(r, -ENOMEM);
             return;
         }
     }
-	r->timeout_task->cb_timer = stack_wait_timeout_cb;
-	r->timeout_task->argv = (uint64_t)r;
-	r->timeout_task->timeout = expire;
+    r->timeout_task->cb_timer = stack_wait_timeout_cb;
+    r->timeout_task->argv = (uint64_t)r;
+    r->timeout_task->timeout = expire;
 
-	if (!r->worker || register_task(r->worker->master, r->timeout_task) < 0) {
+    if (!r->worker || register_task(r->worker->master, r->timeout_task) < 0) {
         destroy_task(r->timeout_task);
         r->timeout_task = NULL;
         req_notify(r, -EIO);
         return;
     }
 
-	if (!LIST_ATTACHED(&r->pn.node)) {
-		r->pn.node.next = NULL;
-		r->pn.value = r;
-		r->pn.cb    = stack_request_pending_cb;
-		add_list_node(&sock->pending, &r->pn.node);
-	}
+    if (!LIST_ATTACHED(&r->pn.node)) {
+        r->pn.node.next = NULL;
+        r->pn.value = r;
+        r->pn.cb    = stack_request_pending_cb;
+        add_list_node(&sock->pending, &r->pn.node);
+    }
 }
 
-static void stack_socket_pending_task_cb(task* tk)
+static void stack_socket_pending_task_cb(task *tk)
 {
-    Socket* sock = (Socket*)tk->argv;
+    Socket *sock = (Socket*)tk->argv;
     unregister_task(sock->pending_task);
 
     /* Snapshot + clear accumulated events before firing callbacks.
@@ -375,8 +375,8 @@ static void stack_socket_pending_task_cb(task* tk)
     /* Callbacks remove themselves only when the event satisfies their wait.
      * Leaving unmatched waiters attached prevents an unrelated notification
      * from losing a pending request. */
-    pending_node* pn;
-    list_node* tmp;
+    pending_node *pn;
+    list_node *tmp;
     FOR_EACH_LIST_SAFE_OFFSET(&sock->pending, pn, tmp, pending_node, node) {
         pn->cb(sock, pn->value, (enum notify_event)events);
     }
@@ -385,42 +385,42 @@ static void stack_socket_pending_task_cb(task* tk)
         callback(sock, callback_events & callback_mask, callback_arg);
 }
 
-void socket_notify_event(Socket* sock, enum notify_event event)
+void socket_notify_event(Socket *sock, enum notify_event event)
 {
-	worker *owner = sock->owner;
-	uint32_t old_events = sock->notified_events;
+    worker *owner = sock->owner;
+    uint32_t old_events = sock->notified_events;
 
-	sock->notified_events |= (uint32_t)event;
+    sock->notified_events |= (uint32_t)event;
 
-	/* No waiter can consume this notification yet.  Keep the
-	 * readiness bits, but avoid allocating and scheduling a timer task. */
-	if (!sock->pending.next && !sock->callback)
-		return;
-	if (!owner || !owner->master)
-		return;
+    /* No waiter can consume this notification yet.  Keep the
+     * readiness bits, but avoid allocating and scheduling a timer task. */
+    if (!sock->pending.next && !sock->callback)
+        return;
+    if (!owner || !owner->master)
+        return;
 
-	/* The same event is already queued for the pending waiters. */
-	if ((old_events & (uint32_t)event) && sock->pending_task &&
-	    sock->pending_task->registered)
-		return;
+    /* The same event is already queued for the pending waiters. */
+    if ((old_events & (uint32_t)event) && sock->pending_task &&
+        sock->pending_task->registered)
+        return;
 
-	if (!sock->pending_task) {
-		sock->pending_task = create_task(TASK_TYPE_TIMER);
-		if (!sock->pending_task)
-			return;
-		sock->pending_task->cb_timer = stack_socket_pending_task_cb;
-		sock->pending_task->argv = (uint64_t)sock;
-		
-	}
+    if (!sock->pending_task) {
+        sock->pending_task = create_task(TASK_TYPE_TIMER);
+        if (!sock->pending_task)
+            return;
+        sock->pending_task->cb_timer = stack_socket_pending_task_cb;
+        sock->pending_task->argv = (uint64_t)sock;
 
-	if (!sock->pending_task->registered) {
-		/* Coalesce notifications while the pending callback is already
-		 * scheduled.  notified_events is a bitmask, so repeated timer-wheel
-		 * remove/insert operations are unnecessary. */
-		sock->pending_task->timeout = get_current_time_ms();
-		if (register_task(owner->master, sock->pending_task) < 0) {
+    }
+
+    if (!sock->pending_task->registered) {
+        /* Coalesce notifications while the pending callback is already
+         * scheduled.  notified_events is a bitmask, so repeated timer-wheel
+         * remove/insert operations are unnecessary. */
+        sock->pending_task->timeout = get_current_time_ms();
+        if (register_task(owner->master, sock->pending_task) < 0) {
             destroy_task(sock->pending_task);
             sock->pending_task = NULL;
         }
-	}
+    }
 }

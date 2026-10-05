@@ -1,17 +1,17 @@
 #include "init.h"
 
-#include <errno.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <string.h>
 #include <cjson/cJSON.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "log.h"
 #include "fd_entry.h"
-#include "worker.h"
 #include "ip.h"
 #include "ipv6.h"
+#include "log.h"
+#include "worker.h"
 #include "xdp.h"
 
 enum {
@@ -396,8 +396,8 @@ static int netfast_release_linux_source_ports(void)
 
 int config_get_interface_queues(const char *ifname)
 {
-	if (!ifname)
-		return 0;
+    if (!ifname)
+        return 0;
 
     for (int i = 0; i < g_cfg.ifs_count; i++) {
         if (strcmp(ifname, g_cfg.ifs[i].name) == 0)
@@ -546,15 +546,15 @@ static void netfast_library_cleanup(void)
 __attribute__((constructor))
 static void netfast_library_init(void)
 {
-	if (fd_table_init() < 0) {
-		fprintf(stderr, "netfast_library_init: fd_table_init failed\n");
-		goto fail;
-	}
+    if (fd_table_init() < 0) {
+        fprintf(stderr, "netfast_library_init: fd_table_init failed\n");
+        goto fail;
+    }
 
-	/* Unit tests initialize the raw frame pool explicitly and must not attach
-	 * XDP programs or start detached workers from the shared-library ctor. */
-	if (getenv("NETFAST_TEST_NO_AUTO_INIT"))
-		return;
+    /* Unit tests initialize the raw frame pool explicitly and must not attach
+     * XDP programs or start detached workers from the shared-library ctor. */
+    if (getenv("NETFAST_TEST_NO_AUTO_INIT"))
+        return;
 
     if (config_load() < 0) {
         fprintf(stderr, "netfast_library_init: config_load failed\n");
@@ -572,7 +572,7 @@ static void netfast_library_init(void)
         ERR_LOG("netfast_library_init: xdp_init failed");
         goto fail;
     }
-    if (netfast_init_workers() < 0){
+    if (netfast_init_workers() < 0) {
         ERR_LOG("netfast_library_init: netfast_init_workers failed");
         goto fail;
     }

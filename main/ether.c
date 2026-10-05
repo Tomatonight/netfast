@@ -19,12 +19,12 @@ typedef struct ether_vlan_hdr {
     uint16_t encap_proto;
 } ether_vlan_hdr;
 
-static bool ether_mac_equal(const uint8_t* a, const uint8_t* b)
+static bool ether_mac_equal(const uint8_t *a, const uint8_t *b)
 {
-	return memcmp(a, b, ETH_ALEN) == 0;
+    return memcmp(a, b, ETH_ALEN) == 0;
 }
 
-static bool ether_mac_is_broadcast(const uint8_t* mac)
+static bool ether_mac_is_broadcast(const uint8_t *mac)
 {
     static const uint8_t broadcast_mac[ETH_ALEN] = {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff
@@ -32,7 +32,7 @@ static bool ether_mac_is_broadcast(const uint8_t* mac)
     return ether_mac_equal(mac, broadcast_mac);
 }
 
-static void ether_update_attributes(if_info* info, struct nlmsghdr *nlh)
+static void ether_update_attributes(if_info *info, struct nlmsghdr *nlh)
 {
     struct ifinfomsg *ifinfo = (struct ifinfomsg *)NLMSG_DATA(nlh);
     struct rtattr *rta;
@@ -66,7 +66,7 @@ static void ether_update_attributes(if_info* info, struct nlmsghdr *nlh)
     }
 }
 
-int ether_create(if_info* info, struct nlmsghdr* nlh)
+int ether_create(if_info *info, struct nlmsghdr *nlh)
 {
     info->l2_addr = malloc(ETH_ALEN);
     if (!info->l2_addr)
@@ -76,17 +76,17 @@ int ether_create(if_info* info, struct nlmsghdr* nlh)
     return 0;
 }
 
-void ether_update(if_info* info, struct nlmsghdr* nlh)
+void ether_update(if_info *info, struct nlmsghdr *nlh)
 {
     ether_update_attributes(info, nlh);
 }
 
-void ether_destroy(if_info* info)
+void ether_destroy(if_info *info)
 {
     free(info->l2_addr);
 }
 
-int ether_up(if_info* info)
+int ether_up(if_info *info)
 {
     if (xdp_if_start(info) < 0) {
         ERR_LOG("ether_up: failed to start XDP on %s", info->name);
@@ -95,14 +95,14 @@ int ether_up(if_info* info)
     return 0;
 }
 
-int ether_down(if_info* info)
+int ether_down(if_info *info)
 {
     return xdp_if_stop(info);
 }
 
-int ether_recv(if_info* info, skbuff* skb)
+int ether_recv(if_info *info, skbuff *skb)
 {
-    if (skb_data0_len(skb) < sizeof(ether_hdr))
+    if (unlikely(skb_data0_len(skb) < sizeof(ether_hdr)))
         return -1;
 
     ether_hdr ether;
@@ -120,7 +120,7 @@ int ether_recv(if_info* info, skbuff* skb)
        Some NICs do hardware VLAN offload, but if the tag reaches us
        we need to skip it to find the real L3 protocol. */
     while (ethertype == ETHER_TYPE_8021Q || ethertype == ETHER_TYPE_8021AD) {
-        if (skb_data0_len(skb) < sizeof(ether_vlan_hdr))
+        if (unlikely(skb_data0_len(skb) < sizeof(ether_vlan_hdr)))
             return -1;
 
         ether_vlan_hdr vlan;
@@ -133,14 +133,14 @@ int ether_recv(if_info* info, skbuff* skb)
     switch (ethertype) {
         case ETHER_TYPE_IPV4:
             return ipv4_recv(skb);
-		case ETHER_TYPE_IPV6:
-			return ipv6_recv(skb);
+        case ETHER_TYPE_IPV6:
+            return ipv6_recv(skb);
         default:
             DEBUG_LOG("ether type 0x%04x not handled", ethertype);
             return -1;
     }
 }
-int ether_send(if_info* info, skbuff* skb)
+int ether_send(if_info *info, skbuff *skb)
 {
     ndp_key nkey = { .ip_family = skb->family, .ifindex = (uint32_t)info->ifindex };
 
@@ -157,7 +157,7 @@ int ether_send(if_info* info, skbuff* skb)
             memcpy(nkey.neigh_ip, &skb->ipv4_hdr->daddr, sizeof(zero4));
     }
 
-    arp_info* neighbor = NULL;
+    arp_info *neighbor = NULL;
     int ret = resolve_neighbor_entry(&nkey, &neighbor);
     if (ret == -EINPROGRESS) {
         DEBUG_LOG("Neighbor resolution pending; dropping packet, family=%d ifindex=%u",
@@ -170,7 +170,7 @@ int ether_send(if_info* info, skbuff* skb)
         return ret;
     }
 
-    ether_hdr* eth = (ether_hdr*)skb_data_push(
+    ether_hdr *eth = (ether_hdr*)skb_data_push(
         skb, sizeof(ether_hdr), sizeof(ether_hdr));
     if (!eth) {
         PUT_REF(neighbor);
@@ -187,7 +187,7 @@ int ether_send(if_info* info, skbuff* skb)
 
     return xdp_transmit_skb(info, skb);
 }
-const if_ops ether_ops={
+const if_ops ether_ops = {
     .send=ether_send,
     .recv=ether_recv,
     .update = ether_update,

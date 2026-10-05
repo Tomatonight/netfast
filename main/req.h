@@ -1,18 +1,20 @@
 #ifndef REQ_H
 #define REQ_H
+
 #include <limits.h>
-#include <stddef.h> 
-#include <sys/types.h> 
+#include <netinet/in.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <sys/types.h>
+
 #include "fd_entry.h"
 #include "if.h"
-#include "queue.h"
-#include "thread.h"
 #include "list.h"
 #include "netfast.h"
+#include "queue.h"
+#include "thread.h"
 
 #define REQ_PENDING INT_MIN
 
@@ -34,21 +36,22 @@ typedef enum req_status {
 
 struct req {
     mpscq_node node;
-    worker* worker;
-    fd_entry* entry;
+    /* Target worker; NULL while executing synchronously on its owner. */
+    worker *worker;
+    fd_entry *entry;
 
     req_type type;
     int ret;
     req_status status;
     pending_node pn;          /* for socket->pending attachment */
 
-    Socket* wait_sock;
+    Socket *wait_sock;
     task *timeout_task;
 
     struct {
         list_node submit_node;
         mpscq_node completion_node;
-        async_cq* cq;
+        async_cq *cq;
     }async;
 
     struct {
@@ -79,10 +82,10 @@ static inline req_status notify_event_to_status(enum notify_event e)
     return s ? s : REQ_STATUS_ALL;
 }
 
-void req_notify(req* r, int ret);
-req* req_create(void);
-void req_init(req* r);
-int  req_push_wait(worker* w, req* r);
+void req_notify(req *r, int ret);
+req *req_create(void);
+void req_init(req *r);
+int  req_push_wait(worker *w, req *r);
 
 /* Fill a stack-allocated req with type and argv fields in one line:
  *   req_fill(&r, REQ_ACCEPT, accept, .addr = a, .addrlen = al);
@@ -92,26 +95,26 @@ int  req_push_wait(worker* w, req* r);
     do {                                                          \
         (r)->type = (type_);                                      \
         (r)->argv.member_ = (typeof((r)->argv.member_)){ __VA_ARGS__ }; \
-    } while(0)
+    } while (0)
 
 int net_socket(int family, int type, int protocol);
-int net_bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
-int net_connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
+int net_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int net_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int net_listen(int fd, int backlog);
 int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
-int net_write(int fd, const void* buf, uint32_t len);
-int net_read(int fd, void* buf, uint32_t len);
-int net_sendto(int fd, const void* buf, uint32_t len, int flags,
-                   const struct sockaddr* dest_addr, socklen_t addrlen);
-int net_recvfrom(int fd, void* buf, uint32_t len, int flags,
-                     struct sockaddr* src_addr, socklen_t* addrlen);
+int net_write(int fd, const void *buf, uint32_t len);
+int net_read(int fd, void *buf, uint32_t len);
+int net_sendto(int fd, const void *buf, uint32_t len, int flags,
+                   const struct sockaddr *dest_addr, socklen_t addrlen);
+int net_recvfrom(int fd, void *buf, uint32_t len, int flags,
+                     struct sockaddr *src_addr, socklen_t *addrlen);
 int net_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int net_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int net_setsockopt(int fd, int level, int optname,
-                   const void* optval, socklen_t optlen);
+                   const void *optval, socklen_t optlen);
 int net_getsockopt(int fd, int level, int optname,
-                   void* optval, socklen_t* optlen);
+                   void *optval, socklen_t *optlen);
 int net_fcntl(int fd, int cmd, ...);
 int net_close(int fd);
 int net_shutdown(int fd, int how);
-#endif
+#endif /* REQ_H */

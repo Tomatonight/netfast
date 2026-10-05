@@ -1,13 +1,14 @@
 #ifndef ROUTE_ARP_NDP_H
 #define ROUTE_ARP_NDP_H
 
-#include <stdint.h>
 #include <arpa/inet.h>
 #include <linux/rtnetlink.h>
-#include "trie.h"
-#include "list.h"
+#include <stdint.h>
+
 #include "base.h"
 #include "if.h"
+#include "list.h"
+#include "trie.h"
 
 #define IF_NAME_MAX 16
 #define MAC_STR_MAX 18
@@ -40,7 +41,7 @@ typedef struct route_info {
     uint32_t mtu;
     uint8_t  prefsrc[16];   /* RTA_PREFSRC (v4 前4字节, v6 全16字节) */
     /* cache */
-    if_info* if_info;
+    if_info *if_info;
     ref_info ref;
     list_node list;
 } route_info;
@@ -65,30 +66,30 @@ typedef ndp_key  arp_key;
 
 /* ── 通用搜索 / 增删接口 ─────────────────────────────────── */
 
-route_info* search_route_table(const route_key* key);
+route_info *search_route_table(const route_key *key);
 uint64_t    route_table_generation(sa_family_t family);
-ndp_info*   search_ndp_table(const ndp_key* key);
-int         resolve_neighbor_entry(const ndp_key* key, ndp_info** result);
-bool        search_best_saddr_by_daddr(const route_key* key, route_key* answer);
+ndp_info *search_ndp_table(const ndp_key *key);
+int         resolve_neighbor_entry(const ndp_key *key, ndp_info ** result);
+bool        search_best_saddr_by_daddr(const route_key *key, route_key *answer);
 
-int route_add_entry(const route_info* info);
-int route_delete_entry(const route_info* info);
+int route_add_entry(const route_info *info);
+int route_delete_entry(const route_info *info);
 
-int ndp_add_entry(const ndp_info* info);
-int ndp_delete_entry(const ndp_info* info);
+int ndp_add_entry(const ndp_info *info);
+int ndp_delete_entry(const ndp_info *info);
 
 /* v4 向后兼容（内部转发到通用接口） */
-static inline route_info* search_ipv4_route_table(const route_key* key)
+static inline route_info *search_ipv4_route_table(const route_key *key)
     { return search_route_table(key); }
-static inline ndp_info* search_arp_table(const ndp_key* key)
+static inline ndp_info *search_arp_table(const ndp_key *key)
     { return search_ndp_table(key); }
-static inline int route4_add_route(const route_info* info)
+static inline int route4_add_route(const route_info *info)
     { return route_add_entry(info); }
-static inline int route4_delete_route(const route_info* info)
+static inline int route4_delete_route(const route_info *info)
     { return route_delete_entry(info); }
-static inline int arp4_add_entry(const ndp_info* info)
+static inline int arp4_add_entry(const ndp_info *info)
     { return ndp_add_entry(info); }
-static inline int arp4_delete_entry(const ndp_info* info)
+static inline int arp4_delete_entry(const ndp_info *info)
     { return ndp_delete_entry(info); }
 
 /* ── 生命周期 / 事件解析 ─────────────────────────────────── */
@@ -100,25 +101,25 @@ int  parse_route_event(struct nlmsghdr *nlh);
 int  parse_neighbor_event(struct nlmsghdr *nlh);
 
 struct skbuff;
-int set_skb_route(struct skbuff* skb, sa_family_t family, const uint8_t* dip);
+int set_skb_route(struct skbuff *skb, sa_family_t family, const uint8_t *dip);
 
 /* ── 内联辅助函数 ─────────────────────────────────────────── */
 
-static inline void get_route_gw(const route_info* info, uint8_t* dst)
+static inline void get_route_gw(const route_info *info, uint8_t *dst)
 {
     memcpy(dst, info->gw_ip, (info->ip_family == AF_INET6) ? 16 : 4);
 }
 
-static inline bool route_is_local_host(const route_info* info)
+static inline bool route_is_local_host(const route_info *info)
     { return info->type == RTN_LOCAL; }
 
-static inline bool route_is_multicast(const route_info* info)
+static inline bool route_is_multicast(const route_info *info)
     { return info->type == RTN_MULTICAST; }
 
-static inline bool route_is_broadcast(const route_info* info)
+static inline bool route_is_broadcast(const route_info *info)
     { return info->type == RTN_BROADCAST; }
 
-static inline bool route_include_nexthop(const route_info* info, const uint8_t* nexthop)
+static inline bool route_include_nexthop(const route_info *info, const uint8_t *nexthop)
 {
     if (info->dst_mask == 0)
         return true;
@@ -152,11 +153,11 @@ static inline bool route_include_nexthop(const route_info* info, const uint8_t* 
 /* Validate both the referenced interface and the caller's cached route
  * generation.  A route object may remain in the FIB across unrelated route
  * updates, so the generation belongs to the cache owner (socket/skb). */
-bool route_info_is_valid(const route_info* info, uint64_t cached_generation);
-bool route_cache_key_matches(const route_info* route, uint64_t generation,
-                             sa_family_t family, const uint8_t* cached_dest,
+bool route_info_is_valid(const route_info *info, uint64_t cached_generation);
+bool route_cache_key_matches(const route_info *route, uint64_t generation,
+                             sa_family_t family, const uint8_t *cached_dest,
                              uint32_t cached_scope_id,
-                             const uint8_t* dest, uint32_t scope_id);
-uint32_t get_route_mtu(const route_info* info);
+                             const uint8_t *dest, uint32_t scope_id);
+uint32_t get_route_mtu(const route_info *info);
 
 #endif /* ROUTE_ARP_NDP_H */

@@ -1,8 +1,8 @@
 #ifndef INIT_H
 #define INIT_H
 
-#include <stdbool.h>
 #include <net/if.h>
+#include <stdbool.h>
 
 #include "base.h"
 
@@ -46,4 +46,4 @@ bool config_interface_is_filtered(const char *ifname);
 extern g_config g_cfg;
 int config_load(void);
 
-#endif
+#endif /* INIT_H */

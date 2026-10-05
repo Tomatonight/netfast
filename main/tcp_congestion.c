@@ -1,10 +1,11 @@
+#include "tcp_congestion.h"
+
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "tcp_congestion.h"
 #include "tcp.h"
 
 #define TCP_INITIAL_CWND         5u
@@ -24,7 +25,7 @@ typedef struct tcp_cubic {
 } tcp_cubic;
 /* t and reach_wmax_ms (K) are milliseconds relative to start_epoch_ms.
  * Keep fractional packets until converting the target to bytes. */
-static inline double tcp_cubic_wt(const tcp_cubic* cubic, uint64_t t)
+static inline double tcp_cubic_wt(const tcp_cubic *cubic, uint64_t t)
 {
     double offset_ms = t >= cubic->reach_wmax_ms
         ? (double)(t - cubic->reach_wmax_ms)
@@ -35,8 +36,8 @@ static inline double tcp_cubic_wt(const tcp_cubic* cubic, uint64_t t)
 }
 
 /* Return the next-RTT target in bytes, bounded by [cwnd, 1.5 * cwnd]. */
-static inline uint64_t tcp_cubic_cwnd(const tcp_pcb* pcb,
-                                     const tcp_cubic* cubic, uint64_t t)
+static inline uint64_t tcp_cubic_cwnd(const tcp_pcb *pcb,
+                                     const tcp_cubic *cubic, uint64_t t)
 {
     uint32_t rtt_ms = pcb->metrics ? pcb->metrics->rtt : 0;
     uint64_t next_rtt = t > UINT64_MAX - rtt_ms ? UINT64_MAX : t + rtt_ms;
@@ -51,7 +52,7 @@ static inline uint64_t tcp_cubic_cwnd(const tcp_pcb* pcb,
         return upper;
     return (uint64_t)wt_rtt;
 }
-void tcp_ca_set_state(tcp_pcb* pcb, enum tcp_ca_status new_state)
+void tcp_ca_set_state(tcp_pcb *pcb, enum tcp_ca_status new_state)
 {
     if (pcb->ca.status == new_state)
         return;
@@ -62,22 +63,22 @@ void tcp_ca_set_state(tcp_pcb* pcb, enum tcp_ca_status new_state)
     pcb->ca.status = new_state;
 }
 
-static int tcp_cubic_init(tcp_pcb* pcb)
+static int tcp_cubic_init(tcp_pcb *pcb)
 {
     pcb->ca.private = calloc(1, sizeof(tcp_cubic));
     return pcb->ca.private ? 0 : -ENOMEM;
 }
 
-static void tcp_cubic_release(tcp_pcb* pcb)
+static void tcp_cubic_release(tcp_pcb *pcb)
 {
     free(pcb->ca.private);
     pcb->ca.private = NULL;
 }
 
-static void tcp_cubic_set_state(tcp_pcb* pcb,
+static void tcp_cubic_set_state(tcp_pcb *pcb,
                                 enum tcp_ca_status new_state)
 {
-    tcp_cubic* cubic = (tcp_cubic*)pcb->ca.private;
+    tcp_cubic *cubic = (tcp_cubic*)pcb->ca.private;
 
     switch (new_state) {
     case TCP_CA_STATUS_RECOVERY:
@@ -108,9 +109,9 @@ static void tcp_cubic_set_state(tcp_pcb* pcb,
     cubic->cwnd_fraction = 0;
 }
 
-static void tcp_cubic_ack_bytes(tcp_pcb* pcb, uint32_t acked_bytes)
+static void tcp_cubic_ack_bytes(tcp_pcb *pcb, uint32_t acked_bytes)
 {
-    tcp_cubic* cubic = (tcp_cubic*)pcb->ca.private;
+    tcp_cubic *cubic = (tcp_cubic*)pcb->ca.private;
 
     bool rto_recovery = pcb->ca.status == TCP_CA_STATUS_LOST;
     if (pcb->ca.status == TCP_CA_STATUS_RECOVERY) {
@@ -252,7 +253,7 @@ start_cwnd == 0 表示尚未开始本轮 epoch。记录开始时间和窗口，�
             min(increase, UINT64_MAX - pcb->snd_cwnd));
 }
 
-static void tcp_cubic_rto_timeout(tcp_pcb* pcb)
+static void tcp_cubic_rto_timeout(tcp_pcb *pcb)
 {
     uint64_t flight_size = tcp_flight_size(pcb);
     uint64_t ssthresh = (flight_size / 10) * 7 +
@@ -264,7 +265,7 @@ static void tcp_cubic_rto_timeout(tcp_pcb* pcb)
     tcp_update_sndcwnd(pcb, pcb->snd_mss);
 }
 
-static void tcp_cubic_event(tcp_pcb* pcb, enum tcp_ca_event event)
+static void tcp_cubic_event(tcp_pcb *pcb, enum tcp_ca_event event)
 {
     switch (event) {
     case TCP_CA_EVENT_LOSS: {
@@ -327,7 +328,7 @@ static const tcp_ca_ops tcp_cubic_ops = {
     .event = tcp_cubic_event,
 };
 
-static void tcp_ca_reset_common(tcp_pcb* pcb)
+static void tcp_ca_reset_common(tcp_pcb *pcb)
 {
     uint64_t initial = (uint64_t)TCP_INITIAL_CWND * pcb->snd_mss;
     pcb->snd_cwnd = initial;
@@ -338,7 +339,7 @@ static void tcp_ca_reset_common(tcp_pcb* pcb)
 
 
 
-static int tcp_ca_install(tcp_pcb* pcb, const tcp_ca_ops* ops)
+static int tcp_ca_install(tcp_pcb *pcb, const tcp_ca_ops *ops)
 {
     tcp_ca_ops selected = *ops;
     tcp_ca_release(pcb);
@@ -355,43 +356,43 @@ static int tcp_ca_install(tcp_pcb* pcb, const tcp_ca_ops* ops)
     return 0;
 }
 
-int tcp_ca_init(tcp_pcb* pcb)
+int tcp_ca_init(tcp_pcb *pcb)
 {
     return tcp_ca_install(pcb, &tcp_cubic_ops);
 }
 
-int tcp_ca_inherit(tcp_pcb* child, const tcp_pcb* parent)
+int tcp_ca_inherit(tcp_pcb *child, const tcp_pcb *parent)
 {
     return tcp_ca_install(child, &parent->ca.ops);
 }
 
-void tcp_ca_release(tcp_pcb* pcb)
+void tcp_ca_release(tcp_pcb *pcb)
 {
     if (pcb->ca.ops.tcp_ca_init && pcb->ca.ops.release)
         pcb->ca.ops.release(pcb);
     memset(&pcb->ca, 0, sizeof(pcb->ca));
 }
 
-void tcp_ca_ack_bytes(tcp_pcb* pcb, uint32_t acked_bytes)
+void tcp_ca_ack_bytes(tcp_pcb *pcb, uint32_t acked_bytes)
 {
     if (pcb->ca.ops.ack_bytes)
         pcb->ca.ops.ack_bytes(pcb, acked_bytes);
 }
 
-void tcp_ca_mss_changed(tcp_pcb* pcb)
+void tcp_ca_mss_changed(tcp_pcb *pcb)
 {
-    if(pcb->snd_cwnd < (uint64_t)TCP_INITIAL_CWND * pcb->snd_mss)
+    if (pcb->snd_cwnd < (uint64_t)TCP_INITIAL_CWND * pcb->snd_mss)
         tcp_update_sndcwnd(pcb,
                            (uint64_t)TCP_INITIAL_CWND * pcb->snd_mss);
 }
 
-void tcp_ca_rto_timeout(tcp_pcb* pcb)
+void tcp_ca_rto_timeout(tcp_pcb *pcb)
 {
     if (pcb->ca.ops.rto_timeout)
         pcb->ca.ops.rto_timeout(pcb);
 }
 
-void tcp_ca_event(tcp_pcb* pcb, enum tcp_ca_event event)
+void tcp_ca_event(tcp_pcb *pcb, enum tcp_ca_event event)
 {
     if (pcb->ca.ops.event)
         pcb->ca.ops.event(pcb, event);

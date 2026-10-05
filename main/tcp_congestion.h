@@ -19,33 +19,33 @@ enum tcp_ca_event {
 };
 
 typedef struct tcp_ca_ops {
-    int (*tcp_ca_init)(struct tcp_pcb* pcb);
-    void (*release)(struct tcp_pcb* pcb);
-    void (*set_state)(struct tcp_pcb* pcb,
+    int (*tcp_ca_init)(struct tcp_pcb *pcb);
+    void (*release)(struct tcp_pcb *pcb);
+    void (*set_state)(struct tcp_pcb *pcb,
                       enum tcp_ca_status new_state);
-    void (*ack_bytes)(struct tcp_pcb* pcb, uint32_t acked_bytes);
-    void (*rto_timeout)(struct tcp_pcb* pcb);
-    void (*event)(struct tcp_pcb* pcb, enum tcp_ca_event event);
+    void (*ack_bytes)(struct tcp_pcb *pcb, uint32_t acked_bytes);
+    void (*rto_timeout)(struct tcp_pcb *pcb);
+    void (*event)(struct tcp_pcb *pcb, enum tcp_ca_event event);
 } tcp_ca_ops;
 
 typedef struct tcp_ca {
     tcp_ca_ops ops;
-    void* private;
+    void *private;
     uint32_t recovery_seq;
     enum tcp_ca_status status;
 } tcp_ca;
 
 
-int tcp_ca_init(struct tcp_pcb* pcb);
-int tcp_ca_inherit(struct tcp_pcb* child, const struct tcp_pcb* parent);
-void tcp_ca_release(struct tcp_pcb* pcb);
+int tcp_ca_init(struct tcp_pcb *pcb);
+int tcp_ca_inherit(struct tcp_pcb *child, const struct tcp_pcb *parent);
+void tcp_ca_release(struct tcp_pcb *pcb);
 /* Enter RECOVERY before reducing cwnd so the callback can record Wmax. */
-void tcp_ca_set_state(struct tcp_pcb* pcb, enum tcp_ca_status new_state);
+void tcp_ca_set_state(struct tcp_pcb *pcb, enum tcp_ca_status new_state);
 
 /* Events reported by the TCP core. */
-void tcp_ca_ack_bytes(struct tcp_pcb* pcb, uint32_t acked_bytes);
-void tcp_ca_mss_changed(struct tcp_pcb* pcb);
-void tcp_ca_rto_timeout(struct tcp_pcb* pcb);
-void tcp_ca_event(struct tcp_pcb* pcb, enum tcp_ca_event event);
+void tcp_ca_ack_bytes(struct tcp_pcb *pcb, uint32_t acked_bytes);
+void tcp_ca_mss_changed(struct tcp_pcb *pcb);
+void tcp_ca_rto_timeout(struct tcp_pcb *pcb);
+void tcp_ca_event(struct tcp_pcb *pcb, enum tcp_ca_event event);
 
-#endif
+#endif /* TCP_CONGESTION_H */

@@ -12,8 +12,8 @@ typedef struct log_rate_limit {
 #define LOG_RATE_LIMIT_INIT { 0, 0 }
 
 int log_init(void);
-void log_out(const char* format, ...) __attribute__((format(printf, 1, 2)));
-void log_out_limited(log_rate_limit* limit, const char* format, ...)
+void log_out(const char *format, ...) __attribute__((format(printf, 1, 2)));
+void log_out_limited(log_rate_limit *limit, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 
 #define LOG_LIMITED(prefix, format, ...) do { \
@@ -35,4 +35,4 @@ void log_out_limited(log_rate_limit* limit, const char* format, ...)
 #define DEBUG_LOG(...) do { } while (0)
 #endif
 
-#endif
+#endif /* LOG_H */

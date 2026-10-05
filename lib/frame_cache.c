@@ -3,11 +3,12 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include "worker.h"
+
 #include "thread.h"
+#include "worker.h"
 #include "xdp.h"
 
-static void frame_page_destroy(void* ptr)
+static void frame_page_destroy(void *ptr)
 {
     xdp_frame_free(ptr);
 }
@@ -21,16 +22,16 @@ _Static_assert(XDP_UMEM_FRAME_SIZE >=
                                FRAME_SLOT_MAX_SIZE),
                "a frame must hold page_info and at least one maximum slot");
 
-static inline frame_cache* frame_cache_local(void)
+static inline frame_cache *frame_cache_local(void)
 {
-    worker* current = get_current_worker();
+    worker *current = get_current_worker();
     return &current->master->frame_cache;
 }
 
 
 typedef struct global_frame_cache_slot {
     _Atomic uint64_t sequence;
-    frame_slot* entry;
+    frame_slot *entry;
 } global_frame_cache_slot;
 
 typedef struct global_frame_cache_class {
@@ -57,7 +58,7 @@ static const uint16_t g_frame_slot_sizes[FRAME_SLOT_CLASS_COUNT] = {
 void frame_global_cache_init(void)
 {
     for (uint32_t cls = 0; cls < FRAME_SLOT_CLASS_COUNT; ++cls) {
-        global_frame_cache_class* cache =
+        global_frame_cache_class *cache =
             &g_frame_cache.classes[cls];
         atomic_init(&cache->enqueue_pos, 0);
         atomic_init(&cache->dequeue_pos, 0);
@@ -67,7 +68,7 @@ void frame_global_cache_init(void)
 }
 
 static uint32_t frame_global_class_enqueue_batch(
-    global_frame_cache_class* cache, frame_slot* const* entries,
+    global_frame_cache_class *cache, frame_slot * const * entries,
     uint32_t max_entries)
 {
     if (!max_entries)
@@ -83,7 +84,7 @@ static uint32_t frame_global_class_enqueue_batch(
         bool stale = false;
         while (ready < max_entries) {
             uint64_t entry_pos = pos + ready;
-            global_frame_cache_slot* slot =
+            global_frame_cache_slot *slot =
                 &cache->slots[entry_pos &
                               (GLOBAL_FRAME_CACHE_LIMIT - 1U)];
             uint64_t sequence = atomic_load_explicit(&slot->sequence,
@@ -114,7 +115,7 @@ static uint32_t frame_global_class_enqueue_batch(
 
         for (uint32_t i = 0; i < ready; ++i) {
             uint64_t entry_pos = pos + i;
-            global_frame_cache_slot* slot =
+            global_frame_cache_slot *slot =
                 &cache->slots[entry_pos &
                               (GLOBAL_FRAME_CACHE_LIMIT - 1U)];
             slot->entry = entries[i];
@@ -126,7 +127,7 @@ static uint32_t frame_global_class_enqueue_batch(
 }
 
 static uint32_t frame_global_class_dequeue_batch(
-    global_frame_cache_class* cache, frame_slot** entries,
+    global_frame_cache_class *cache, frame_slot ** entries,
     uint32_t max_entries)
 {
     if (!max_entries)
@@ -142,7 +143,7 @@ static uint32_t frame_global_class_dequeue_batch(
         bool stale = false;
         while (ready < max_entries) {
             uint64_t entry_pos = pos + ready;
-            global_frame_cache_slot* slot =
+            global_frame_cache_slot *slot =
                 &cache->slots[entry_pos &
                               (GLOBAL_FRAME_CACHE_LIMIT - 1U)];
             uint64_t sequence = atomic_load_explicit(&slot->sequence,
@@ -174,7 +175,7 @@ static uint32_t frame_global_class_dequeue_batch(
 
         for (uint32_t i = 0; i < ready; ++i) {
             uint64_t entry_pos = pos + i;
-            global_frame_cache_slot* slot =
+            global_frame_cache_slot *slot =
                 &cache->slots[entry_pos &
                               (GLOBAL_FRAME_CACHE_LIMIT - 1U)];
             entries[i] = slot->entry;
@@ -188,7 +189,7 @@ static uint32_t frame_global_class_dequeue_batch(
 }
 
 static uint32_t frame_global_enqueue_batch(
-    uint8_t size_class, frame_slot* const* entries,
+    uint8_t size_class, frame_slot * const * entries,
     uint32_t max_entries)
 {
     assert(size_class < FRAME_SLOT_CLASS_COUNT);
@@ -197,7 +198,7 @@ static uint32_t frame_global_enqueue_batch(
 }
 
 static uint32_t frame_global_dequeue_batch(
-    uint8_t size_class, frame_slot** entries,
+    uint8_t size_class, frame_slot ** entries,
     uint32_t max_entries)
 {
     assert(size_class < FRAME_SLOT_CLASS_COUNT);
@@ -235,12 +236,12 @@ uint32_t frame_rx_headroom(void)
     return XDP_RX_FRAME_HEADROOM;
 }
 
-void frame_cache_init(frame_cache* cache)
+void frame_cache_init(frame_cache *cache)
 {
     memset(cache, 0, sizeof(*cache));
 }
 
-void frame_cache_reset(frame_cache* cache)
+void frame_cache_reset(frame_cache *cache)
 {
     for (uint32_t cls = 0; cls < FRAME_SLOT_CLASS_COUNT; ++cls) {
         for (uint16_t i = 0; i < cache->count[cls]; ++i)
@@ -252,7 +253,7 @@ void frame_cache_reset(frame_cache* cache)
 void frame_global_cache_reset(void)
 {
     for (uint32_t cls = 0; cls < FRAME_SLOT_CLASS_COUNT; ++cls) {
-        frame_slot* entries[THREAD_FRAME_CACHE_LOW];
+        frame_slot *entries[THREAD_FRAME_CACHE_LOW];
         uint32_t count;
         do {
             count = frame_global_class_dequeue_batch(
@@ -264,8 +265,8 @@ void frame_global_cache_reset(void)
     }
 }
 
-static bool frame_local_push(frame_cache* cache, uint8_t size_class,
-                             frame_slot* slot)
+static bool frame_local_push(frame_cache *cache, uint8_t size_class,
+                             frame_slot *slot)
 {
     uint16_t n = cache->count[size_class];
     if (n >= THREAD_FRAME_CACHE_LIMIT)
@@ -275,7 +276,7 @@ static bool frame_local_push(frame_cache* cache, uint8_t size_class,
     return true;
 }
 
-static void frame_local_spill(frame_cache* cache, uint8_t size_class)
+static void frame_local_spill(frame_cache *cache, uint8_t size_class)
 {
 
     uint16_t count = cache->count[size_class];
@@ -283,7 +284,7 @@ static void frame_local_spill(frame_cache* cache, uint8_t size_class)
         return;
 
     uint32_t spill_count = count - THREAD_FRAME_CACHE_LOW;
-    frame_slot** entries =
+    frame_slot ** entries =
         &cache->entries[size_class][THREAD_FRAME_CACHE_LOW];
     cache->count[size_class] = THREAD_FRAME_CACHE_LOW;
 
@@ -294,14 +295,14 @@ static void frame_local_spill(frame_cache* cache, uint8_t size_class)
 }
 
 
-static void frame_cache_free_slot(frame_slot* slot)
+static void frame_cache_free_slot(frame_slot *slot)
 {
     int size_class = frame_slot_size_class(slot->slot_size);
     if (size_class < 0) {
         PUT_REF(slot->page);
         return;
     }
-    frame_cache* cache = frame_cache_local();
+    frame_cache *cache = frame_cache_local();
     if (!frame_local_push(cache, (uint8_t)size_class, slot)) {
         frame_local_spill(cache, (uint8_t)size_class);
         bool cached = frame_local_push(cache, (uint8_t)size_class, slot);
@@ -310,15 +311,15 @@ static void frame_cache_free_slot(frame_slot* slot)
     }
 }
 
-static void frame_slot_destroy(void* ptr)
+static void frame_slot_destroy(void *ptr)
 {
-    frame_slot* slot = ptr;
+    frame_slot *slot = ptr;
     atomic_store_explicit(&slot->ref.useful, false, memory_order_release);
     /* 活动 slot 持有的 page 引用在此转交给缓存条目。 */
     frame_cache_free_slot(slot);
 }
 
-static frame_slot* frame_cache_acquire_slot(frame_slot* slot)
+static frame_slot *frame_cache_acquire_slot(frame_slot *slot)
 {
     /* The local cache owns this slot exclusively.  Entries dequeued from the
      * shared cache also have a single consumer, so no compare/exchange is
@@ -330,7 +331,7 @@ static frame_slot* frame_cache_acquire_slot(frame_slot* slot)
     return slot;
 }
 
-static frame_slot* frame_local_pop(frame_cache* cache, uint8_t size_class)
+static frame_slot *frame_local_pop(frame_cache *cache, uint8_t size_class)
 {
     assert(cache);
     assert(size_class < FRAME_SLOT_CLASS_COUNT);
@@ -340,7 +341,7 @@ static frame_slot* frame_local_pop(frame_cache* cache, uint8_t size_class)
     return frame_cache_acquire_slot(cache->entries[size_class][n]);
 }
 
-static uint32_t frame_local_refill(frame_cache* cache, uint8_t size_class)
+static uint32_t frame_local_refill(frame_cache *cache, uint8_t size_class)
 {
     assert(cache);
     assert(size_class < FRAME_SLOT_CLASS_COUNT);
@@ -353,7 +354,7 @@ static uint32_t frame_local_refill(frame_cache* cache, uint8_t size_class)
     return added;
 }
 
-static void frame_slot_init(frame_slot* slot, page_info* page, uint8_t* data,
+static void frame_slot_init(frame_slot *slot, page_info *page, uint8_t *data,
                       uint16_t slot_size, bool allocated)
 {
     atomic_init(&slot->ref.ref_cnt, allocated ? 1 : 0);
@@ -364,9 +365,9 @@ static void frame_slot_init(frame_slot* slot, page_info* page, uint8_t* data,
     slot->slot_size = slot_size;
 }
 
-static frame_slot* frame_slot_page_alloc(uint8_t size_class, frame_cache* cache)
+static frame_slot *frame_slot_page_alloc(uint8_t size_class, frame_cache *cache)
 {
-    page_info* page = NULL;
+    page_info *page = NULL;
     if (xdp_frame_alloc((void**)&page) != 0)
         return NULL;
 
@@ -380,11 +381,11 @@ static frame_slot* frame_slot_page_alloc(uint8_t size_class, frame_cache* cache)
     atomic_store_explicit(&page->ref.ref_cnt, (int)count,
                           memory_order_release);
 
-    frame_slot* first = NULL;
+    frame_slot *first = NULL;
     for (uint32_t i = 0; i < count; ++i) {
-        frame_slot* slot = (frame_slot*)((uint8_t*)page + slot_offset +
+        frame_slot *slot = (frame_slot*)((uint8_t*)page + slot_offset +
                                         (size_t)i * stride);
-        uint8_t* data = (uint8_t*)slot + sizeof(*slot) +
+        uint8_t *data = (uint8_t*)slot + sizeof(*slot) +
                         XDP_TX_METADATA_LEN;
         frame_slot_init(slot, page, data, g_frame_slot_sizes[size_class], i == 0);
         if (i == 0) {
@@ -401,10 +402,10 @@ static frame_slot* frame_slot_page_alloc(uint8_t size_class, frame_cache* cache)
     return first;
 }
 
-static frame_slot* frame_slot_alloc_class(uint8_t size_class,
-                                          frame_cache* cache)
+static frame_slot *frame_slot_alloc_class(uint8_t size_class,
+                                          frame_cache *cache)
 {
-    frame_slot* slot = frame_local_pop(cache, size_class);
+    frame_slot *slot = frame_local_pop(cache, size_class);
     if (!slot && frame_local_refill(cache, size_class))
         slot = frame_local_pop(cache, size_class);
     if (!slot)
@@ -412,7 +413,7 @@ static frame_slot* frame_slot_alloc_class(uint8_t size_class,
     return slot;
 }
 
-frame_slot* frame_slot_alloc(uint32_t min_data_len)
+frame_slot *frame_slot_alloc(uint32_t min_data_len)
 {
     int size_class = frame_size_class(min_data_len);
     if (size_class < 0)
@@ -421,19 +422,19 @@ frame_slot* frame_slot_alloc(uint32_t min_data_len)
                                    frame_cache_local());
 }
 
-void free_data_info(data_info* info)
+void free_data_info(data_info *info)
 {
     if (!info)
         return;
     PUT_REF(info->slot);
     free(info);
 }
-data_info* alloc_data_info(uint32_t size)
+data_info *alloc_data_info(uint32_t size)
 {
-    frame_slot* slot = frame_slot_alloc(size);
+    frame_slot *slot = frame_slot_alloc(size);
     if (!slot)
         return NULL;
-    data_info* info = malloc(sizeof(*info));
+    data_info *info = malloc(sizeof(*info));
     if (!info) {
         PUT_REF(slot);
         return NULL;
@@ -446,7 +447,7 @@ data_info* alloc_data_info(uint32_t size)
     info->next = NULL;
     return info;
 }
-data_info* create_data_info(frame_slot* slot, uint32_t buf_start,
+data_info *create_data_info(frame_slot *slot, uint32_t buf_start,
                             uint32_t buf_end, uint32_t start, uint32_t end)
 {
     if (buf_start > buf_end || start > end || buf_start > start || end > buf_end)
@@ -458,7 +459,7 @@ data_info* create_data_info(frame_slot* slot, uint32_t buf_start,
     if (!slot || buf_end > slot->slot_size)
         goto fail;
 
-    data_info* info = malloc(sizeof(*info));
+    data_info *info = malloc(sizeof(*info));
     if (!info)
         goto fail;
     info->slot = slot;
@@ -475,7 +476,7 @@ fail:
     return NULL;
 }
 
-void copy_data_info(data_info* dst, const data_info* src)
+void copy_data_info(data_info *dst, const data_info *src)
 {
     *dst = *src;
     dst->next = NULL;

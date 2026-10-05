@@ -1,17 +1,18 @@
+#include "fd_entry.h"
+
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
-#include "fd_entry.h"
 #include "req.h"
 
 #define FD_START 0x08888888
 #define FD_TABLE_CAP (1024 * 128)
 #define FD_LOCK_COUNT 256
 
-static fd_entry** g_fd_table;
-static uint32_t* g_free_slots;
+static fd_entry ** g_fd_table;
+static uint32_t *g_free_slots;
 static uint32_t g_free_n;
 static spin_rwlock_t g_fd_locks[FD_LOCK_COUNT];
 static spin_rwlock_t g_free_lock;
@@ -30,8 +31,8 @@ static inline uint32_t fd_entry_lock_index(uint32_t slot)
 
 int fd_table_init(void)
 {
-    fd_entry** table = calloc(FD_TABLE_CAP, sizeof(*table));
-    uint32_t* free_slots = malloc(sizeof(*free_slots) * FD_TABLE_CAP);
+    fd_entry ** table = calloc(FD_TABLE_CAP, sizeof(*table));
+    uint32_t *free_slots = malloc(sizeof(*free_slots) * FD_TABLE_CAP);
     if (!table || !free_slots) {
         free(table);
         free(free_slots);
@@ -50,7 +51,7 @@ int fd_table_init(void)
     return 0;
 }
 
-static void fd_entry_destroy(fd_entry* entry)
+static void fd_entry_destroy(fd_entry *entry)
 {
     int slot = fd_entry_slot(entry->fd);
     if (slot >= 0) {
@@ -68,8 +69,8 @@ static void fd_entry_destroy(fd_entry* entry)
     free(entry);
 }
 
-fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
-                                     worker* w)
+fd_entry *alloc_fd_entry_with_worker(void *value, const fd_entry_ops *ops,
+                                     worker *w)
 {
     CREATE_REF(fd_entry, entry, fd_entry_destroy);
     if (!entry)
@@ -100,7 +101,7 @@ fd_entry* alloc_fd_entry_with_worker(void* value, const fd_entry_ops* ops,
     return entry;
 }
 
-fd_entry* hold_fd_entry(int fd)
+fd_entry *hold_fd_entry(int fd)
 {
     int slot = fd_entry_slot(fd);
     if (slot < 0 || (uint32_t)slot >= FD_TABLE_CAP)
@@ -108,14 +109,14 @@ fd_entry* hold_fd_entry(int fd)
 
     uint32_t idx = fd_entry_lock_index((uint32_t)slot);
     spin_rwlock_rdlock(&g_fd_locks[idx]);
-    fd_entry* entry = g_fd_table[slot];
+    fd_entry *entry = g_fd_table[slot];
     if (entry && !INC_REF_NOT_ZERO(entry))
         entry = NULL;
     spin_rwlock_unlock(&g_fd_locks[idx]);
     return entry;
 }
 
-fd_entry* fd_entry_from_request(const req* r)
+fd_entry *fd_entry_from_request(const req *r)
 {
     return r->entry;
 }

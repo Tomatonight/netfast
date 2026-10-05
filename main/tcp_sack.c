@@ -1,22 +1,23 @@
+#include "tcp_sack.h"
+
 #include <arpa/inet.h>
 #include <stddef.h>
 #include <string.h>
 
-#include <base.h>
-#include <skbuff.h>
-#include <tcp_sack.h>
-#include <tcp.h>
+#include "base.h"
+#include "skbuff.h"
+#include "tcp.h"
 
 /* 判断两个半开 SACK 区间是否重叠或首尾相邻，可用于合并连续范围。 */
-static inline bool tcp_sack_blocks_touch(const tcp_sack_block* a,
-                                         const tcp_sack_block* b)
+static inline bool tcp_sack_blocks_touch(const tcp_sack_block *a,
+                                         const tcp_sack_block *b)
 {
     return SEQ_LEQ(a->left, b->right) && SEQ_GEQ(a->right, b->left);
 }
 
 /* 将 src 覆盖的序号范围并入 dst，结果取两者的最左和最右边界。 */
-static inline void tcp_sack_block_merge(tcp_sack_block* dst,
-                                        const tcp_sack_block* src)
+static inline void tcp_sack_block_merge(tcp_sack_block *dst,
+                                        const tcp_sack_block *src)
 {
     if (SEQ_LT(src->left, dst->left))
         dst->left = src->left;
@@ -24,28 +25,28 @@ static inline void tcp_sack_block_merge(tcp_sack_block* dst,
         dst->right = src->right;
 }
 
-void tcp_sack_set_state(tcp_pcb* pcb, skbuff* skb, uint8_t state)
+void tcp_sack_set_state(tcp_pcb *pcb, skbuff *skb, uint8_t state)
 {
     if (skb->l4_private.tcp.sack_state == state ||
         !pcb->tcp_flag.peer_sack_ok)
         return;
     uint32_t bytes = skb->l4_private.tcp.seq_end - skb->l4_private.tcp.seq;
-    if(skb->l4_private.tcp.sack_state & TCP_SACKED_ACKED){
-        if(!(state & TCP_SACKED_ACKED)){
+    if (skb->l4_private.tcp.sack_state & TCP_SACKED_ACKED) {
+        if (!(state & TCP_SACKED_ACKED)) {
             pcb->sack.sacked_bytes -= bytes;
 
         }
-    }else {
-        if(state & TCP_SACKED_ACKED){
+    } else {
+        if (state & TCP_SACKED_ACKED) {
             pcb->sack.sacked_bytes += bytes;
 
         }
     }
-    if(skb->l4_private.tcp.sack_state & TCP_SACKED_RETRANS){
-        if(!(state & TCP_SACKED_RETRANS))
+    if (skb->l4_private.tcp.sack_state & TCP_SACKED_RETRANS) {
+        if (!(state & TCP_SACKED_RETRANS))
             pcb->sack.recovery_bytes -= bytes;
-    }else {
-        if(state & TCP_SACKED_RETRANS)
+    } else {
+        if (state & TCP_SACKED_RETRANS)
             pcb->sack.recovery_bytes += bytes;
     }
     skb->l4_private.tcp.sack_state = state;
@@ -53,7 +54,7 @@ void tcp_sack_set_state(tcp_pcb* pcb, skbuff* skb, uint8_t state)
 }
 
 
-void tcp_sack_rcv_nxt_advance(tcp_pcb* pcb)
+void tcp_sack_rcv_nxt_advance(tcp_pcb *pcb)
 {
     if (!pcb->tcp_flag.peer_sack_ok || pcb->sack.notify_sack_count == 0)
         return;
@@ -70,14 +71,14 @@ void tcp_sack_rcv_nxt_advance(tcp_pcb* pcb)
             high = pcb->sack.notify_sacks[i].right;
     }
     memcpy(pcb->sack.notify_sacks, next, pcb->sack.notify_sack_count * sizeof(tcp_sack_block));
-    skbuff* skb = TCP_TREE_LOWER_BOUND(pcb, reorder, high);
-    if(pcb->sack.notify_sack_count < TCP_MAX_SACK_BLOCKS && skb){
-        tcp_sack_block new_block={.left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end};
+    skbuff *skb = TCP_TREE_LOWER_BOUND(pcb, reorder, high);
+    if (pcb->sack.notify_sack_count < TCP_MAX_SACK_BLOCKS && skb) {
+        tcp_sack_block new_block = { .left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end };
         skb = TCP_TREE_NEXT(skb, reorder);
-        while(skb){
-            if(!tcp_sack_blocks_touch(&new_block, &(tcp_sack_block){.left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end}))
+        while (skb) {
+            if (!tcp_sack_blocks_touch(&new_block, &(tcp_sack_block){ .left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end }))
                 break;
-            tcp_sack_block_merge(&new_block, &(tcp_sack_block){.left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end});
+            tcp_sack_block_merge(&new_block, &(tcp_sack_block){ .left = skb->l4_private.tcp.seq, .right = skb->l4_private.tcp.seq_end });
             skb = TCP_TREE_NEXT(skb, reorder);
         }
         pcb->sack.notify_sacks[pcb->sack.notify_sack_count++] = new_block;
@@ -86,7 +87,7 @@ void tcp_sack_rcv_nxt_advance(tcp_pcb* pcb)
 }
 
 // recv out of order skb, update sack
-void tcp_sack_recv_ooo_skb(tcp_pcb* pcb, const skbuff* skb)
+void tcp_sack_recv_ooo_skb(tcp_pcb *pcb, const skbuff *skb)
 {
     if (!pcb->tcp_flag.peer_sack_ok)
         return;
@@ -96,7 +97,7 @@ void tcp_sack_recv_ooo_skb(tcp_pcb* pcb, const skbuff* skb)
         .right = skb->l4_private.tcp.seq_end,
     };
 
-    for (const skbuff* queued_skb = TCP_TREE_PREV(skb, reorder); queued_skb;
+    for (const skbuff *queued_skb = TCP_TREE_PREV(skb, reorder); queued_skb;
          queued_skb = TCP_TREE_PREV(queued_skb, reorder)) {
         tcp_sack_block queued = {
             .left = queued_skb->l4_private.tcp.seq,
@@ -106,7 +107,7 @@ void tcp_sack_recv_ooo_skb(tcp_pcb* pcb, const skbuff* skb)
             break;
         tcp_sack_block_merge(&merged, &queued);
     }
-    for (const skbuff* queued_skb = TCP_TREE_NEXT(skb, reorder); queued_skb;
+    for (const skbuff *queued_skb = TCP_TREE_NEXT(skb, reorder); queued_skb;
          queued_skb = TCP_TREE_NEXT(queued_skb, reorder)) {
         tcp_sack_block queued = {
             .left = queued_skb->l4_private.tcp.seq,
@@ -130,7 +131,7 @@ void tcp_sack_recv_ooo_skb(tcp_pcb* pcb, const skbuff* skb)
 }
 
 
-static uint32_t tcp_sack_option_block_count(const tcp_pcb* pcb,
+static uint32_t tcp_sack_option_block_count(const tcp_pcb *pcb,
                                              uint8_t flags)
 {
     if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) != TCP_FLAG_ACK ||
@@ -141,17 +142,17 @@ static uint32_t tcp_sack_option_block_count(const tcp_pcb* pcb,
     return min((uint32_t)pcb->sack.notify_sack_count, max_blocks);
 }
 
-uint64_t tcp_sack_acked_bytes(const tcp_pcb* pcb)
+uint64_t tcp_sack_acked_bytes(const tcp_pcb *pcb)
 {
     return pcb->sack.sacked_bytes;
 }
 
-uint64_t tcp_sack_retransmited_bytes(const tcp_pcb* pcb)
+uint64_t tcp_sack_retransmited_bytes(const tcp_pcb *pcb)
 {
     return pcb->sack.recovery_bytes;
 }
 
-uint32_t tcp_sack_option_len(const tcp_pcb* pcb, uint8_t flags)
+uint32_t tcp_sack_option_len(const tcp_pcb *pcb, uint8_t flags)
 {
     uint32_t count = tcp_sack_option_block_count(pcb, flags);
     if (!count)
@@ -162,7 +163,7 @@ uint32_t tcp_sack_option_len(const tcp_pcb* pcb, uint8_t flags)
 
 /* 将接收端保存的 SACK blocks 编码到已预留的 TCP 选项缓冲区，转换为网络
  * 字节序，并使用 NOP 补齐到四字节边界。 */
-void tcp_sack_write_option(tcp_pcb* pcb, uint8_t flags, uint8_t* out)
+void tcp_sack_write_option(tcp_pcb *pcb, uint8_t flags, uint8_t *out)
 {
     uint32_t count = tcp_sack_option_block_count(pcb, flags);
     if (!count)
@@ -188,16 +189,16 @@ void tcp_sack_write_option(tcp_pcb* pcb, uint8_t flags, uint8_t* out)
 }
 
 /* Return the retransmit skb whose sequence interval covers seq, if any. */
-static inline skbuff* tcp_sack_find_covering_skb(tcp_pcb* pcb,
+static inline skbuff *tcp_sack_find_covering_skb(tcp_pcb *pcb,
                                                  uint32_t seq)
 {
-    skbuff* skb = TCP_TREE_LOWER_BOUND(pcb, retransmit, seq);
+    skbuff *skb = TCP_TREE_LOWER_BOUND(pcb, retransmit, seq);
     if (!skb)
         return TCP_TREE_LAST(pcb, retransmit);
 
     /* lower_bound() already gives us the insertion point; its rb predecessor
      * is the only possible skb that can start before seq and still cover it. */
-    skbuff* prev = TCP_TREE_PREV(skb, retransmit);
+    skbuff *prev = TCP_TREE_PREV(skb, retransmit);
     if (prev && SEQ_GT(prev->l4_private.tcp.seq_end, seq))
         return prev;
 
@@ -205,11 +206,11 @@ static inline skbuff* tcp_sack_find_covering_skb(tcp_pcb* pcb,
 }
 
 /* Mark exactly [left, right) as SACKed, splitting boundary skbs as needed. */
-static void tcp_sack_mark_block(tcp_pcb* pcb, const tcp_sack_block* block)
+static void tcp_sack_mark_block(tcp_pcb *pcb, const tcp_sack_block *block)
 {
     uint32_t left = block->left;
     uint32_t right = block->right;
-    skbuff* skb = tcp_sack_find_covering_skb(pcb, left);
+    skbuff *skb = tcp_sack_find_covering_skb(pcb, left);
 
     while (skb && SEQ_LT(skb->l4_private.tcp.seq, right)) {
         if (SEQ_LT(skb->l4_private.tcp.seq, left)) {
@@ -224,7 +225,7 @@ static void tcp_sack_mark_block(tcp_pcb* pcb, const tcp_sack_block* block)
                            right - skb->l4_private.tcp.seq))
             return;
 
-        skbuff* next = TCP_TREE_NEXT(skb, retransmit);
+        skbuff *next = TCP_TREE_NEXT(skb, retransmit);
         tcp_sack_set_state(pcb, skb,
                            skb->l4_private.tcp.sack_state |
                            TCP_SACKED_ACKED);
@@ -232,7 +233,7 @@ static void tcp_sack_mark_block(tcp_pcb* pcb, const tcp_sack_block* block)
     }
 }
 
-void tcp_sack_process_options(tcp_pcb* pcb, const tcp_options* options)
+void tcp_sack_process_options(tcp_pcb *pcb, const tcp_options *options)
 {
     if (!pcb->tcp_flag.peer_sack_ok ||
         !(options->flags & TCP_OPTION_SACK_SEEN))
@@ -283,7 +284,7 @@ void tcp_sack_process_options(tcp_pcb* pcb, const tcp_options* options)
 
 }
 
-void tcp_sack_reset(tcp_pcb* pcb)
+void tcp_sack_reset(tcp_pcb *pcb)
 {
     memset(pcb->sack.notify_sacks, 0, sizeof(pcb->sack.notify_sacks));
     pcb->sack.notify_sack_count = 0;

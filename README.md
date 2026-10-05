@@ -360,9 +360,15 @@ protocol processing remain serialized with packet handling. Notifications are
 coalesced until the worker runs the callback; the `events` mask can contain
 multiple bits. The callback receives the opaque `Socket *` associated with the
 event and the application-provided `arg`. Call `net_clear_callback(fd)` to
-remove it. A callback must not block or use the socket from another thread;
-submit regular asynchronous requests when work needs to run outside the
-owning worker.
+remove it.
+
+Synchronous `net_*` calls made from the owning worker execute inline and never
+wait for that worker. If an operation would block, it returns `EAGAIN` or
+`EINPROGRESS`. A worker callback cannot synchronously operate on a socket owned
+by another worker; that call returns `EAGAIN`. Keep the callback short and use
+the asynchronous request API or an application queue for work that needs to
+run elsewhere. `net_async_wait()` and `net_async_close()` are lifecycle calls
+that may wait for other workers and must be called outside a worker callback.
 
 ## Repository Layout
 

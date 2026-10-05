@@ -70,9 +70,9 @@ typedef struct icmp_hdr {
 #define ICMP6_POLICY_FAIL           5
 #define ICMP6_REJECT_ROUTE          6
 
-int icmp_recv(skbuff* skb);
-int icmp6_recv(skbuff* skb);
-int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code);
-int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu);
+int icmp_recv(skbuff *skb);
+int icmp6_recv(skbuff *skb);
+int icmp_send_dest_unreach(skbuff *orig_skb, uint8_t code);
+int icmp6_send_packet_too_big(skbuff *orig_skb, uint32_t mtu);
 
 #endif /* ICMP_H */

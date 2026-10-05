@@ -333,9 +333,14 @@ net_set_callback(fd, NET_EVENT_READ | NET_EVENT_WRITE |
 callback 在 socket 所属的 worker 线程上执行，因此 socket 状态和报文处理仍然
 由同一个 worker 串行化。worker 执行 callback 前会合并已经产生的通知，
 `events` 可能同时包含多个位。callback 会收到对应的 opaque `Socket *` 和
-应用传入的 `arg`。使用 `net_clear_callback(fd)` 可以移除 callback。callback
-不应阻塞，也不应从其他线程直接操作该 socket；需要在 worker 外执行的工作，
-请使用常规异步请求提交。
+应用传入的 `arg`。使用 `net_clear_callback(fd)` 可以移除 callback。
+
+在所属 worker 中调用同步 `net_*` API 时会直接执行，不会再次等待该 worker。
+如果操作需要等待数据或发送空间，会返回 `EAGAIN` 或 `EINPROGRESS`。worker
+callback 不能同步操作其他 worker 所属的 socket，此时会返回 `EAGAIN`。callback
+应尽量保持简短；需要在其他线程执行的工作，请使用异步请求 API 或应用自己的
+任务队列。`net_async_wait()` 和 `net_async_close()` 可能需要等待其他 worker，
+必须在 worker callback 外调用。
 
 ## 目录结构
 

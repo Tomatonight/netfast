@@ -1,11 +1,12 @@
 #ifndef TCP_H
 #define TCP_H
-#include"socket.h"
-#include"thread.h"
-#include "tcp_metrics.h"
+
+#include "socket.h"
 #include "tcp_congestion.h"
+#include "tcp_metrics.h"
 #include "tcp_rack.h"
-#include <tcp_sack.h>
+#include "tcp_sack.h"
+#include "thread.h"
 
 extern protocol_ops tcp_protocol_ops;
 
@@ -114,9 +115,9 @@ typedef struct tcp_skb_tree {
     uint32_t count;
 } tcp_skb_tree;
 
-typedef struct tcp_pcb{
-    Socket* sock;
-    tcp_metrics* metrics;
+typedef struct tcp_pcb {
+    Socket *sock;
+    tcp_metrics *metrics;
     enum tcp_state state;
     task *timer_task;
 
@@ -156,7 +157,7 @@ typedef struct tcp_pcb{
     uint32_t syn_list_num;
     list_node accept_list; /* 全连接队列：已完成三次握手，等待 accept 取走。 */
     uint32_t accept_list_num;
-    Socket* parent_sock;
+    Socket *parent_sock;
 
     tcp_skb_tree retransmit_tree;
     tcp_skb_tree reorder_tree;
@@ -207,18 +208,18 @@ typedef struct tcp_pcb{
 
 } tcp_pcb;
 
-void tcp_skb_tree_insert(tcp_skb_tree* tree, skbuff* skb,
+void tcp_skb_tree_insert(tcp_skb_tree *tree, skbuff *skb,
                          size_t node_offset);
-void tcp_skb_tree_remove(tcp_skb_tree* tree, skbuff* skb,
+void tcp_skb_tree_remove(tcp_skb_tree *tree, skbuff *skb,
                          size_t node_offset);
-skbuff* tcp_skb_tree_lower_bound(const tcp_skb_tree* tree, uint32_t seq,
+skbuff *tcp_skb_tree_lower_bound(const tcp_skb_tree *tree, uint32_t seq,
                                  size_t node_offset);
 /* Return the skb with the greatest sequence start strictly below seq. */
-skbuff* tcp_skb_tree_prev_lower_bound(const tcp_skb_tree* tree, uint32_t seq,
+skbuff *tcp_skb_tree_prev_lower_bound(const tcp_skb_tree *tree, uint32_t seq,
                                       size_t node_offset);
 /* Split a TCP skb at a payload sequence offset, keeping queues, RACK, and
  * SACK byte accounting in sync. */
-skbuff* tcp_skb_split(tcp_pcb* pcb, skbuff* skb, uint32_t seq_len);
+skbuff *tcp_skb_split(tcp_pcb *pcb, skbuff *skb, uint32_t seq_len);
 
 #define TCP_ADD_RETRASMIT(pcb, skb) \
     tcp_skb_tree_insert(&(pcb)->retransmit_tree, (skb), \
@@ -254,7 +255,7 @@ skbuff* tcp_skb_split(tcp_pcb* pcb, skbuff* skb, uint32_t seq_len);
 /* The Window field in SYN/SYN-ACK is never scaled.  Scaling starts with
  * packets sent after the handshake, and only when both sides exchanged the
  * option. */
-static inline uint16_t tcp_encode_window(const tcp_pcb* pcb, uint8_t flags)
+static inline uint16_t tcp_encode_window(const tcp_pcb *pcb, uint8_t flags)
 {
     uint32_t window = pcb->rcv_wnd;
     if (!(flags & TCP_FLAG_SYN) && pcb->tcp_flag.peer_wnd_scale_ok)
@@ -262,7 +263,7 @@ static inline uint16_t tcp_encode_window(const tcp_pcb* pcb, uint8_t flags)
     return (uint16_t)(window > 65535u ? 65535u : window);
 }
 
-static inline uint32_t tcp_decode_window(const tcp_pcb* pcb, uint16_t window,
+static inline uint32_t tcp_decode_window(const tcp_pcb *pcb, uint16_t window,
                                          uint8_t flags)
 {
     if ((flags & TCP_FLAG_SYN) || !pcb->tcp_flag.peer_wnd_scale_ok)
@@ -270,17 +271,17 @@ static inline uint32_t tcp_decode_window(const tcp_pcb* pcb, uint16_t window,
     return (uint32_t)window << pcb->snd_wnd_scale;
 }
 
-int tcp_recv(struct skbuff* skb);
+int tcp_recv(struct skbuff *skb);
 /* 重传完整 skb：1 表示上层已消费本次尝试；0 表示预算为零。
  * 下层发送错误按丢包处理，不向 TCP 上层返回负值。 */
-void tcp_retransmit_skb(tcp_pcb* pcb, skbuff* skb);
-void tcp_update_sndcwnd(tcp_pcb* pcb, uint64_t new_cwnd);
-void tcp_update_timer(tcp_pcb* pcb, uint64_t* which,
+void tcp_retransmit_skb(tcp_pcb *pcb, skbuff *skb);
+void tcp_update_sndcwnd(tcp_pcb *pcb, uint64_t new_cwnd);
+void tcp_update_timer(tcp_pcb *pcb, uint64_t *which,
                       uint64_t deadline_ms, bool override);
 
-static inline uint64_t tcp_flight_size(const tcp_pcb* pcb)
+static inline uint64_t tcp_flight_size(const tcp_pcb *pcb)
 {
-    if(pcb->tcp_flag.peer_sack_ok){
+    if (pcb->tcp_flag.peer_sack_ok) {
         return pcb->snd_nxt - pcb->snd_una - pcb->sack.sacked_bytes;
     }
     return pcb->snd_nxt - pcb->snd_una;
@@ -288,5 +289,5 @@ static inline uint64_t tcp_flight_size(const tcp_pcb* pcb)
 /* Split an oversized TCP packet into TCP segments.  Each segment retains the
  * complete TCP header/options and receives its own sequence number/checksum;
  * the IP output path adds the corresponding IP header afterward. */
-bool tcp_skb_frag(skbuff* skb, uint32_t mtu);
-#endif
+bool tcp_skb_frag(skbuff *skb, uint32_t mtu);
+#endif /* TCP_H */

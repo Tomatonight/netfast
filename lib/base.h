@@ -2,16 +2,23 @@
 #define BASE_H
 
 #include <assert.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/time.h>
 #include <time.h>
 
+/* Branch prediction hints for hot packet-processing paths. */
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 
 #define IP_STR "%u.%u.%u.%u"
 #define IP_ARG(addr) \
@@ -31,12 +38,12 @@ typedef struct ref_info {
     void (*free_info)(void*);
 } ref_info;
 
-static inline void ref_inc(ref_info* r) {
+static inline void ref_inc(ref_info *r) {
     /* The caller already owns a live reference. */
     atomic_fetch_add_explicit(&r->ref_cnt, 1, memory_order_relaxed);
 }
 
-static inline bool ref_inc_not_zero(ref_info* r) {
+static inline bool ref_inc_not_zero(ref_info *r) {
     int old = atomic_load_explicit(&r->ref_cnt, memory_order_acquire);
     while (old != 0) {
         if (atomic_compare_exchange_weak_explicit(
@@ -49,7 +56,7 @@ static inline bool ref_inc_not_zero(ref_info* r) {
 }
 
 
-static inline bool ref_dec_and_test(ref_info* r)
+static inline bool ref_dec_and_test(ref_info *r)
 {
     int old = atomic_load_explicit(&r->ref_cnt, memory_order_acquire);
     while (old != 0) {
@@ -62,7 +69,7 @@ static inline bool ref_dec_and_test(ref_info* r)
 }
 
 #define CREATE_REF(type, name, free_fn)                   \
-    type* name = (type*)calloc(1, sizeof(type));             \
+    type *name = (type*)calloc(1, sizeof(type));             \
     if (name) {                                              \
         atomic_init(&(name)->ref.ref_cnt, 1);                  \
         atomic_init(&(name)->ref.useful, true);               \
@@ -124,17 +131,17 @@ static inline bool ref_dec_and_test(ref_info* r)
 
 typedef pthread_spinlock_t spinlock_t;
 
-static inline void spin_lock_init(spinlock_t* lock)
+static inline void spin_lock_init(spinlock_t *lock)
 {
     (void)pthread_spin_init(lock, PTHREAD_PROCESS_PRIVATE);
 }
 
-static inline void spin_lock(spinlock_t* lock)
+static inline void spin_lock(spinlock_t *lock)
 {
     (void)pthread_spin_lock(lock);
 }
 
-static inline void spin_unlock(spinlock_t* lock)
+static inline void spin_unlock(spinlock_t *lock)
 {
     (void)pthread_spin_unlock(lock);
 }
@@ -143,12 +150,12 @@ typedef struct spin_rwlock {
     atomic_int state;
 } spin_rwlock_t;
 
-static inline void spin_rwlock_init(spin_rwlock_t* l)
+static inline void spin_rwlock_init(spin_rwlock_t *l)
 {
     atomic_init(&l->state, 0);
 }
 
-static inline void spin_rwlock_rdlock(spin_rwlock_t* l)
+static inline void spin_rwlock_rdlock(spin_rwlock_t *l)
 {
     for (;;) {
         int s = atomic_load_explicit(&l->state, memory_order_acquire);
@@ -164,7 +171,7 @@ static inline void spin_rwlock_rdlock(spin_rwlock_t* l)
     }
 }
 
-static inline void spin_rwlock_wrlock(spin_rwlock_t* l)
+static inline void spin_rwlock_wrlock(spin_rwlock_t *l)
 {
     for (;;) {
         int expected = 0;
@@ -176,7 +183,7 @@ static inline void spin_rwlock_wrlock(spin_rwlock_t* l)
     }
 }
 
-static inline void spin_rwlock_unlock(spin_rwlock_t* l)
+static inline void spin_rwlock_unlock(spin_rwlock_t *l)
 {
     int s = atomic_load_explicit(&l->state, memory_order_acquire);
     if (s == -1) {
@@ -189,22 +196,22 @@ static inline void spin_rwlock_unlock(spin_rwlock_t* l)
 
 typedef pthread_mutex_t mutex_t;
 
-static inline void mutex_init(mutex_t* mtx)
+static inline void mutex_init(mutex_t *mtx)
 {
     (void)pthread_mutex_init(mtx, NULL);
 }
 
-static inline void mutex_lock(mutex_t* mtx)
+static inline void mutex_lock(mutex_t *mtx)
 {
     (void)pthread_mutex_lock(mtx);
 }
 
-static inline void mutex_unlock(mutex_t* mtx)
+static inline void mutex_unlock(mutex_t *mtx)
 {
     (void)pthread_mutex_unlock(mtx);
 }
 
-static inline void mutex_destroy(mutex_t* mtx)
+static inline void mutex_destroy(mutex_t *mtx)
 {
     (void)pthread_mutex_destroy(mtx);
 }
@@ -222,11 +229,11 @@ static inline uint64_t get_current_time_ms(void) {
     return current_time_ms;
 };
 
-uint16_t checksum_protocol(const void* data, uint32_t len, uint32_t saddr, uint32_t daddr, uint8_t protocol);
-uint16_t checksum(const void* buff, uint32_t len, uint32_t start_sum);
-uint32_t checksum_partial(const void* buff, uint32_t len, uint32_t start_sum);
+uint16_t checksum_protocol(const void *data, uint32_t len, uint32_t saddr, uint32_t daddr, uint8_t protocol);
+uint16_t checksum(const void *buff, uint32_t len, uint32_t start_sum);
+uint32_t checksum_partial(const void *buff, uint32_t len, uint32_t start_sum);
 
-static inline uint32_t get_time(const struct timeval* timeval)
+static inline uint32_t get_time(const struct timeval *timeval)
 {
     return (uint32_t)((uint64_t)timeval->tv_sec * 1000 +
                       (uint64_t)timeval->tv_usec / 1000);

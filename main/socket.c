@@ -1,21 +1,23 @@
-#include <errno.h>
+#include "socket.h"
+
 #include <assert.h>
-#include <stdatomic.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
-#include "socket.h"
-#include "log.h"
-#include "udp.h"
-#include "queue.h"
-#include "tcp.h"
-#include "ip.h"
-#include "if.h"
 #include "fd_entry.h"
+#include "if.h"
+#include "init.h"
+#include "ip.h"
+#include "log.h"
+#include "queue.h"
 #include "req_socket.h"
 #include "rss.h"
+#include "tcp.h"
+#include "tcp_metrics.h"
+#include "udp.h"
 #include "worker.h"
-#include "init.h"
 
 /* Default buffer sizes are page-aligned (4 KB × N) for efficient memory
  * allocation and zero-copy page-flipping. */
@@ -50,7 +52,7 @@ typedef union tuple_key {
 
 struct tuple_entry {
     hash_node hash_node;
-    list_node* sockets;
+    list_node *sockets;
     tuple_key key;
 };
 
@@ -58,9 +60,9 @@ _Static_assert(sizeof(tuple_key4) == 12, "IPv4 tuple key must stay compact");
 _Static_assert(sizeof(tuple_key6) == 36,
                "IPv6 tuple key must stay compact");
 
-static uint32_t socket_tuple_hash(const void* key, uint32_t key_len)
+static uint32_t socket_tuple_hash(const void *key, uint32_t key_len)
 {
-    const uint8_t* bytes = key;
+    const uint8_t *bytes = key;
     uint32_t hash = 0x9747b28cu ^ key_len;
 
     for (uint32_t offset = 0; offset < key_len; offset += sizeof(uint32_t)) {
@@ -83,7 +85,7 @@ static uint32_t socket_tuple_hash(const void* key, uint32_t key_len)
     return hash;
 }
 
-hash* tuple_hash_create(uint32_t size, int family)
+hash *tuple_hash_create(uint32_t size, int family)
 {
     if (family != AF_INET && family != AF_INET6)
         return NULL;
@@ -93,10 +95,10 @@ hash* tuple_hash_create(uint32_t size, int family)
         HASH_KEY_OFFSET(tuple_entry, hash_node, key), key_len);
 }
 
-static uint32_t socket_tuple_key(const Socket* sock, tuple_key* key)
+static uint32_t socket_tuple_key(const Socket *sock, tuple_key *key)
 {
     if (sock->family == AF_INET6) {
-        tuple_key6* key6 = &key->key6;
+        tuple_key6 *key6 = &key->key6;
         memcpy(key6->saddr, sock->sip6, sizeof(key6->saddr));
         memcpy(key6->daddr, sock->dip6, sizeof(key6->daddr));
         key6->sport = sock->sport;
@@ -104,7 +106,7 @@ static uint32_t socket_tuple_key(const Socket* sock, tuple_key* key)
         return sizeof(*key6);
     }
 
-    tuple_key4* key4 = &key->key4;
+    tuple_key4 *key4 = &key->key4;
     key4->saddr = sock->sip;
     key4->daddr = sock->dip;
     key4->sport = sock->sport;
@@ -124,9 +126,9 @@ struct bind_table {
     _Atomic uint64_t ports[BIND_PORT_COUNT];
 };
 
-static void socket_bind_hash_add(uint32_t* hash, const void* data, size_t len)
+static void socket_bind_hash_add(uint32_t *hash, const void *data, size_t len)
 {
-    const uint8_t* bytes = data;
+    const uint8_t *bytes = data;
 
     for (size_t i = 0; i < len; i++) {
         *hash ^= bytes[i];
@@ -134,7 +136,7 @@ static void socket_bind_hash_add(uint32_t* hash, const void* data, size_t len)
     }
 }
 
-static uint32_t socket_bind_key_hash(const addr_key* key)
+static uint32_t socket_bind_key_hash(const addr_key *key)
 {
     uint32_t hash = 2166136261u;
 
@@ -149,7 +151,7 @@ static uint32_t socket_bind_key_hash(const addr_key* key)
     return hash;
 }
 
-static bool socket_bind_key_equal(const addr_key* a, const addr_key* b)
+static bool socket_bind_key_equal(const addr_key *a, const addr_key *b)
 {
     if (a->family != b->family || a->port != b->port)
         return false;
@@ -159,7 +161,7 @@ static bool socket_bind_key_equal(const addr_key* a, const addr_key* b)
         : a->addr == b->addr;
 }
 
-static bool socket_bind_key_is_any(const addr_key* key)
+static bool socket_bind_key_is_any(const addr_key *key)
 {
     static const uint8_t zero[16];
 
@@ -168,9 +170,9 @@ static bool socket_bind_key_is_any(const addr_key* key)
         : key->addr == INADDR_ANY;
 }
 
-static bind_slot* socket_bind_find(const bind_table* table, const addr_key* key)
+static bind_slot *socket_bind_find(const bind_table *table, const addr_key *key)
 {
-    bind_slot* slot = atomic_load_explicit(
+    bind_slot *slot = atomic_load_explicit(
         &table->buckets[socket_bind_key_hash(key) % BIND_BUCKET_COUNT],
         memory_order_acquire);
 
@@ -179,12 +181,12 @@ static bind_slot* socket_bind_find(const bind_table* table, const addr_key* key)
     return slot;
 }
 
-static bool socket_bind_port_reserve(bind_table* table, const addr_key* key,
+static bool socket_bind_port_reserve(bind_table *table, const addr_key *key,
                               bool reuse)
 {
     bool any = socket_bind_key_is_any(key);
     uint64_t add = any ? BIND_ANY_ONE : BIND_SPECIFIC_ONE;
-    _Atomic uint64_t* state = &table->ports[ntohs(key->port)];
+    _Atomic uint64_t *state = &table->ports[ntohs(key->port)];
     uint64_t old = atomic_load_explicit(state, memory_order_relaxed);
 
     do {
@@ -195,7 +197,7 @@ static bool socket_bind_port_reserve(bind_table* table, const addr_key* key,
     return true;
 }
 
-static void socket_bind_port_release(bind_table* table, const addr_key* key)
+static void socket_bind_port_release(bind_table *table, const addr_key *key)
 {
     uint64_t sub = socket_bind_key_is_any(key) ? BIND_ANY_ONE : BIND_SPECIFIC_ONE;
     uint64_t old = atomic_fetch_sub_explicit(
@@ -205,7 +207,7 @@ static void socket_bind_port_release(bind_table* table, const addr_key* key)
     (void)old;
 }
 
-static bind_slot* socket_bind_reserve(bind_table* table, const addr_key* key,
+static bind_slot *socket_bind_reserve(bind_table *table, const addr_key *key,
                                bool reuse)
 {
     if (!socket_bind_port_reserve(table, key, reuse))
@@ -213,7 +215,7 @@ static bind_slot* socket_bind_reserve(bind_table* table, const addr_key* key,
 
     uint32_t bucket = socket_bind_key_hash(key) % BIND_BUCKET_COUNT;
     for (;;) {
-        bind_slot* slot = socket_bind_find(table, key);
+        bind_slot *slot = socket_bind_find(table, key);
         if (slot) {
             uint32_t count = atomic_load_explicit(&slot->count,
                                                   memory_order_relaxed);
@@ -235,7 +237,7 @@ static bind_slot* socket_bind_reserve(bind_table* table, const addr_key* key,
         }
         slot->key = *key;
         atomic_init(&slot->count, 1);
-        bind_slot* head = atomic_load_explicit(&table->buckets[bucket],
+        bind_slot *head = atomic_load_explicit(&table->buckets[bucket],
                                                memory_order_acquire);
         atomic_init(&slot->next, head);
         if (atomic_compare_exchange_strong_explicit(
@@ -246,7 +248,7 @@ static bind_slot* socket_bind_reserve(bind_table* table, const addr_key* key,
     }
 }
 
-static void socket_bind_release(bind_table* table, bind_slot* slot)
+static void socket_bind_release(bind_table *table, bind_slot *slot)
 {
     uint32_t old = atomic_fetch_sub_explicit(&slot->count, 1,
                                              memory_order_acq_rel);
@@ -255,9 +257,9 @@ static void socket_bind_release(bind_table* table, bind_slot* slot)
     socket_bind_port_release(table, &slot->key);
 }
 
-bind_table* bind_table_create(void)
+bind_table *bind_table_create(void)
 {
-    bind_table* table = calloc(1, sizeof(*table));
+    bind_table *table = calloc(1, sizeof(*table));
     if (!table)
         return NULL;
     for (uint32_t i = 0; i < BIND_BUCKET_COUNT; i++)
@@ -267,13 +269,13 @@ bind_table* bind_table_create(void)
     return table;
 }
 
-void bind_table_destroy(bind_table* table)
+void bind_table_destroy(bind_table *table)
 {
     for (uint32_t i = 0; i < BIND_BUCKET_COUNT; i++) {
-        bind_slot* slot = atomic_load_explicit(&table->buckets[i],
+        bind_slot *slot = atomic_load_explicit(&table->buckets[i],
                                                memory_order_relaxed);
         while (slot) {
-            bind_slot* next = atomic_load_explicit(&slot->next,
+            bind_slot *next = atomic_load_explicit(&slot->next,
                                                    memory_order_relaxed);
             free(slot);
             slot = next;
@@ -284,11 +286,11 @@ void bind_table_destroy(bind_table* table)
 
 /* ── 协议选择与 Socket 生命周期 ────────────────────────── */
 
-typedef struct inet_ops{
+typedef struct inet_ops {
     int family;
     int type;
     int protocol;
-    protocol_ops* ops;
+    protocol_ops *ops;
 }inet_ops;
 
 static inet_ops supported_inet_ops[] = {
@@ -302,19 +304,17 @@ static inet_ops supported_inet_ops[] = {
     {AF_INET6, SOCK_STREAM, 0,           &tcp_protocol_ops},
 };
 
-static void socket_fail_request(req *r, int error)
+static protocol_ops *socket_find_inet_ops(int family, int type, int *protocol)
 {
-    req_notify(r, -error);
-}
-
-static protocol_ops* socket_find_inet_ops(int family, int type, int *protocol){
-    for(uint32_t i=0;i<sizeof(supported_inet_ops)/sizeof(inet_ops);i++){
-        if(supported_inet_ops[i].family==family && supported_inet_ops[i].type==type
-             && supported_inet_ops[i].protocol==*protocol){
-            if(!supported_inet_ops[i].ops ||
+    for (uint32_t i = 0; i < sizeof(supported_inet_ops) /
+                              sizeof(inet_ops); i++) {
+        if (supported_inet_ops[i].family == family &&
+            supported_inet_ops[i].type == type &&
+            supported_inet_ops[i].protocol == *protocol) {
+            if (!supported_inet_ops[i].ops ||
                !supported_inet_ops[i].ops->release)
                 return NULL;
-            if(supported_inet_ops[i].protocol==0)
+            if (supported_inet_ops[i].protocol == 0)
                 *protocol = supported_inet_ops[i].ops->protocol;
             return supported_inet_ops[i].ops;
         }
@@ -322,7 +322,7 @@ static protocol_ops* socket_find_inet_ops(int family, int type, int *protocol){
     return NULL;
 }
 
-static hash* socket_select_tuple_hash(int protocol, int family)
+static hash *socket_select_tuple_hash(int protocol, int family)
 {
     switch (protocol) {
     case IPPROTO_UDP:
@@ -334,7 +334,7 @@ static hash* socket_select_tuple_hash(int protocol, int family)
     }
 }
 
-static bind_table* socket_select_bind_table(int protocol, int family)
+static bind_table *socket_select_bind_table(int protocol, int family)
 {
     switch (protocol) {
     case IPPROTO_UDP:
@@ -346,14 +346,14 @@ static bind_table* socket_select_bind_table(int protocol, int family)
     }
 }
 
-Socket* create_socket(int family, int type, int protocol){
-    protocol_ops* ops = socket_find_inet_ops(family, type, &protocol);
-    if(!ops){
+Socket *create_socket(int family, int type, int protocol) {
+    protocol_ops *ops = socket_find_inet_ops(family, type, &protocol);
+    if (!ops) {
         DEBUG_LOG("socket_process_create_request: unsupported Socket type: family=%d, type=%d, protocol=%d", family, type, protocol);
         return NULL;
     }
-    Socket* sock = calloc(1, sizeof(*sock));
-    if(!sock){
+    Socket *sock = calloc(1, sizeof(*sock));
+    if (!sock) {
         ERR_LOG("socket_process_create_request: failed to allocate Socket");
         return NULL;
     }
@@ -366,9 +366,9 @@ Socket* create_socket(int family, int type, int protocol){
     sock->recv_buffer_len_max = SOCKET_DEFAULT_RECV_SIZE;
     sock->send_buffer_len_max = SOCKET_DEFAULT_SEND_SIZE;
 
-    if(ops->pcb_init){
+    if (ops->pcb_init) {
         int ret = ops->pcb_init(sock);
-        if(ret<0){
+        if (ret<0) {
             free(sock);
             return NULL;
         }
@@ -378,33 +378,33 @@ Socket* create_socket(int family, int type, int protocol){
 
 /* ── worker 上执行的同步 Socket 请求处理器 ─────────────── */
 
-static void socket_cancel_timer_migration(Socket* sock)
+static void socket_cancel_timer_migration(Socket *sock)
 {
     if (sock->owner)
         thread_remove_socket_timer(sock->owner->master,
                                    &sock->timer_migrate_node);
 }
 
-void socket_process_timer_migrations(task* tk)
+void socket_process_timer_migrations(task *tk)
 {
-    thread* master = tk->parent_thread;
-    list_node* node;
+    thread *master = tk->parent_thread;
+    list_node *node;
     while ((node = thread_pop_socket_timer(master))) {
-        Socket* sock = (Socket*)((uint8_t*)node -
+        Socket *sock = (Socket*)((uint8_t*)node -
                                  offsetof(Socket, timer_migrate_node));
 
         if (sock->pending_task && sock->pending_task->timeout)
             register_task(master, sock->pending_task);
 
         if (sock->protocol == IPPROTO_TCP) {
-            tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
+            tcp_pcb *pcb = (tcp_pcb*)sock->pcb;
             if (pcb->timer_task->timeout)
                 register_task(master, pcb->timer_task);
         }
     }
 }
 
-void set_socket_worker(Socket* sock, worker* w)
+void set_socket_worker(Socket *sock, worker *w)
 {
     if (sock->fd_entry)
         fd_entry_set_worker(sock->fd_entry, w);
@@ -422,7 +422,7 @@ void set_socket_worker(Socket* sock, worker* w)
     }
 
     if (sock->protocol == IPPROTO_TCP) {
-        tcp_pcb* pcb = (tcp_pcb*)sock->pcb;
+        tcp_pcb *pcb = (tcp_pcb*)sock->pcb;
         unregister_task(pcb->timer_task);
         migrate |= pcb->timer_task->timeout != 0;
     }
@@ -451,37 +451,38 @@ int socket_set_callback(Socket *sock, net_event_mask events,
     return 0;
 }
 
-void destroy_socket(Socket* sock){
+void destroy_socket(Socket *sock) {
     socket_cancel_timer_migration(sock);
 
     destroy_task(sock->pending_task);
     sock->pending_task = NULL;
 
     if (sock->flag.is_hash) {
-        hash* tuple_hash = socket_select_tuple_hash(
+        hash *tuple_hash = socket_select_tuple_hash(
             sock->protocol, sock->family);
         uninstall_tuple(sock, tuple_hash);
     }
     if (sock->flag.is_bound) {
-        bind_table* bound_table = socket_select_bind_table(
+        bind_table *bound_table = socket_select_bind_table(
             sock->protocol, sock->family);
         unbind_saddr(sock, bound_table);
     }
 
-    skbuff* skb;
-    while((skb=SKB_FROM_NODE(pop_queue(&sock->recv_queue), queue_node))!=NULL){
+    skbuff *skb;
+    while ((skb=SKB_FROM_NODE(pop_queue(&sock->recv_queue), queue_node))!=NULL) {
         PUT_REF(skb);
     }
-    while((skb=SKB_FROM_NODE(pop_queue(&sock->send_queue), queue_node))!=NULL){
+    while ((skb=SKB_FROM_NODE(pop_queue(&sock->send_queue), queue_node))!=NULL) {
         PUT_REF(skb);
     }
     PUT_REF(sock->route);
+    PUT_REF(sock->metrics);
     free(sock);
 }
 
-void socket_detach_with_fd_entry(Socket* sock){
-    fd_entry* entry = sock->fd_entry;
-    if(!entry){
+void socket_detach_with_fd_entry(Socket *sock) {
+    fd_entry *entry = sock->fd_entry;
+    if (!entry) {
         return;
     }
     entry->value = NULL;
@@ -490,43 +491,43 @@ void socket_detach_with_fd_entry(Socket* sock){
     sock->callback_arg = NULL;
     sock->callback_events = 0;
 
-    pending_node* pn;
-    list_node* t;
+    pending_node *pn;
+    list_node *t;
     FOR_EACH_LIST_SAFE_OFFSET(&sock->pending, pn, t, pending_node, node) {
         remove_list_node(&pn->node);
         if (pn->cb == stack_request_pending_cb) {
             /* Req waiter: notify failure */
-            req* r = (req*)pn->value;
-            socket_fail_request(r, EBADF);
+            req *r = (req*)pn->value;
+            req_notify(r, -EBADF);
         }
     }
 }
 
-void socket_process_create_request(req* r)
+void socket_process_create_request(req *r)
 {
     int family = r->argv.Socket.family;
     int type = r->argv.Socket.type;
     int protocol = r->argv.Socket.protocol;
 
-    protocol_ops* ops = socket_find_inet_ops(family, type, &protocol);
-    if(!ops){
+    protocol_ops *ops = socket_find_inet_ops(family, type, &protocol);
+    if (!ops) {
         DEBUG_LOG("socket_process_create_request: unsupported Socket type: family=%d, type=%d, protocol=%d", family, type, protocol);
-        socket_fail_request(r, EAFNOSUPPORT);
+        req_notify(r, -EAFNOSUPPORT);
         return;
     }
 
-    worker* owner = get_current_worker();
-    fd_entry* entry = alloc_fd_entry_with_worker(NULL, &socket_fd_ops, owner);
-    if(!entry){
+    worker *owner = get_current_worker();
+    fd_entry *entry = alloc_fd_entry_with_worker(NULL, &socket_fd_ops, owner);
+    if (!entry) {
         ERR_LOG("socket_process_create_request: failed to allocate fd entry");
-        socket_fail_request(r, EMFILE);
+        req_notify(r, -EMFILE);
         return;
     }
 
-    Socket* sock = create_socket(family, type, protocol);
-    if(!sock){
+    Socket *sock = create_socket(family, type, protocol);
+    if (!sock) {
         PUT_REF(entry);
-        socket_fail_request(r, ENOMEM);
+        req_notify(r, -ENOMEM);
         return;
     }
 
@@ -537,102 +538,110 @@ void socket_process_create_request(req* r)
     req_notify(r, entry->fd);
 }
 
-void socket_process_bind_request(req* r)
+void socket_process_bind_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     const struct sockaddr_in *addr = (const struct sockaddr_in*)&r->argv.bind.addr;
     socklen_t addrlen = r->argv.bind.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
-    if(!sock->protocol_ops->bind){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->bind) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
-    int ret = sock->protocol_ops->bind(sock, r, addr, addrlen);
+    int ret = sock->protocol_ops->bind(sock,
+                                       r->worker ? r : NULL,
+                                       addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_listen_request(req* r)
+void socket_process_listen_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     int backlog = r->argv.listen.backlog;
 
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
     if (!sock->protocol_ops->listen) {
-        socket_fail_request(r, EOPNOTSUPP);
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
 
-    int ret = sock->protocol_ops->listen(sock, r, backlog);
+    int ret = sock->protocol_ops->listen(sock,
+                                         r->worker ? r : NULL,
+                                         backlog);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_accept_request(req* r)
+void socket_process_accept_request(req *r)
 {
-    fd_entry* entry = r->entry;
-    struct sockaddr_in* addr = (struct sockaddr_in*)r->argv.accept.addr;
-    socklen_t* addrlen = r->argv.accept.addrlen;
+    fd_entry *entry = r->entry;
+    struct sockaddr_in *addr = (struct sockaddr_in*)r->argv.accept.addr;
+    socklen_t *addrlen = r->argv.accept.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
     if (!sock->protocol_ops->accept) {
-        socket_fail_request(r, EOPNOTSUPP);
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
 
-    int ret = sock->protocol_ops->accept(sock, r, addr, addrlen);
+    int ret = sock->protocol_ops->accept(sock,
+                                         r->worker ? r : NULL,
+                                         addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_connect_request(req* r)
+void socket_process_connect_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     const struct sockaddr_in *addr = (const struct sockaddr_in*)&r->argv.connect.addr;
     socklen_t addrlen = r->argv.connect.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
-    if(!sock->protocol_ops->connect){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->connect) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
-    int ret = sock->protocol_ops->connect(sock, r, addr, addrlen);
+    int ret = sock->protocol_ops->connect(sock,
+                                          r->worker ? r : NULL,
+                                          addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_read_request(req* r)
+void socket_process_read_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     void *buf = r->argv.read.buf;
     uint32_t len = r->argv.read.len;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
@@ -640,30 +649,32 @@ void socket_process_read_request(req* r)
         req_notify(r, 0);
         return;
     }
-    if(buf==NULL){
-        socket_fail_request(r, EFAULT);
+    if (buf==NULL) {
+        req_notify(r, -EFAULT);
         return;
     }
-    if(!sock->protocol_ops->read){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->read) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
 
-    int ret = sock->protocol_ops->read(sock, r, buf, len);
+    int ret = sock->protocol_ops->read(sock,
+                                       r->worker ? r : NULL,
+                                       buf, len);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_write_request(req* r)
+void socket_process_write_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     const void *buf = r->argv.write.buf;
     uint32_t len = r->argv.write.len;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
@@ -671,46 +682,48 @@ void socket_process_write_request(req* r)
         req_notify(r, 0);
         return;
     }
-    if(buf==NULL){
-        socket_fail_request(r, EFAULT);
+    if (buf==NULL) {
+        req_notify(r, -EFAULT);
         return;
     }
     if (sock->flag.close_send) {
-        socket_fail_request(r, EPIPE);
+        req_notify(r, -EPIPE);
         return;
     }
-    if(!sock->protocol_ops->write){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->write) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
-    int ret = sock->protocol_ops->write(sock, r, buf, len);
+    int ret = sock->protocol_ops->write(sock,
+                                        r->worker ? r : NULL,
+                                        buf, len);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_sendto_request(req* r)
+void socket_process_sendto_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     const void *buf = r->argv.sendto.buf;
     uint32_t len = r->argv.sendto.len;
     const struct sockaddr_in *dest_addr = r->argv.sendto.has_dest_addr
         ? (const struct sockaddr_in*)&r->argv.sendto.dest_addr : NULL;
     socklen_t addrlen = r->argv.sendto.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
     if (len != 0 && buf == NULL) {
-        socket_fail_request(r, EFAULT);
+        req_notify(r, -EFAULT);
         return;
     }
 
     if (sock->flag.close_send) {
-        socket_fail_request(r, EPIPE);
+        req_notify(r, -EPIPE);
         return;
     }
     socklen_t required = sock->family == AF_INET6
@@ -718,44 +731,47 @@ void socket_process_sendto_request(req* r)
         : (socklen_t)sizeof(struct sockaddr_in);
     /* sendto on a connected socket accepts a NULL destination. */
     if (dest_addr && addrlen < required) {
-        socket_fail_request(r, EINVAL);
+        req_notify(r, -EINVAL);
         return;
     }
     if (dest_addr && dest_addr->sin_family != sock->family) {
-        socket_fail_request(r, EAFNOSUPPORT);
+        req_notify(r, -EAFNOSUPPORT);
         return;
     }
     if (!dest_addr && !sock->flag.is_connected) {
-        socket_fail_request(r, EDESTADDRREQ);
+        req_notify(r, -EDESTADDRREQ);
         return;
     }
-    if(!sock->protocol_ops->sendto){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->sendto) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
     int flags = r->argv.sendto.flags;
-    int ret = sock->protocol_ops->sendto(sock, r, buf, len, flags, (sockaddr_in*)dest_addr, addrlen);
+    int ret = sock->protocol_ops->sendto(sock,
+                                         r->worker ? r : NULL,
+                                         buf, len, flags,
+                                         (sockaddr_in*)dest_addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_recvfrom_request(req* r)
+void socket_process_recvfrom_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     void *buf = r->argv.recvfrom.buf;
     uint32_t len = r->argv.recvfrom.len;
-    sockaddr_in* addr = (sockaddr_in*)r->argv.recvfrom.src_addr;
-    socklen_t* addrlen = r->argv.recvfrom.addrlen;
+    sockaddr_in *addr = (sockaddr_in*)r->argv.recvfrom.src_addr;
+    socklen_t *addrlen = r->argv.recvfrom.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
-    if(len != 0 && buf == NULL){
-        socket_fail_request(r, EFAULT);
+    if (len != 0 && buf == NULL) {
+        req_notify(r, -EFAULT);
         return;
     }
     if (sock->flag.close_recv) {
@@ -763,83 +779,89 @@ void socket_process_recvfrom_request(req* r)
         return;
     }
     /* A NULL source-address pointer means the address length is ignored. */
-    if(addr != NULL && addrlen == NULL){
-        socket_fail_request(r, EFAULT);
+    if (addr != NULL && addrlen == NULL) {
+        req_notify(r, -EFAULT);
         return;
     }
-    if(!sock->protocol_ops->recvfrom){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->recvfrom) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
     int flags = r->argv.recvfrom.flags;
-    int ret = sock->protocol_ops->recvfrom(sock, r, buf, len, flags, addr, addrlen);
+    int ret = sock->protocol_ops->recvfrom(sock,
+                                           r->worker ? r : NULL,
+                                           buf, len, flags, addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_getsockname_request(req* r)
+void socket_process_getsockname_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     struct sockaddr_in *addr = (struct sockaddr_in*)r->argv.getsockname.addr;
     socklen_t *addrlen = r->argv.getsockname.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
-    if(!addr || !addrlen){
-        socket_fail_request(r, EFAULT);
+    if (!addr || !addrlen) {
+        req_notify(r, -EFAULT);
         return;
     }
-    if(!sock->protocol_ops->getsockname){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->getsockname) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
-    int ret = sock->protocol_ops->getsockname(sock, r, addr, addrlen);
+    int ret = sock->protocol_ops->getsockname(sock,
+                                              r->worker ? r : NULL,
+                                              addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_getpeername_request(req* r)
+void socket_process_getpeername_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     struct sockaddr_in *addr = (struct sockaddr_in*)r->argv.getpeername.addr;
     socklen_t *addrlen = r->argv.getpeername.addrlen;
 
-    Socket* sock = (Socket*)entry->value;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    Socket *sock = (Socket*)entry->value;
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
-    if(!addr || !addrlen){
-        socket_fail_request(r, EFAULT);
+    if (!addr || !addrlen) {
+        req_notify(r, -EFAULT);
         return;
     }
-    if(!sock->protocol_ops->getpeername){
-        socket_fail_request(r, EOPNOTSUPP);
+    if (!sock->protocol_ops->getpeername) {
+        req_notify(r, -EOPNOTSUPP);
         return;
     }
-    int ret = sock->protocol_ops->getpeername(sock, r, addr, addrlen);
+    int ret = sock->protocol_ops->getpeername(sock,
+                                              r->worker ? r : NULL,
+                                              addr, addrlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_close_request(req* r)
+void socket_process_close_request(req *r)
 {
-    fd_entry* entry = r->entry;
-    Socket* sock = (Socket*)entry->value;
+    fd_entry *entry = r->entry;
+    Socket *sock = (Socket*)entry->value;
     bool linger_retry = r->status == REQ_WAITING_CLOSE;
 
     if (!sock && linger_retry)
         sock = r->wait_sock;
-    if(!sock){
-        socket_fail_request(r, EBADF);
+    if (!sock) {
+        req_notify(r, -EBADF);
         return;
     }
 
@@ -847,25 +869,28 @@ void socket_process_close_request(req* r)
         socket_detach_with_fd_entry(sock);
         PUT_REF(entry); /* release the fd table's ownership */
     }
-    int ret = sock->protocol_ops->release(sock, r);
+    int ret = sock->protocol_ops->release(
+        sock, r->worker ? r : NULL);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_shutdown_request(req* r)
+void socket_process_shutdown_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     int how = r->argv.shutdown.how;
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
 
     /* Protocol-specific shutdown (e.g. TCP sends FIN) */
     if (sock->protocol_ops && sock->protocol_ops->shutdown) {
-        int ret = sock->protocol_ops->shutdown(sock, r, how);
+        int ret = sock->protocol_ops->shutdown(sock,
+                                              r->worker ? r : NULL,
+                                              how);
         if (ret != REQ_PENDING)
             req_notify(r, ret);
         return;
@@ -884,75 +909,79 @@ void socket_process_shutdown_request(req* r)
         sock->flag.close_send = 1;
         break;
     default:
-        socket_fail_request(r, EINVAL);
+        req_notify(r, -EINVAL);
         return;
     }
 
     req_notify(r, 0);
 }
 
-void socket_process_setsockopt_request(req* r)
+void socket_process_setsockopt_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     int level = r->argv.setsockopt.level;
     int optname = r->argv.setsockopt.optname;
-    const void* optval = r->argv.setsockopt.optval;
+    const void *optval = r->argv.setsockopt.optval;
     socklen_t optlen = r->argv.setsockopt.optlen;
 
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
 
     if (optval == NULL) {
-        socket_fail_request(r, EFAULT);
+        req_notify(r, -EFAULT);
         return;
     }
     if (optlen == 0) {
-        socket_fail_request(r, EINVAL);
+        req_notify(r, -EINVAL);
         return;
     }
 
     if (!sock->protocol_ops || !sock->protocol_ops->setsockopt) {
-        socket_fail_request(r, ENOPROTOOPT);
+        req_notify(r, -ENOPROTOOPT);
         return;
     }
 
-    int ret = sock->protocol_ops->setsockopt(sock, r, level, optname, optval, optlen);
+    int ret = sock->protocol_ops->setsockopt(
+        sock, r->worker ? r : NULL, level, optname, optval,
+        optlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
 }
 
-void socket_process_getsockopt_request(req* r)
+void socket_process_getsockopt_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     int level = r->argv.getsockopt.level;
     int optname = r->argv.getsockopt.optname;
-    void* optval = r->argv.getsockopt.optval;
-    socklen_t* optlen = r->argv.getsockopt.optlen;
+    void *optval = r->argv.getsockopt.optval;
+    socklen_t *optlen = r->argv.getsockopt.optlen;
 
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
     if (!optval || !optlen) {
-        socket_fail_request(r, EFAULT);
+        req_notify(r, -EFAULT);
         return;
     }
     if (*optlen == 0) {
-        socket_fail_request(r, EINVAL);
+        req_notify(r, -EINVAL);
         return;
     }
 
     if (!sock->protocol_ops || !sock->protocol_ops->getsockopt) {
-        socket_fail_request(r, ENOPROTOOPT);
+        req_notify(r, -ENOPROTOOPT);
         return;
     }
 
-    int ret = sock->protocol_ops->getsockopt(sock, r, level, optname, optval, optlen);
+    int ret = sock->protocol_ops->getsockopt(
+        sock, r->worker ? r : NULL, level, optname, optval,
+        optlen);
     if (ret != REQ_PENDING) {
         req_notify(r, ret);
     }
@@ -960,14 +989,14 @@ void socket_process_getsockopt_request(req* r)
 
 
 
-void socket_process_fcntl_request(req* r)
+void socket_process_fcntl_request(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     int cmd = r->argv.fcntl.cmd;
 
-    Socket* sock = (Socket*)entry->value;
+    Socket *sock = (Socket*)entry->value;
     if (!sock) {
-        socket_fail_request(r, EBADF);
+        req_notify(r, -EBADF);
         return;
     }
 
@@ -982,14 +1011,14 @@ void socket_process_fcntl_request(req* r)
         return;
     }
     default:
-        socket_fail_request(r, EINVAL);
+        req_notify(r, -EINVAL);
         return;
     }
 }
 
 /* ── Tuple 安装、绑定和本地地址管理 ─────────────────────── */
 
-bool install_tuple(Socket* sock, hash* table)
+bool install_tuple(Socket *sock, hash *table)
 {
     if (sock->flag.is_hash) {
         if (!uninstall_tuple(sock, table)) {
@@ -1007,10 +1036,10 @@ bool install_tuple(Socket* sock, hash* table)
     uint32_t index = hash_bucket_index(table, value);
     HASH_BUCKET_WRLOCK(table, index);
 
-    hash_node* node = hash_find_node_locked(table, index, &key, value);
-    tuple_entry* entry = node
+    hash_node *node = hash_find_node_locked(table, index, &key, value);
+    tuple_entry *entry = node
         ? HASH_CONTAINER_OF(node, tuple_entry, hash_node) : NULL;
-    list_node* head = entry ? entry->sockets : NULL;
+    list_node *head = entry ? entry->sockets : NULL;
 
     if (head) {
         static const uint8_t zero6[16];
@@ -1030,8 +1059,8 @@ bool install_tuple(Socket* sock, hash* table)
             return false;
         }
 
-        for (list_node* n = head; n; n = n->next) {
-            Socket* member = (Socket*)((uint8_t*)n - offsetof(Socket, tuple_node));
+        for (list_node *n = head; n; n = n->next) {
+            Socket *member = (Socket*)((uint8_t*)n - offsetof(Socket, tuple_node));
             if (!member->options.reuseport) {
                 HASH_BUCKET_UNLOCK(table, index);
                 return false;
@@ -1066,11 +1095,11 @@ bool install_tuple(Socket* sock, hash* table)
     return true;
 }
 
-bool uninstall_tuple(Socket* sock, hash* table)
+bool uninstall_tuple(Socket *sock, hash *table)
 {
     if (!sock->flag.is_hash)
         return true;
-    tuple_entry* entry = sock->tuple_entry;
+    tuple_entry *entry = sock->tuple_entry;
     if (!entry) {
         ERR_LOG("uninstall_tuple: not found");
         return false;
@@ -1079,7 +1108,7 @@ bool uninstall_tuple(Socket* sock, hash* table)
     uint32_t index = hash_bucket_index(table, entry->hash_node.hash);
     HASH_BUCKET_WRLOCK(table, index);
 
-    list_node* head = entry->sockets;
+    list_node *head = entry->sockets;
     if (!entry->hash_node.pprev || !head) {
         ERR_LOG("uninstall_tuple: entry is not in the tuple table");
         HASH_BUCKET_UNLOCK(table, index);
@@ -1087,7 +1116,7 @@ bool uninstall_tuple(Socket* sock, hash* table)
     }
 
     bool node_found = false;
-    for (list_node* node = head; node; node = node->next) {
+    for (list_node *node = head; node; node = node->next) {
         if (node == &sock->tuple_node) {
             node_found = true;
             break;
@@ -1120,8 +1149,8 @@ bool uninstall_tuple(Socket* sock, hash* table)
     return true;
 }
 
-static void socket_set_bind_reservation(Socket* sock, const addr_key* key,
-                                        bind_slot* reservation)
+static void socket_set_bind_reservation(Socket *sock, const addr_key *key,
+                                        bind_slot *reservation)
 {
     if (key->family == AF_INET6)
         memcpy(sock->sip6, key->addr6, 16);
@@ -1133,12 +1162,12 @@ static void socket_set_bind_reservation(Socket* sock, const addr_key* key,
     sock->flag.is_bound = 1;
 }
 
-bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table)
+bool bind_saddr(Socket *sock, const addr_key *key, bind_table *bound_table)
 {
     if (sock->bind_reservation)
         return false;
 
-    bind_slot* reservation = socket_bind_reserve(
+    bind_slot *reservation = socket_bind_reserve(
         bound_table, key, sock->options.reuseaddr || sock->options.reuseport);
     if (!reservation)
         return false;
@@ -1147,20 +1176,20 @@ bool bind_saddr(Socket* sock, const addr_key* key, bind_table* bound_table)
     return true;
 }
 
-int socket_bind_local(Socket* sock, const struct sockaddr_in* addr,
-                      socklen_t addrlen, bind_table* bound_table)
+int socket_bind_local(Socket *sock, const struct sockaddr_in *addr,
+                      socklen_t addrlen, bind_table *bound_table)
 {
     if (sock->flag.is_bound)
         return -EINVAL;
 
     bool is_v6 = sock->family == AF_INET6;
-    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
+    const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6*)addr;
     if (addrlen < (is_v6 ? sizeof(*addr6) : sizeof(*addr)))
         return -EINVAL;
     if (addr->sin_family != sock->family)
         return -EAFNOSUPPORT;
 
-    const uint8_t* ip = is_v6 ? (const uint8_t*)&addr6->sin6_addr
+    const uint8_t *ip = is_v6 ? (const uint8_t*)&addr6->sin6_addr
                               : (const uint8_t*)&addr->sin_addr.s_addr;
     uint32_t scope_id = is_v6 ? addr6->sin6_scope_id : 0;
     if (is_v6 && IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr) && !scope_id) {
@@ -1200,13 +1229,13 @@ int socket_bind_local(Socket* sock, const struct sockaddr_in* addr,
     return bind_saddr(sock, &key, bound_table) ? 0 : -EADDRINUSE;
 }
 
-bool bind_exist(const addr_key* key, const bind_table* bound_table)
+bool bind_exist(const addr_key *key, const bind_table *bound_table)
 {
-    bind_slot* slot = socket_bind_find(bound_table, key);
+    bind_slot *slot = socket_bind_find(bound_table, key);
     return slot && atomic_load_explicit(&slot->count,
                                         memory_order_acquire) != 0;
 }
-bool unbind_saddr(Socket* sock, bind_table* bound_table)
+bool unbind_saddr(Socket *sock, bind_table *bound_table)
 {
     if (!sock->bind_reservation)
         return false;
@@ -1220,9 +1249,9 @@ bool unbind_saddr(Socket* sock, bind_table* bound_table)
     return true;
 }
 
-Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport,
+Socket *search_socket_by_tuple(uint32_t saddr, uint16_t sport,
                                uint32_t daddr, uint16_t dport,
-                               hash* table, worker** socket_worker)
+                               hash *table, worker ** socket_worker)
 {
     tuple_key4 key = {
         .saddr = saddr,
@@ -1234,11 +1263,11 @@ Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport,
     uint32_t index = hash_bucket_index(table, value);
     HASH_BUCKET_RDLOCK(table, index);
 
-    hash_node* hash_entry = hash_find_node_locked(table, index, &key, value);
-    tuple_entry* entry = hash_entry
+    hash_node *hash_entry = hash_find_node_locked(table, index, &key, value);
+    tuple_entry *entry = hash_entry
         ? HASH_CONTAINER_OF(hash_entry, tuple_entry, hash_node) : NULL;
-    list_node* socket_node = entry ? entry->sockets : NULL;
-    Socket* sock = socket_node
+    list_node *socket_node = entry ? entry->sockets : NULL;
+    Socket *sock = socket_node
         ? (Socket*)((uint8_t*)socket_node - offsetof(Socket, tuple_node)) : NULL;
     if (socket_worker)
         *socket_worker = sock ? sock->owner : NULL;
@@ -1247,9 +1276,9 @@ Socket* search_socket_by_tuple(uint32_t saddr, uint16_t sport,
     return sock;
 }
 
-Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
+Socket *search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
                                 const uint8_t daddr[16], uint16_t dport,
-                                hash* table, worker** socket_worker)
+                                hash *table, worker ** socket_worker)
 {
     tuple_key6 key = {
         .sport = sport,
@@ -1262,11 +1291,11 @@ Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
     uint32_t index = hash_bucket_index(table, value);
     HASH_BUCKET_RDLOCK(table, index);
 
-    hash_node* hash_entry = hash_find_node_locked(table, index, &key, value);
-    tuple_entry* entry = hash_entry
+    hash_node *hash_entry = hash_find_node_locked(table, index, &key, value);
+    tuple_entry *entry = hash_entry
         ? HASH_CONTAINER_OF(hash_entry, tuple_entry, hash_node) : NULL;
-    list_node* socket_node = entry ? entry->sockets : NULL;
-    Socket* sock = socket_node
+    list_node *socket_node = entry ? entry->sockets : NULL;
+    Socket *sock = socket_node
         ? (Socket*)((uint8_t*)socket_node - offsetof(Socket, tuple_node)) : NULL;
     if (socket_worker)
         *socket_worker = sock ? sock->owner : NULL;
@@ -1277,7 +1306,7 @@ Socket* search_socket_by_tuple6(const uint8_t saddr[16], uint16_t sport,
 
 /* ── 路由和 SOL_SOCKET 选项 ────────────────────────────── */
 
-bool socket_route_is_valid(const Socket* sock, const uint8_t* dest_ip,
+bool socket_route_is_valid(const Socket *sock, const uint8_t *dest_ip,
                            uint32_t scope_id)
 {
     return route_cache_key_matches(sock->route, sock->route_generation,
@@ -1285,21 +1314,36 @@ bool socket_route_is_valid(const Socket* sock, const uint8_t* dest_ip,
                                    sock->route_scope_id, dest_ip, scope_id);
 }
 
-int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id)
+static void socket_refresh_metrics(Socket *sock, const uint8_t *dest_ip)
+{
+    ip_metrics *metrics = ip_metrics_get(
+        sock->family, dest_ip, sock->route ? sock->route->ifindex : 0);
+    if (metrics != sock->metrics) {
+        PUT_REF(sock->metrics);
+        sock->metrics = metrics;
+    } else {
+        PUT_REF(metrics);
+    }
+}
+
+int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
 {
     uint64_t generation = route_table_generation(sock->family);
 
     if (sock->family == AF_INET6) {
-        if (socket_route_is_valid(sock, dest_ip, scope_id))
+        if (socket_route_is_valid(sock, dest_ip, scope_id)) {
+            socket_refresh_metrics(sock, dest_ip);
             return 0;
+        }
 
         route_key key = { .ip_family = AF_INET6 };
         key.ifindex = scope_id;
         memcpy(key.dip, dest_ip, 16);
-        route_info* route = search_route_table(&key);
+        route_info *route = search_route_table(&key);
         if (!route) {
             PUT_REF(sock->route);
             sock->route = NULL;
+            PUT_REF(sock->metrics);
             sock->route_generation = generation;
             return -1;
         }
@@ -1312,18 +1356,22 @@ int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id)
         sock->route_generation = generation;
         memcpy(sock->route_dest, dest_ip, 16);
         sock->route_scope_id = scope_id;
+        socket_refresh_metrics(sock, dest_ip);
         return 0;
     }
 
     /* IPv4 */
-    if (socket_route_is_valid(sock, dest_ip, scope_id))
+    if (socket_route_is_valid(sock, dest_ip, scope_id)) {
+        socket_refresh_metrics(sock, dest_ip);
         return 0;
+    }
     route_key key = { .ip_family = AF_INET };
     memcpy(key.dip, dest_ip, 4);
-    route_info* route = search_route_table(&key);
+    route_info *route = search_route_table(&key);
     if (!route) {
         PUT_REF(sock->route);
         sock->route = NULL;
+        PUT_REF(sock->metrics);
         sock->route_generation = generation;
         return -1;
     }
@@ -1336,19 +1384,20 @@ int set_socket_route(Socket* sock, const uint8_t* dest_ip, uint32_t scope_id)
     sock->route_generation = generation;
     memcpy(sock->route_dest, dest_ip, 4);
     sock->route_scope_id = 0;
+    socket_refresh_metrics(sock, dest_ip);
     return 0;
 }
 
-static bool socket_timeval_valid(const struct timeval* tv)
+static bool socket_timeval_valid(const struct timeval *tv)
 {
     return tv->tv_sec >= 0 && tv->tv_usec >= 0 && tv->tv_usec < 1000000;
 }
 
-int socket_setsockopt(struct Socket* sock, int level, int optname, const void* optval, socklen_t optlen){
+int socket_setsockopt(struct Socket *sock, int level, int optname, const void *optval, socklen_t optlen) {
     const int *ival = (const int *)optval;
-    if(level!=SOL_SOCKET)
+    if (level!=SOL_SOCKET)
         return -ENOPROTOOPT;
-    switch(optname){
+    switch (optname) {
         case SO_REUSEADDR: {
             if (optlen < (socklen_t)sizeof(int))
                 return -EINVAL;
@@ -1388,7 +1437,7 @@ int socket_setsockopt(struct Socket* sock, int level, int optname, const void* o
         case SO_RCVTIMEO: {
             if (optlen < (socklen_t)sizeof(struct timeval))
                 return -EINVAL;
-            const struct timeval* tv = optval;
+            const struct timeval *tv = optval;
             if (!socket_timeval_valid(tv))
                 return -EINVAL;
             sock->recv_timeout = *tv;
@@ -1398,7 +1447,7 @@ int socket_setsockopt(struct Socket* sock, int level, int optname, const void* o
         case SO_SNDTIMEO: {
             if (optlen < (socklen_t)sizeof(struct timeval))
                 return -EINVAL;
-            const struct timeval* tv = optval;
+            const struct timeval *tv = optval;
             if (!socket_timeval_valid(tv))
                 return -EINVAL;
             sock->send_timeout = *tv;
@@ -1412,10 +1461,10 @@ int socket_setsockopt(struct Socket* sock, int level, int optname, const void* o
             return 0;
         }
         case SO_LINGER: {
-           
+
             if (optlen < (socklen_t)sizeof(struct linger))
                 return -EINVAL;
-            const struct linger* linger = optval;
+            const struct linger *linger = optval;
             if (linger->l_linger < 0)
                 return -EINVAL;
             sock->options.linger = linger->l_onoff != 0;
@@ -1424,13 +1473,13 @@ int socket_setsockopt(struct Socket* sock, int level, int optname, const void* o
         }
         default:
             return -ENOPROTOOPT;
-    }  
+    }
 }
 
 /* SOL_SOCKET getsockopt helper: return 0 on success, negative errno on failure.
  * Caller must pass in/out optlen like standard getsockopt.
  */
-int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval, socklen_t* optlen)
+int socket_getsockopt(struct Socket *sock, int level, int optname, void *optval, socklen_t *optlen)
 {
     if (level != SOL_SOCKET)
         return -ENOPROTOOPT;
@@ -1503,8 +1552,8 @@ int socket_getsockopt(struct Socket* sock, int level, int optname, void* optval,
     }
 }
 
-int socket_auto_bind(Socket* sock, bind_table* bound_table,
-                     const addr_key* local_key, const uint8_t* dest_ip,
+int socket_auto_bind(Socket *sock, bind_table *bound_table,
+                     const addr_key *local_key, const uint8_t *dest_ip,
                      uint16_t dest_port, uint32_t scope_id)
 {
     /* sock and bound_table are supplied by the protocol/socket layer.
@@ -1542,13 +1591,13 @@ int socket_auto_bind(Socket* sock, bind_table* bound_table,
 
         if (dest_ip) {
             /* When the peer is known, keep the final tuple on this worker. */
-            worker* tuple_worker = rss_select_worker_by_tuple(sock->family,
+            worker *tuple_worker = rss_select_worker_by_tuple(sock->family,
                 key.addr6, dest_ip, key.port, dest_port);
             if (tuple_worker != get_current_worker())
                 continue;
         }
 
-        bind_slot* reservation = socket_bind_reserve(bound_table, &key, reuse);
+        bind_slot *reservation = socket_bind_reserve(bound_table, &key, reuse);
         if (!reservation)
             continue;
 
@@ -1561,10 +1610,10 @@ int socket_auto_bind(Socket* sock, bind_table* bound_table,
 }
 /* ── 负载均衡和 skb 关联 ──────────────────────────────── */
 
-Socket* socket_select(Socket* first_sock, uint32_t hash){
+Socket *socket_select(Socket *first_sock, uint32_t hash) {
     Socket *aim = first_sock;
     uint32_t count = 1;
-    for (list_node* n = first_sock->tuple_node.next; n; n = n->next) {
+    for (list_node *n = first_sock->tuple_node.next; n; n = n->next) {
         count++;
         /* Reservoir sampling selects one tuple member in a single pass. */
         hash = hash * 1664525u + 1013904223u;
@@ -1573,7 +1622,7 @@ Socket* socket_select(Socket* first_sock, uint32_t hash){
     }
     return aim;
 }
-void set_skb_by_socket(skbuff* skb, Socket* sock){
+void set_skb_by_socket(skbuff *skb, Socket *sock) {
     skb->sock = sock;
     skb->family = sock->family;
     skb->protocol = sock->protocol;
@@ -1583,4 +1632,3 @@ void set_skb_by_socket(skbuff* skb, Socket* sock){
     memcpy(skb->route_dest, sock->route_dest, sizeof(skb->route_dest));
     skb->route_scope_id = sock->route_scope_id;
 }
-

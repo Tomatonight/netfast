@@ -12,7 +12,7 @@
 #include "skbuff.h"
 #include "worker.h"
 
-int loopback_create(if_info* info, struct nlmsghdr *nlh)
+int loopback_create(if_info *info, struct nlmsghdr *nlh)
 {
     struct ifinfomsg *ifinfo = (struct ifinfomsg *)NLMSG_DATA(nlh);
 
@@ -23,7 +23,7 @@ int loopback_create(if_info* info, struct nlmsghdr *nlh)
     return 0;
 }
 
-void loopback_update(if_info* info, struct nlmsghdr *nlh)
+void loopback_update(if_info *info, struct nlmsghdr *nlh)
 {
     struct ifinfomsg *ifinfo = (struct ifinfomsg *)NLMSG_DATA(nlh);
 
@@ -31,15 +31,15 @@ void loopback_update(if_info* info, struct nlmsghdr *nlh)
     info->flags = ifinfo->ifi_flags;
 }
 
-static int loopback_recv_skb(skbuff* skb)
+static int loopback_recv_skb(skbuff *skb)
 {
     return skb->family == AF_INET6 ? ipv6_recv(skb) : ipv4_recv(skb);
 }
 
-int loopback_send(if_info* info, skbuff* skb)
+int loopback_send(if_info *info, skbuff *skb)
 {
     (void)info;
-    worker* rx_worker = get_current_worker();
+    worker *rx_worker = get_current_worker();
     if (!rx_worker) {
         errno = ENETDOWN;
         return -ENETDOWN;
@@ -65,7 +65,7 @@ int loopback_init(void)
     /* Create and publish the interface under the list lock.  Address helpers
      * acquire the same lock internally, so they must run after it is
      * released; pthread rwlocks are not recursive. */
-    if_info* lo = if_create_virtual_loopback();
+    if_info *lo = if_create_virtual_loopback();
     if (!lo) {
         IF_UNLOCK();
         ERR_LOG("loopback_init: failed to create loopback interface");

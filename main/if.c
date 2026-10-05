@@ -22,7 +22,7 @@
 
 typedef struct if_l2_ops {
     int if_type;
-    const if_ops* ops;
+    const if_ops *ops;
 } if_l2_ops;
 
 static const if_l2_ops g_l2_ops[] = {
@@ -33,15 +33,15 @@ static const if_l2_ops g_l2_ops[] = {
 static list_node g_if_list;
 pthread_rwlock_t g_if_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
-static inline uint32_t if_load_ipv4(const uint8_t* ip)
+static inline uint32_t if_load_ipv4(const uint8_t *ip)
 {
     uint32_t value;
     memcpy(&value, ip, sizeof(value));
     return value;
 }
 
-static bool if_addr_equal(const if_addr* addr, sa_family_t family,
-                          const uint8_t* ip)
+static bool if_addr_equal(const if_addr *addr, sa_family_t family,
+                          const uint8_t *ip)
 {
     if (addr->ip_family != family)
         return false;
@@ -51,7 +51,7 @@ static bool if_addr_equal(const if_addr* addr, sa_family_t family,
 }
 
 /* Derive scope from an IP address (simplified, mirrors kernel logic). */
-static uint8_t if_ip_scope(sa_family_t family, const uint8_t* ip)
+static uint8_t if_ip_scope(sa_family_t family, const uint8_t *ip)
 {
     if (family == AF_INET) {
         uint32_t v4 = if_load_ipv4(ip);
@@ -72,7 +72,7 @@ static uint8_t if_ip_scope(sa_family_t family, const uint8_t* ip)
     return ADDR_SCOPE_GLOBAL;
 }
 
-static const if_ops* if_ops_for_type(int if_type)
+static const if_ops *if_ops_for_type(int if_type)
 {
     for (uint32_t i = 0; i < sizeof(g_l2_ops) / sizeof(g_l2_ops[0]); ++i) {
         if (g_l2_ops[i].if_type == if_type)
@@ -86,7 +86,7 @@ static inline bool if_is_up(uint32_t flags)
     return (flags & IFF_UP) != 0;
 }
 
-static bool if_hw_rx_checksum_enabled(const if_info* info)
+static bool if_hw_rx_checksum_enabled(const if_info *info)
 {
     if (!info->name[0])
         return false;
@@ -106,7 +106,7 @@ static bool if_hw_rx_checksum_enabled(const if_info* info)
     return enabled;
 }
 
-static void if_update_checksum_features(if_info* info)
+static void if_update_checksum_features(if_info *info)
 {
     uint64_t xsk_features = 0;
     int ret = netlink_get_xsk_features((uint32_t)info->ifindex, &xsk_features);
@@ -123,10 +123,10 @@ static void if_update_checksum_features(if_info* info)
               info->hw_rx_checksum_enabled);
 }
 
-static void if_clear_addr_list(if_info* info)
+static void if_clear_addr_list(if_info *info)
 {
-    if_addr* addr;
-    list_node* tmp_node;
+    if_addr *addr;
+    list_node *tmp_node;
 
     FOR_EACH_LIST_SAFE_OFFSET(&info->addr_list, addr, tmp_node, if_addr, list) {
         remove_list_node(&addr->list);
@@ -134,10 +134,10 @@ static void if_clear_addr_list(if_info* info)
     }
 }
 
-static bool if_delete_addr(if_info* info, sa_family_t family, const uint8_t* ip)
+static bool if_delete_addr(if_info *info, sa_family_t family, const uint8_t *ip)
 {
-    if_addr* addr;
-    list_node* tmp_node;
+    if_addr *addr;
+    list_node *tmp_node;
 
     IF_WRLOCK();
     FOR_EACH_LIST_SAFE_OFFSET(&info->addr_list, addr, tmp_node, if_addr, list) {
@@ -152,10 +152,10 @@ static bool if_delete_addr(if_info* info, sa_family_t family, const uint8_t* ip)
     return false;
 }
 
-bool if_add_addr(if_info* info, sa_family_t family, const uint8_t* ip,
+bool if_add_addr(if_info *info, sa_family_t family, const uint8_t *ip,
                  uint32_t prefix_len, uint8_t scope, bool primary)
 {
-    if_addr* addr;
+    if_addr *addr;
 
     IF_WRLOCK();
     FOR_EACH_LIST_OFFSET(&info->addr_list, addr, if_addr, list) {
@@ -188,11 +188,11 @@ bool if_add_addr(if_info* info, sa_family_t family, const uint8_t* ip,
     return true;
 }
 
-bool if_has_addr(if_info* info, sa_family_t family, const uint8_t* ip)
+bool if_has_addr(if_info *info, sa_family_t family, const uint8_t *ip)
 {
     bool found = false;
     IF_RDLOCK();
-    if_addr* addr;
+    if_addr *addr;
     FOR_EACH_LIST_OFFSET(&info->addr_list, addr, if_addr, list) {
         if (if_addr_equal(addr, family, ip)) {
             found = true;
@@ -211,7 +211,7 @@ static bool if_subnet_matches_v4(uint32_t sip, uint32_t prefix_len, uint32_t dip
     return (ntohl(sip) & mask) == (ntohl(dip) & mask);
 }
 
-static bool if_subnet_matches_v6(const uint8_t* sip, uint32_t prefix_len, const uint8_t* dip)
+static bool if_subnet_matches_v6(const uint8_t *sip, uint32_t prefix_len, const uint8_t *dip)
 {
     if (prefix_len > 128)
         return false;
@@ -227,7 +227,7 @@ static bool if_subnet_matches_v6(const uint8_t* sip, uint32_t prefix_len, const 
     return (sip[full_bytes] & mask8) == (dip[full_bytes] & mask8);
 }
 
-static bool if_addr_better(const if_addr* candidate, const if_addr* current,
+static bool if_addr_better(const if_addr *candidate, const if_addr *current,
                            uint8_t daddr_scope)
 {
     if (!current)
@@ -242,7 +242,7 @@ static bool if_addr_better(const if_addr* candidate, const if_addr* current,
     return candidate->prefix_len > current->prefix_len;
 }
 
-static void if_copy_addr(const if_addr* addr, uint8_t* dst)
+static void if_copy_addr(const if_addr *addr, uint8_t *dst)
 {
     if (addr->ip_family == AF_INET6)
         memcpy(dst, addr->ipv6, sizeof(addr->ipv6));
@@ -250,12 +250,12 @@ static void if_copy_addr(const if_addr* addr, uint8_t* dst)
         memcpy(dst, &addr->ipv4, sizeof(addr->ipv4));
 }
 
-bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
-                                   const uint8_t* daddr, uint8_t* saddr)
+bool if_search_best_saddr_by_daddr(if_info *info, sa_family_t family,
+                                   const uint8_t *daddr, uint8_t *saddr)
 {
-    if_addr* addr;
-    if_addr* best = NULL;
-    if_addr* best_fallback = NULL;
+    if_addr *addr;
+    if_addr *best = NULL;
+    if_addr *best_fallback = NULL;
     uint8_t daddr_scope = if_ip_scope(family, daddr);
 
     memset(saddr, 0, 16);
@@ -285,42 +285,42 @@ bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
             best_fallback = addr;
         }
     }
-    const if_addr* selected = best ? best : best_fallback;
+    const if_addr *selected = best ? best : best_fallback;
     if (selected)
         if_copy_addr(selected, saddr);
     IF_UNLOCK();
     return selected != NULL;
 }
 
-static int if_up_cb(void* arg)
+static int if_up_cb(void *arg)
 {
-    if_info* info = (if_info*)arg;
+    if_info *info = (if_info*)arg;
     if (info->ops->up)
         return info->ops->up(info);
     return 0;
 }
 
-static int if_down_cb(void* arg)
+static int if_down_cb(void *arg)
 {
-    if_info* info = (if_info*)arg;
+    if_info *info = (if_info*)arg;
     if (info->ops->down)
         return info->ops->down(info);
     return 0;
 }
 
-static void if_notify_change(if_info* info, int (*cb)(void*))
+static void if_notify_change(if_info *info, int (*cb)(void*))
 {
-    worker* cur = get_current_worker();
+    worker *cur = get_current_worker();
 
     for (int i = 0; i < g_worker_num; ++i) {
-        worker* w = &g_workers[i];
+        worker *w = &g_workers[i];
         if (w == cur)
             continue;
         submit_req_2_worker(w, info, cb, true);
     }
 }
 
-static void if_up(if_info* info)
+static void if_up(if_info *info)
 {
     if_update_checksum_features(info);
     if (info->ops->up)
@@ -328,18 +328,18 @@ static void if_up(if_info* info)
     if_notify_change(info, if_up_cb);
 }
 
-static void if_down(if_info* info)
+static void if_down(if_info *info)
 {
     if_notify_change(info, if_down_cb);
     if (info->ops->down)
         (void)info->ops->down(info);
 }
 
-static if_info* if_create_from_netlink(struct nlmsghdr* nlh)
+static if_info *if_create_from_netlink(struct nlmsghdr *nlh)
 {
-    struct ifinfomsg* ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
-    const if_ops* ops = if_ops_for_type(ifinfo->ifi_type);
-    if_info* info;
+    struct ifinfomsg *ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
+    const if_ops *ops = if_ops_for_type(ifinfo->ifi_type);
+    if_info *info;
 
     if (!ops)
         return NULL;
@@ -356,11 +356,11 @@ static if_info* if_create_from_netlink(struct nlmsghdr* nlh)
 /* Locking: acquires g_if_rwlock internally.  Interface state transitions are
  * reported to the caller rather than acted on here: starting/stopping XDP can
  * generate netlink events, so it must never run while holding this lock. */
-static int if_update(struct nlmsghdr* nlh, if_info** changed_info,
-                     bool* bring_up, bool* bring_down)
+static int if_update(struct nlmsghdr *nlh, if_info ** changed_info,
+                     bool *bring_up, bool *bring_down)
 {
-    struct ifinfomsg* ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
-    if_info* info;
+    struct ifinfomsg *ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
+    if_info *info;
 
     *changed_info = NULL;
     *bring_up = false;
@@ -407,11 +407,11 @@ static int if_update(struct nlmsghdr* nlh, if_info** changed_info,
 /* Locking: acquires g_if_rwlock internally for g_if_list manipulation.
  * The removed list reference is returned to the caller, which performs
  * the potentially re-entrant teardown unlocked. */
-static int if_delete(struct nlmsghdr* nlh, if_info** deleted_info,
-                     bool* was_up)
+static int if_delete(struct nlmsghdr *nlh, if_info ** deleted_info,
+                     bool *was_up)
 {
-    struct ifinfomsg* ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
-    if_info* info;
+    struct ifinfomsg *ifinfo = (struct ifinfomsg*)NLMSG_DATA(nlh);
+    if_info *info;
 
     *deleted_info = NULL;
     *was_up = false;
@@ -431,10 +431,10 @@ static int if_delete(struct nlmsghdr* nlh, if_info** deleted_info,
     return -1;
 }
 
-int parse_link_event(struct nlmsghdr* nlh)
+int parse_link_event(struct nlmsghdr *nlh)
 {
     int ret = 0;
-    if_info* changed_info = NULL;
+    if_info *changed_info = NULL;
     bool bring_up = false;
     bool bring_down = false;
 
@@ -461,12 +461,12 @@ int parse_link_event(struct nlmsghdr* nlh)
     return ret;
 }
 
-int parse_addr_event(struct nlmsghdr* nlh)
+int parse_addr_event(struct nlmsghdr *nlh)
 {
-    struct ifaddrmsg* ifa = (struct ifaddrmsg*)NLMSG_DATA(nlh);
-    struct rtattr* rta;
+    struct ifaddrmsg *ifa = (struct ifaddrmsg*)NLMSG_DATA(nlh);
+    struct rtattr *rta;
     int rta_len = IFA_PAYLOAD(nlh);
-    if_info* info;
+    if_info *info;
     bool have_local = false, have_addr = false;
     uint32_t ipv4_local = 0, ipv4_addr = 0;
     uint8_t  ipv6_local[16] = {0}, ipv6_addr[16] = {0};
@@ -504,7 +504,7 @@ int parse_addr_event(struct nlmsghdr* nlh)
     bool primary = !(ifa_flags & IFA_F_SECONDARY);
 
     if (have_local || have_addr) {
-        const uint8_t* ip;
+        const uint8_t *ip;
         uint32_t ipv4;
         if (ifa->ifa_family == AF_INET6) {
             ip = have_local ? ipv6_local : ipv6_addr;
@@ -523,9 +523,9 @@ int parse_addr_event(struct nlmsghdr* nlh)
     return 0;
 }
 
-if_info* search_if_by_name(const char* name)
+if_info *search_if_by_name(const char *name)
 {
-    if_info* info;
+    if_info *info;
 
     IF_RDLOCK();
     FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
@@ -539,9 +539,9 @@ if_info* search_if_by_name(const char* name)
     return NULL;
 }
 
-if_info* search_if_by_index(uint32_t ifindex)
+if_info *search_if_by_index(uint32_t ifindex)
 {
-    if_info* info;
+    if_info *info;
 
     IF_RDLOCK();
     FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
@@ -559,7 +559,7 @@ bool if_has_loopback(void)
 {
     bool found = false;
     IF_RDLOCK();
-    if_info* info;
+    if_info *info;
     FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
         if (info->ops == &loopback_ops) {
             found = true;
@@ -570,10 +570,10 @@ bool if_has_loopback(void)
     return found;
 }
 
-bool if_address_exists(sa_family_t family, const uint8_t* ip, uint32_t ifindex)
+bool if_address_exists(sa_family_t family, const uint8_t *ip, uint32_t ifindex)
 {
-    if_info* info;
-    if_addr* addr;
+    if_info *info;
+    if_addr *addr;
 
     IF_RDLOCK();
     FOR_EACH_LIST_OFFSET(&g_if_list, info, if_info, list) {
@@ -590,9 +590,9 @@ bool if_address_exists(sa_family_t family, const uint8_t* ip, uint32_t ifindex)
     return false;
 }
 
-if_info* if_create_virtual_loopback(void)
+if_info *if_create_virtual_loopback(void)
 {
-    if_info* info;
+    if_info *info;
 
     CREATE_REF(if_info, lo, free);
     info = lo;

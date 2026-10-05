@@ -1,10 +1,10 @@
 #ifndef NETFAST_H
 #define NETFAST_H
 
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,9 +21,9 @@ typedef uint32_t net_event_mask;
 #define NET_EVENT_FIN       (UINT32_C(1) << 4)
 #define NET_EVENT_ERROR     (UINT32_C(1) << 5)
 
-/* Called on the worker that owns sock.  The callback receives the internal
- * socket object so protocol-specific, non-blocking operations can be used
- * without re-submitting a request to the same worker. */
+/* Called on the worker that owns sock.  Synchronous net_* calls made from this
+ * callback execute inline with non-blocking semantics; an operation that would
+ * wait returns EAGAIN or EINPROGRESS. */
 typedef void (*net_callback)(Socket *sock, net_event_mask events, void *arg);
 
 /* ── socket API ── */
@@ -168,12 +168,12 @@ int net_async_submit(int cq_fd, req *request);
 int net_async_result(const req *request, req_type *type);
 req_argv *net_async_argv(req *request);
 int net_async_wait(int cq_fd, req **requests,
-	                   uint32_t min_complete, uint32_t max_complete,
-	                   int total_timeout_ms);
+                       uint32_t min_complete, uint32_t max_complete,
+                       int total_timeout_ms);
 int net_async_close(int cq_fd);
 
-	#ifdef __cplusplus
-	}
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* NETFAST_H */

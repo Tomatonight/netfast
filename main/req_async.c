@@ -1,3 +1,5 @@
+#include "req_async.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -5,18 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "req_async.h"
 #include "fd_entry.h"
+#include "netfast.h"
 #include "stack.h"
 #include "worker.h"
-#include "netfast.h"
 
 typedef struct async_waiter {
-    struct async_waiter* next;
+    struct async_waiter *next;
     uint32_t need;
 } async_waiter;
 
-static void async_waiter_add(async_cq* cq, async_waiter* waiter)
+static void async_waiter_add(async_cq *cq, async_waiter *waiter)
 {
     waiter->next = cq->waiters;
     cq->waiters = waiter;
@@ -28,9 +29,9 @@ static void async_waiter_add(async_cq* cq, async_waiter* waiter)
                               memory_order_release);
 }
 
-static void async_waiter_remove(async_cq* cq, async_waiter* waiter)
+static void async_waiter_remove(async_cq *cq, async_waiter *waiter)
 {
-    async_waiter** link = &cq->waiters;
+    async_waiter ** link = &cq->waiters;
     while (*link != waiter) {
         assert(*link);
         link = &(*link)->next;
@@ -39,12 +40,12 @@ static void async_waiter_remove(async_cq* cq, async_waiter* waiter)
     waiter->next = NULL;
 
     unsigned int need = UINT_MAX;
-    for (async_waiter* it = cq->waiters; it; it = it->next)
+    for (async_waiter *it = cq->waiters; it; it = it->next)
         need = min(need, it->need);
     atomic_store_explicit(&cq->wait_need, need, memory_order_release);
 }
 
-static void async_notify_ready_waiters(async_cq* cq)
+static void async_notify_ready_waiters(async_cq *cq)
 {
     unsigned int need = atomic_load_explicit(&cq->wait_need,
                                               memory_order_acquire);
@@ -54,9 +55,9 @@ static void async_notify_ready_waiters(async_cq* cq)
         notify_queue_notify(&cq->completions);
 }
 
-static void async_req_free(req* r)
+static void async_req_free(req *r)
 {
-    fd_entry* entry = r->entry;
+    fd_entry *entry = r->entry;
     r->entry = NULL;
     PUT_REF(entry);
     pthread_cond_destroy(&r->done_cv);
@@ -65,7 +66,7 @@ static void async_req_free(req* r)
     free(r);
 }
 
-static void async_cq_destroy(async_cq* cq)
+static void async_cq_destroy(async_cq *cq)
 {
     assert(!cq->waiters);
     notify_queue_close(&cq->completions);
@@ -73,9 +74,9 @@ static void async_cq_destroy(async_cq* cq)
     free(cq);
 }
 
-static req* async_cq_pop(async_cq* cq)
+static req *async_cq_pop(async_cq *cq)
 {
-    mpscq_node* node = notify_queue_pop(&cq->completions);
+    mpscq_node *node = notify_queue_pop(&cq->completions);
     if (!node)
         return NULL;
 
@@ -84,7 +85,7 @@ static req* async_cq_pop(async_cq* cq)
     (void)old;
     assert(old != 0);
 
-    req* r = (req*)((uint8_t*)node -
+    req *r = (req*)((uint8_t*)node -
                     offsetof(req, async.completion_node));
     assert(LIST_ATTACHED(&r->async.submit_node));
     remove_list_node(&r->async.submit_node);
@@ -95,8 +96,8 @@ static req* async_cq_pop(async_cq* cq)
     return r;
 }
 
-static int async_submit_one(async_cq* cq, req* r,
-                            uint64_t* worker_mask)
+static int async_submit_one(async_cq *cq, req *r,
+                            uint64_t *worker_mask)
 {
     if (!r) {
         errno = EINVAL;
@@ -110,7 +111,7 @@ static int async_submit_one(async_cq* cq, req* r,
         return -1;
     }
 
-    worker* aim_worker;
+    worker *aim_worker;
     if (r->type == REQ_SOCKET) {
         aim_worker = worker_select_random();
     } else if (r->entry) {
@@ -160,7 +161,7 @@ static uint64_t async_add_ns(uint64_t now, uint64_t delta)
     return UINT64_MAX - now < delta ? UINT64_MAX : now + delta;
 }
 
-static int async_wait(fd_entry* entry, req** requests, uint32_t min,
+static int async_wait(fd_entry *entry, req ** requests, uint32_t min,
                       uint32_t max, int total_timeout_ms)
 {
     if (!requests || min == 0 || max < min || max > INT_MAX) {
@@ -176,7 +177,7 @@ static int async_wait(fd_entry* entry, req** requests, uint32_t min,
         : UINT64_MAX;
 
     mutex_lock(&entry->mtx);
-    async_cq* cq = (async_cq*)entry->value;
+    async_cq *cq = (async_cq*)entry->value;
     if (!cq) {
         mutex_unlock(&entry->mtx);
         errno = EBADF;
@@ -186,7 +187,7 @@ static int async_wait(fd_entry* entry, req** requests, uint32_t min,
     INC_REF(cq);
     for (;;) {
         while ((uint32_t)count < max) {
-            req* r = async_cq_pop(cq);
+            req *r = async_cq_pop(cq);
             if (!r)
                 break;
             requests[count++] = r;
@@ -217,7 +218,7 @@ static int async_wait(fd_entry* entry, req** requests, uint32_t min,
         mutex_unlock(&cq->waiters_mtx);
 
         struct timespec timeout;
-        struct timespec* timeout_ptr = NULL;
+        struct timespec *timeout_ptr = NULL;
         if (total_deadline != UINT64_MAX) {
             now = async_now_ns();
             uint64_t remaining = total_deadline > now
@@ -266,10 +267,10 @@ static int async_wait(fd_entry* entry, req** requests, uint32_t min,
     return count;
 }
 
-static int async_cancel_worker_requests(void* argv)
+static int async_cancel_worker_requests(void *argv)
 {
-    async_cq* cq = (async_cq*)argv;
-    req* r;
+    async_cq *cq = (async_cq*)argv;
+    req *r;
 
     FOR_EACH_LIST_OFFSET(&cq->submit_reqs, r, req,
                          async.submit_node) {
@@ -288,10 +289,10 @@ static int async_cancel_worker_requests(void* argv)
     return 0;
 }
 
-static int async_close(fd_entry* entry)
+static int async_close(fd_entry *entry)
 {
     mutex_lock(&entry->mtx);
-    async_cq* cq = (async_cq*)entry->value;
+    async_cq *cq = (async_cq*)entry->value;
     if (!cq) {
         mutex_unlock(&entry->mtx);
         errno = EBADF;
@@ -313,7 +314,7 @@ static int async_close(fd_entry* entry)
          * one visited earlier.  In that case the next pass orders a cancel
          * callback behind it on its new owner. */
         all_done = true;
-        req* pending;
+        req *pending;
         FOR_EACH_LIST_OFFSET(&cq->submit_reqs, pending, req,
                              async.submit_node) {
             spin_lock(&pending->done_mtx);
@@ -326,7 +327,7 @@ static int async_close(fd_entry* entry)
         }
     } while (!all_done);
 
-    req* r;
+    req *r;
     while ((r = async_cq_pop(cq)) != NULL)
         async_req_free(r);
 
@@ -360,7 +361,7 @@ int net_async_create(void)
         return -1;
     }
 
-    fd_entry* entry = alloc_fd_entry_with_worker(cq, &async_cq_fd_ops, NULL);
+    fd_entry *entry = alloc_fd_entry_with_worker(cq, &async_cq_fd_ops, NULL);
     if (!entry) {
         errno = EMFILE;
         PUT_REF(cq);
@@ -371,8 +372,8 @@ int net_async_create(void)
 
 /* ---- request construction ---- */
 
-static int async_copy_sockaddr(struct sockaddr_storage* dst,
-                         const struct sockaddr* src, socklen_t len)
+static int async_copy_sockaddr(struct sockaddr_storage *dst,
+                         const struct sockaddr *src, socklen_t len)
 {
     if (!src) {
         errno = EFAULT;
@@ -387,9 +388,9 @@ static int async_copy_sockaddr(struct sockaddr_storage* dst,
     return 0;
 }
 
-static req* async_create_request_va(int fd, req_type type, va_list ap)
+static req *async_create_request_va(int fd, req_type type, va_list ap)
 {
-    fd_entry* entry = NULL;
+    fd_entry *entry = NULL;
     if (type != REQ_SOCKET) {
         entry = hold_fd_entry(fd);
         if (!entry) {
@@ -398,7 +399,7 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
         }
     }
 
-    req* r = req_create();
+    req *r = req_create();
     if (!r) {
         PUT_REF(entry);
         return NULL;
@@ -414,35 +415,35 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
         r->argv.Socket.protocol = va_arg(ap, int);
         break;
     case REQ_BIND: {
-        const struct sockaddr* addr = va_arg(ap, const struct sockaddr*);
+        const struct sockaddr *addr = va_arg(ap, const struct sockaddr*);
         socklen_t len = va_arg(ap, socklen_t);
         r->argv.bind.addrlen = len;
         valid = async_copy_sockaddr(&r->argv.bind.addr, addr, len) == 0;
         break;
     }
     case REQ_CONNECT: {
-        const struct sockaddr* addr = va_arg(ap, const struct sockaddr*);
+        const struct sockaddr *addr = va_arg(ap, const struct sockaddr*);
         socklen_t len = va_arg(ap, socklen_t);
         r->argv.connect.addrlen = len;
         valid = async_copy_sockaddr(&r->argv.connect.addr, addr, len) == 0;
         break;
     }
     case REQ_LISTEN:
-        r->argv.listen = (typeof(r->argv.listen)){
+        r->argv.listen = (typeof(r->argv.listen)) {
             .backlog = va_arg(ap, int)};
         break;
     case REQ_ACCEPT:
-        r->argv.accept = (typeof(r->argv.accept)){
+        r->argv.accept = (typeof(r->argv.accept)) {
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_WRITE:
-        r->argv.write = (typeof(r->argv.write)){
+        r->argv.write = (typeof(r->argv.write)) {
             .buf = va_arg(ap, const void*),
             .len = va_arg(ap, uint32_t)};
         break;
     case REQ_READ:
-        r->argv.read = (typeof(r->argv.read)){
+        r->argv.read = (typeof(r->argv.read)) {
             .buf = va_arg(ap, void*),
             .len = va_arg(ap, uint32_t)};
         break;
@@ -450,7 +451,7 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
         r->argv.sendto.buf = va_arg(ap, const void*);
         r->argv.sendto.len = va_arg(ap, uint32_t);
         r->argv.sendto.flags = va_arg(ap, int);
-        const struct sockaddr* addr = va_arg(ap, const struct sockaddr*);
+        const struct sockaddr *addr = va_arg(ap, const struct sockaddr*);
         socklen_t len = va_arg(ap, socklen_t);
         r->argv.sendto.addrlen = len;
         if (addr) {
@@ -463,7 +464,7 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
         break;
     }
     case REQ_RECVFROM:
-        r->argv.recvfrom = (typeof(r->argv.recvfrom)){
+        r->argv.recvfrom = (typeof(r->argv.recvfrom)) {
             .buf = va_arg(ap, void*),
             .len = va_arg(ap, uint32_t),
             .flags = va_arg(ap, int),
@@ -471,37 +472,37 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_GETSOCKNAME:
-        r->argv.getsockname = (typeof(r->argv.getsockname)){
+        r->argv.getsockname = (typeof(r->argv.getsockname)) {
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_GETPEERNAME:
-        r->argv.getpeername = (typeof(r->argv.getpeername)){
+        r->argv.getpeername = (typeof(r->argv.getpeername)) {
             .addr = va_arg(ap, struct sockaddr*),
             .addrlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_CLOSE:
         break;
     case REQ_SHUTDOWN:
-        r->argv.shutdown = (typeof(r->argv.shutdown)){
+        r->argv.shutdown = (typeof(r->argv.shutdown)) {
             .how = va_arg(ap, int)};
         break;
     case REQ_SETSOCKOPT:
-        r->argv.setsockopt = (typeof(r->argv.setsockopt)){
+        r->argv.setsockopt = (typeof(r->argv.setsockopt)) {
             .level = va_arg(ap, int),
             .optname = va_arg(ap, int),
             .optval = va_arg(ap, const void*),
             .optlen = va_arg(ap, socklen_t)};
         break;
     case REQ_GETSOCKOPT:
-        r->argv.getsockopt = (typeof(r->argv.getsockopt)){
+        r->argv.getsockopt = (typeof(r->argv.getsockopt)) {
             .level = va_arg(ap, int),
             .optname = va_arg(ap, int),
             .optval = va_arg(ap, void*),
             .optlen = va_arg(ap, socklen_t*)};
         break;
     case REQ_FCNTL:
-        r->argv.fcntl = (typeof(r->argv.fcntl)){
+        r->argv.fcntl = (typeof(r->argv.fcntl)) {
             .cmd = va_arg(ap, int),
             .arg = va_arg(ap, int)};
         break;
@@ -519,20 +520,20 @@ static req* async_create_request_va(int fd, req_type type, va_list ap)
     return r;
 }
 
-req* net_async_req_create(int fd, req_type type, ...)
+req *net_async_req_create(int fd, req_type type, ...)
 {
     va_list ap;
     va_start(ap, type);
-    req* r = async_create_request_va(fd, type, ap);
+    req *r = async_create_request_va(fd, type, ap);
     va_end(ap);
     return r;
 }
 
-void net_async_req_destroy(req* request)
+void net_async_req_destroy(req *request)
 {
     if (!request)
         return;
-    req* r = request;
+    req *r = request;
 
     spin_lock(&r->done_mtx);
     if (r->async.cq) {
@@ -547,9 +548,9 @@ void net_async_req_destroy(req* request)
 
 /* ---- public fd-based wrappers ---- */
 
-static fd_entry* async_hold_entry(int fd)
+static fd_entry *async_hold_entry(int fd)
 {
-    fd_entry* entry = hold_fd_entry(fd);
+    fd_entry *entry = hold_fd_entry(fd);
     if (entry && entry->ops == &async_cq_fd_ops)
         return entry;
 
@@ -558,19 +559,19 @@ static fd_entry* async_hold_entry(int fd)
     return NULL;
 }
 
-int net_async_submit(int cq_fd, req* request)
+int net_async_submit(int cq_fd, req *request)
 {
     if (!request) {
         errno = EINVAL;
         return -1;
     }
 
-    fd_entry* entry = async_hold_entry(cq_fd);
+    fd_entry *entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
 
     mutex_lock(&entry->mtx);
-    async_cq* cq = (async_cq*)entry->value;
+    async_cq *cq = (async_cq*)entry->value;
     if (!cq) {
         mutex_unlock(&entry->mtx);
         PUT_REF(entry);
@@ -591,7 +592,7 @@ int net_async_submit(int cq_fd, req* request)
     return ret;
 }
 
-int net_async_result(const req* request, req_type* type)
+int net_async_result(const req *request, req_type *type)
 {
     if (!request) {
         errno = EINVAL;
@@ -603,7 +604,7 @@ int net_async_result(const req* request, req_type* type)
     return request->ret;
 }
 
-req_argv* net_async_argv(req* request)
+req_argv *net_async_argv(req *request)
 {
     if (!request) {
         errno = EINVAL;
@@ -612,10 +613,15 @@ req_argv* net_async_argv(req* request)
     return &request->argv;
 }
 
-int net_async_wait(int cq_fd, req** requests, uint32_t min,
+int net_async_wait(int cq_fd, req ** requests, uint32_t min,
                    uint32_t max, int total_timeout_ms)
 {
-    fd_entry* entry = async_hold_entry(cq_fd);
+    if (get_current_worker()) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    fd_entry *entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
     int ret = async_wait(entry, requests, min, max, total_timeout_ms);
@@ -625,7 +631,12 @@ int net_async_wait(int cq_fd, req** requests, uint32_t min,
 
 int net_async_close(int cq_fd)
 {
-    fd_entry* entry = async_hold_entry(cq_fd);
+    if (get_current_worker()) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    fd_entry *entry = async_hold_entry(cq_fd);
     if (!entry)
         return -1;
     int ret = async_close(entry);

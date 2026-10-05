@@ -1,14 +1,16 @@
 #ifndef IF_H
 #define IF_H
-#include <stdint.h>
-#include <sys/types.h>
-#include <stdbool.h>
-#include <pthread.h>
-#include <net/if.h>
+
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include "list.h"
+#include <net/if.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <sys/types.h>
+
 #include "base.h"
+#include "list.h"
 
 typedef struct skbuff skbuff;
 typedef struct if_info if_info;
@@ -28,27 +30,27 @@ typedef struct if_addr {
     bool        primary;    /* preferred / primary address */
 } if_addr;
 typedef struct if_ops {
-    int (*recv)(if_info* info, skbuff* skb);
-    int (*send)(if_info* info, skbuff* skb);
-    void (*update)(if_info* info, struct nlmsghdr *nlh);
-    int (*create)(if_info* info, struct nlmsghdr *nlh);
-    int (*up)(if_info* info);
-    int (*down)(if_info* info);
-    void (*destroy)(if_info* info);
+    int (*recv)(if_info *info, skbuff *skb);
+    int (*send)(if_info *info, skbuff *skb);
+    void (*update)(if_info *info, struct nlmsghdr *nlh);
+    int (*create)(if_info *info, struct nlmsghdr *nlh);
+    int (*up)(if_info *info);
+    int (*down)(if_info *info);
+    void (*destroy)(if_info *info);
 } if_ops;
 
 typedef struct if_info {
     int32_t ifindex;
     char name[IFNAMSIZ];
-    uint8_t* l2_addr;
+    uint8_t *l2_addr;
     uint32_t l2_len;       /* actual L2 header size (e.g. 14 for Ethernet) */
     uint32_t flags;
     uint32_t mtu;
     bool hw_tx_checksum_enabled;
     bool hw_rx_checksum_enabled;
     list_node addr_list;
-    const if_ops* ops;
-    void* xdp_data[32];
+    const if_ops *ops;
+    void *xdp_data[32];
     /* Cached queue count used by the XDP TX fast path.  It is populated
      * when the interface is started, so packet sends do not repeatedly
      * consult the configuration tree. */
@@ -72,23 +74,23 @@ extern pthread_rwlock_t g_if_rwlock;
     pthread_rwlock_unlock(&g_if_rwlock); \
 } while (0)
 
-if_info* search_if_by_name(const char* name);
+if_info *search_if_by_name(const char *name);
 
-if_info* search_if_by_index(uint32_t ifindex);
+if_info *search_if_by_index(uint32_t ifindex);
 
-bool if_add_addr(if_info* info, sa_family_t family, const uint8_t* ip,
+bool if_add_addr(if_info *info, sa_family_t family, const uint8_t *ip,
                  uint32_t prefix_len, uint8_t scope, bool primary);
-bool if_has_addr(if_info* info, sa_family_t family, const uint8_t* ip);
+bool if_has_addr(if_info *info, sa_family_t family, const uint8_t *ip);
 bool if_has_loopback(void);
-bool if_address_exists(sa_family_t family, const uint8_t* ip, uint32_t ifindex);
+bool if_address_exists(sa_family_t family, const uint8_t *ip, uint32_t ifindex);
 
 int parse_link_event(struct nlmsghdr *nlh);
 int parse_addr_event(struct nlmsghdr *nlh);
 
-bool if_search_best_saddr_by_daddr(if_info* info, sa_family_t family,
-                                   const uint8_t* daddr, uint8_t* saddr);
+bool if_search_best_saddr_by_daddr(if_info *info, sa_family_t family,
+                                   const uint8_t *daddr, uint8_t *saddr);
 
-if_info* if_create_virtual_loopback(void);
+if_info *if_create_virtual_loopback(void);
 
-#endif
+#endif /* IF_H */
 

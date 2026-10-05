@@ -8,7 +8,7 @@ PROFILE_CFLAGS_debug := -Og -g3 -DDEBUG
 PROFILE_CFLAGS_release := -O2 -DNDEBUG
 PROFILE_CFLAGS_relwithdebinfo := -O2 -g -DNDEBUG
 
-PROFILE_BPF_CFLAGS_debug := -O0 -g
+PROFILE_BPF_CFLAGS_debug := -O1 -g
 PROFILE_BPF_CFLAGS_release := -O2 -g
 PROFILE_BPF_CFLAGS_relwithdebinfo := -O2 -g
 

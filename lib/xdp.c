@@ -1,43 +1,43 @@
+#include "xdp.h"
+
+#include <assert.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <errno.h>
+#include <linux/capability.h>
+#include <linux/ethtool.h>
+#include <linux/if_link.h>
+#include <linux/sockios.h>
+#include <net/if.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
-#include <unistd.h>
-#include <xdp/xsk.h>
-#include <errno.h>
-#include <sys/mman.h>
-#include <signal.h>
-#include <assert.h>
-#include <linux/capability.h>
-#include <sys/syscall.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <poll.h>
-#include <net/if.h>
-#include <linux/if_link.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-#include <xdp/libxdp.h>
-
 #include <sys/ioctl.h>
-#include <linux/ethtool.h>
-#include <linux/sockios.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <xdp/libxdp.h>
+#include <xdp/xsk.h>
 
-#include "if.h"
-#include "queue.h"
-#include "rss.h"
-#include "worker.h"
-#include "thread.h"
-#include "skbuff.h"
 #include "ether.h"
+#include "icmp.h"
+#include "if.h"
+#include "init.h"
 #include "ip.h"
 #include "ipv6.h"
-#include "udp.h"
-#include "tcp.h"
-#include "icmp.h"
-#include "init.h"
 #include "log.h"
-#include "xdp.h"
+#include "queue.h"
+#include "rss.h"
+#include "skbuff.h"
+#include "tcp.h"
+#include "thread.h"
+#include "udp.h"
+#include "worker.h"
 #include "xdp_redirect_config.h"
 
 _Static_assert(XDP_UMEM_FRAME_CNT != 0 &&
@@ -45,7 +45,7 @@ _Static_assert(XDP_UMEM_FRAME_CNT != 0 &&
                "XDP_UMEM_FRAME_CNT must be a power of two");
 
 xdp_frame_pool g_xdp_frame_pool = {0};
-static struct xsk_umem* g_xdp_umem = NULL;
+static struct xsk_umem *g_xdp_umem = NULL;
 static struct xsk_ring_prod g_umem_fq = {0};
 static struct xsk_ring_cons g_umem_cq = {0};
 static spinlock_t g_xdp_umem_lock;
@@ -54,25 +54,25 @@ typedef struct xdp_prog_shared {
     int ifindex;
     int xsks_map_fd;
     uint32_t xdp_attach_mode;
-    struct bpf_object* xdp_obj;
-    struct bpf_link* xdp_link;
-    struct xdp_prog_shared* next;
+    struct bpf_object *xdp_obj;
+    struct bpf_link *xdp_link;
+    struct xdp_prog_shared *next;
 } xdp_prog_shared;
 
-static xdp_prog_shared* g_xdp_prog_list = NULL;
+static xdp_prog_shared *g_xdp_prog_list = NULL;
 
 /* ── 全局 UMEM frame 池 ────────────────────────────────── */
 
 static inline void *xdp_frame_index_to_ptr(uint32_t idx)
 {
-	return (uint8_t *)g_xdp_frame_pool.buffer +
-	       (size_t)idx * g_xdp_frame_pool.frame_size;
+    return (uint8_t *)g_xdp_frame_pool.buffer +
+           (size_t)idx * g_xdp_frame_pool.frame_size;
 }
 
 static inline uint32_t xdp_frame_ptr_to_index(void *ptr)
 {
-	return (uint32_t)(((uintptr_t)ptr - (uintptr_t)g_xdp_frame_pool.buffer)
-	                  / g_xdp_frame_pool.frame_size);
+    return (uint32_t)(((uintptr_t)ptr - (uintptr_t)g_xdp_frame_pool.buffer)
+                      / g_xdp_frame_pool.frame_size);
 }
 
 /*
@@ -370,8 +370,8 @@ static inline uint64_t xdp_umem_frame_addr(uint64_t addr)
     return data & ~((uint64_t)XDP_UMEM_FRAME_SIZE - 1U);
 }
 
-static inline uint64_t xdp_umem_tx_addr(const frame_slot* slot,
-                                    const uint8_t* data)
+static inline uint64_t xdp_umem_tx_addr(const frame_slot *slot,
+                                    const uint8_t *data)
 {
     uint64_t slot_addr = (uint64_t)((const uint8_t*)slot -
                                     (const uint8_t*)g_xdp_frame_pool.buffer);
@@ -382,11 +382,11 @@ static inline uint64_t xdp_umem_tx_addr(const frame_slot* slot,
     return slot_addr | (data_offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
 }
 
-static inline frame_slot* xdp_tx_slot_from_addr(uint64_t addr)
+static inline frame_slot *xdp_tx_slot_from_addr(uint64_t addr)
 {
-    frame_slot* slot = xsk_umem__get_data(
+    frame_slot *slot = xsk_umem__get_data(
         g_xdp_frame_pool.buffer, xsk_umem__extract_addr(addr));
-    uint8_t* data = xsk_umem__get_data(
+    uint8_t *data = xsk_umem__get_data(
         g_xdp_frame_pool.buffer, xsk_umem__add_offset_to_addr(addr));
     assert(data >= slot->data && data < slot->data + slot->slot_size);
     (void)data;
@@ -401,39 +401,39 @@ static inline void xdp_umem_release_addr(uint64_t addr)
 
 /* Drain all four rings on teardown, returning frames to pool and releasing
  * data_buf refs.  Must be called before xsk_socket__delete. */
-static void xdp_drain_ring_pending(if_xdp* ix)
+static void xdp_drain_ring_pending(if_xdp *ix)
 {
-	/* ── RX ring: return unconsumed frames to pool ── */
-	uint32_t rx_idx = 0;
-	uint32_t rx_n = xsk_ring_cons__peek(&ix->rx, XDP_RX_QUEUE_SIZE, &rx_idx);
-	for (uint32_t j = 0; j < rx_n; ++j) {
-		const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&ix->rx, rx_idx + j);
-		if (desc)
-			xdp_umem_release_addr(desc->addr);
-	}
-	if (rx_n)
-		xsk_ring_cons__release(&ix->rx, rx_n);
+    /* ── RX ring: return unconsumed frames to pool ── */
+    uint32_t rx_idx = 0;
+    uint32_t rx_n = xsk_ring_cons__peek(&ix->rx, XDP_RX_QUEUE_SIZE, &rx_idx);
+    for (uint32_t j = 0; j < rx_n; ++j) {
+        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&ix->rx, rx_idx + j);
+        if (desc)
+            xdp_umem_release_addr(desc->addr);
+    }
+    if (rx_n)
+        xsk_ring_cons__release(&ix->rx, rx_n);
 
-	/* ── TX ring: release data_buf refs for all pending descs ── */
-	const __u32 tx_cons = *ix->tx.consumer;
-	const __u32 tx_prod  = *ix->tx.producer;
-	for (__u32 i = tx_cons; i != tx_prod; ++i) {
-		struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, i);
-		if (!d) continue;
-		frame_slot* slot = xdp_tx_slot_from_addr(d->addr);
-		PUT_REF(slot);
-	}
+    /* ── TX ring: release data_buf refs for all pending descs ── */
+    const __u32 tx_cons = *ix->tx.consumer;
+    const __u32 tx_prod  = *ix->tx.producer;
+    for (__u32 i = tx_cons; i != tx_prod; ++i) {
+        struct xdp_desc *d = xsk_ring_prod__tx_desc(&ix->tx, i);
+        if (!d) continue;
+        frame_slot *slot = xdp_tx_slot_from_addr(d->addr);
+        PUT_REF(slot);
+    }
 
-	/* ── FQ ring: return un-consumed frames to pool ── */
-	const __u32 fq_cons = *ix->fq.consumer;
-	const __u32 fq_prod  = *ix->fq.producer;
-	for (__u32 i = fq_cons; i != fq_prod; ++i) {
-		xdp_umem_release_addr(*xsk_ring_prod__fill_addr(&ix->fq, i));
-	}
+    /* ── FQ ring: return un-consumed frames to pool ── */
+    const __u32 fq_cons = *ix->fq.consumer;
+    const __u32 fq_prod  = *ix->fq.producer;
+    for (__u32 i = fq_cons; i != fq_prod; ++i) {
+        xdp_umem_release_addr(*xsk_ring_prod__fill_addr(&ix->fq, i));
+    }
 }
 
 //填充提供给内核用于接收的frame
-static void xdp_umem_refill_fill_ring(if_xdp* ix, struct xsk_ring_prod *fq)
+static void xdp_umem_refill_fill_ring(if_xdp *ix, struct xsk_ring_prod *fq)
 {
     uint32_t idx = 0;
     uint32_t n = xsk_prod_nb_free(fq, XDP_FILL_QUEUE_SIZE);
@@ -445,7 +445,7 @@ static void xdp_umem_refill_fill_ring(if_xdp* ix, struct xsk_ring_prod *fq)
         return;
 
     for (uint32_t i = 0; i < n; ++i) {
-        frame_slot* slot = frame_slot_alloc(FRAME_SLOT_MAX_SIZE);
+        frame_slot *slot = frame_slot_alloc(FRAME_SLOT_MAX_SIZE);
         if (!slot) {
             fq->cached_prod -= (n - i);
             WARN_LOG("xdp: fq refill shortfall at %u/%u\n", i, n);
@@ -460,20 +460,20 @@ static void xdp_umem_refill_fill_ring(if_xdp* ix, struct xsk_ring_prod *fq)
     if (ix && xsk_ring_prod__needs_wakeup(fq)) {
         recvfrom(xsk_socket__fd(ix->xsk),
                 NULL, 0,
-                MSG_DONTWAIT, 
+                MSG_DONTWAIT,
                 NULL, NULL);
     }
 }
 
-static void xdp_umem_complete_tx(if_xdp* ix)
+static void xdp_umem_complete_tx(if_xdp *ix)
 {
-    struct xsk_ring_cons* cq = &ix->cq;
+    struct xsk_ring_cons *cq = &ix->cq;
     uint32_t idx = 0;
     uint32_t n   = xsk_ring_cons__peek(cq, XDP_COMP_QUEUE_SIZE, &idx);
 
     for (uint32_t i = 0; i < n; ++i) {
         uint64_t addr = *xsk_ring_cons__comp_addr(cq, idx + i);
-        frame_slot* slot = xdp_tx_slot_from_addr(addr);
+        frame_slot *slot = xdp_tx_slot_from_addr(addr);
         PUT_REF(slot);
     }
 
@@ -483,7 +483,7 @@ static void xdp_umem_complete_tx(if_xdp* ix)
 
 /* ── TX ring 提交、回收与背压 ───────────────────────────── */
 
-static void xdp_tx_update_watch(if_xdp* ix)
+static void xdp_tx_update_watch(if_xdp *ix)
 {
 
     int desired_type = ix->pending_tx_queue.element_number
@@ -498,7 +498,7 @@ static void xdp_tx_update_watch(if_xdp* ix)
     }
 }
 
-static inline void xdp_tx_kick(if_xdp* ix)
+static inline void xdp_tx_kick(if_xdp *ix)
 {
     if (xsk_ring_prod__needs_wakeup(&ix->tx)) {
         ssize_t ret = sendto(xsk_socket__fd(ix->xsk), NULL, 0, MSG_DONTWAIT,
@@ -510,7 +510,7 @@ static inline void xdp_tx_kick(if_xdp* ix)
     }
 }
 
-static inline void xdp_tx_flush(if_xdp* ix)
+static inline void xdp_tx_flush(if_xdp *ix)
 {
     if (!ix->tx_kick_pending && !ix->pending_tx_queue.element_number)
         return;
@@ -519,18 +519,18 @@ static inline void xdp_tx_flush(if_xdp* ix)
     ix->tx_kick_pending = 0;
 }
 
-static void xdp_tx_kick_loop(task* tk)
+static void xdp_tx_kick_loop(task *tk)
 {
-    if_xdp* ix = (if_xdp*)tk->argv;
+    if_xdp *ix = (if_xdp*)tk->argv;
 
     xdp_umem_complete_tx(ix);
     xdp_tx_flush(ix);
 }
 
-static uint32_t xdp_skb_frame_count(const skbuff* skb)
+static uint32_t xdp_skb_frame_count(const skbuff *skb)
 {
     uint32_t frames = 0;
-    for (const data_info* di = &skb->data0; di; di = di->next) {
+    for (const data_info *di = &skb->data0; di; di = di->next) {
         if (di->end != di->start)
             frames++;
     }
@@ -539,9 +539,9 @@ static uint32_t xdp_skb_frame_count(const skbuff* skb)
 
 /* Submit an skb without retaining skb itself.  The TX descriptors retain the
  * data_buf references until they are returned through the completion ring. */
-static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
+static int xdp_tx_submit(if_xdp *ix, skbuff *skb)
 {
-    uint8_t* packet = skb_start(skb);
+    uint8_t *packet = skb_start(skb);
     uint32_t frames = xdp_skb_frame_count(skb);
     if (!frames)
         return -EINVAL;
@@ -557,7 +557,7 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
         return -EAGAIN;
     }
 
-    struct xsk_tx_metadata* meta =
+    struct xsk_tx_metadata *meta =
         (struct xsk_tx_metadata*)(packet - XDP_TX_METADATA_LEN);
     meta->flags = 0;
 
@@ -569,11 +569,11 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
     }
 
     uint32_t i = 0;
-    for (data_info* di = &skb->data0; di; di = di->next) {
+    for (data_info *di = &skb->data0; di; di = di->next) {
         if (di->end == di->start)
             continue;
-        frame_slot* slot = di->slot;
-        struct xdp_desc* d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
+        frame_slot *slot = di->slot;
+        struct xdp_desc *d = xsk_ring_prod__tx_desc(&ix->tx, tx_idx + i);
         d->addr = xdp_umem_tx_addr(slot, di->start);
         d->len = di->end - di->start;
         d->options = i + 1u < frames ? XDP_PKT_CONTD : 0;
@@ -590,7 +590,7 @@ static int xdp_tx_submit(if_xdp* ix, skbuff* skb)
     return 0;
 }
 
-static int xdp_tx_enqueue(if_xdp* ix, skbuff* skb)
+static int xdp_tx_enqueue(if_xdp *ix, skbuff *skb)
 {
     uint32_t frames = xdp_skb_frame_count(skb);
     if (frames > XDP_TX_PENDING_FRAME_LIMIT ||
@@ -604,14 +604,14 @@ static int xdp_tx_enqueue(if_xdp* ix, skbuff* skb)
     return 0;
 }
 
-static void xdp_tx_drain_pending(if_xdp* ix)
+static void xdp_tx_drain_pending(if_xdp *ix)
 {
     if (!ix->pending_tx_queue.element_number)
         return;
 
     xdp_umem_complete_tx(ix);
     while (ix->pending_tx_queue.element_number) {
-        skbuff* skb = SKB_FROM_NODE(get_queue_first(&ix->pending_tx_queue), tx_node);
+        skbuff *skb = SKB_FROM_NODE(get_queue_first(&ix->pending_tx_queue), tx_node);
         if (!skb)
             break;
 
@@ -635,9 +635,9 @@ static void xdp_tx_drain_pending(if_xdp* ix)
     xdp_tx_update_watch(ix);
 }
 
-static void xdp_tx_drop_pending(if_xdp* ix)
+static void xdp_tx_drop_pending(if_xdp *ix)
 {
-    skbuff* skb;
+    skbuff *skb;
     while ((skb = SKB_FROM_NODE(pop_queue(&ix->pending_tx_queue), tx_node)) != NULL) {
         PUT_REF(skb);
     }
@@ -676,7 +676,7 @@ static __u32 xdp_interface_mode_flags(uint32_t mode)
 }
 
 #ifdef DEBUG
-static const char* xdp_interface_mode_name(uint32_t mode)
+static const char *xdp_interface_mode_name(uint32_t mode)
 {
     if (mode == XDP_MODE_SKB)
         return "skb";
@@ -688,9 +688,9 @@ static const char* xdp_interface_mode_name(uint32_t mode)
 }
 #endif
 
-static xdp_prog_shared* xdp_program_find(int ifindex)
+static xdp_prog_shared *xdp_program_find(int ifindex)
 {
-    xdp_prog_shared* it = g_xdp_prog_list;
+    xdp_prog_shared *it = g_xdp_prog_list;
     while (it) {
         if (it->ifindex == ifindex)
             return it;
@@ -699,7 +699,7 @@ static xdp_prog_shared* xdp_program_find(int ifindex)
     return NULL;
 }
 
-static void xdp_program_destroy(xdp_prog_shared* shared)
+static void xdp_program_destroy(xdp_prog_shared *shared)
 {
     if (shared->xdp_link) {
         int err = bpf_link__destroy(shared->xdp_link);
@@ -721,9 +721,9 @@ static void xdp_program_destroy(xdp_prog_shared* shared)
 
 void xdp_cleanup_programs(void)
 {
-    xdp_prog_shared* it = g_xdp_prog_list;
+    xdp_prog_shared *it = g_xdp_prog_list;
     while (it) {
-        xdp_prog_shared* next = it->next;
+        xdp_prog_shared *next = it->next;
         if (it->xsks_map_fd > 0) {
             for (__u32 key = 0; key < 32; ++key)
                 (void)bpf_map_delete_elem(it->xsks_map_fd, &key);
@@ -734,7 +734,7 @@ void xdp_cleanup_programs(void)
     g_xdp_prog_list = NULL;
 }
 
-static void xdp_interface_release_redirect_program(if_xdp* ix)
+static void xdp_interface_release_redirect_program(if_xdp *ix)
 {
     ix->prog_shared      = NULL;
     ix->xdp_obj          = NULL;
@@ -744,7 +744,7 @@ static void xdp_interface_release_redirect_program(if_xdp* ix)
     ix->xdp_attach_mode  = XDP_MODE_UNSPEC;
 }
 
-static int xdp_interface_attach_redirect_program(if_xdp* ix)
+static int xdp_interface_attach_redirect_program(if_xdp *ix)
 {
 
     ix->ifindex  = (int)if_nametoindex(ix->info->name);
@@ -753,7 +753,7 @@ static int xdp_interface_attach_redirect_program(if_xdp* ix)
         return -1;
     }
 
-    xdp_prog_shared* shared = xdp_program_find(ix->ifindex);
+    xdp_prog_shared *shared = xdp_program_find(ix->ifindex);
     if (shared) {
         ix->prog_shared = shared;
         ix->xdp_obj = shared->xdp_obj;
@@ -767,19 +767,19 @@ static int xdp_interface_attach_redirect_program(if_xdp* ix)
         return -1;
     }
 
-    const char* obj_path = XDP_REDIRECT_BPF_OBJ_PATH;
+    const char *obj_path = XDP_REDIRECT_BPF_OBJ_PATH;
 
     struct bpf_object_open_opts open_opts = {
         .sz = sizeof(open_opts),
     };
-    struct bpf_object* obj = bpf_object__open_file(obj_path, &open_opts);
+    struct bpf_object *obj = bpf_object__open_file(obj_path, &open_opts);
     long open_err = libbpf_get_error(obj);
     if (open_err) {
         ERR_LOG("xdp: open xdp prog failed path=%s err=%ld\n", obj_path, open_err);
         return -1;
     }
 
-    struct bpf_program* prog = bpf_object__find_program_by_name(obj, "xdp_redirect");
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_redirect");
     if (!prog)
         prog = bpf_object__next_program(obj, NULL);
     if (!prog) {
@@ -889,7 +889,7 @@ static int xdp_interface_attach_redirect_program(if_xdp* ix)
     return 0;
 }
 
-static void xdp_interface_unbind_socket(if_xdp* ix)
+static void xdp_interface_unbind_socket(if_xdp *ix)
 {
     xdp_drain_ring_pending(ix);
     if (ix->xsk) {
@@ -907,7 +907,7 @@ static void xdp_interface_unbind_socket(if_xdp* ix)
     }
 }
 
-static int xdp_interface_bind_socket(if_xdp* ix)
+static int xdp_interface_bind_socket(if_xdp *ix)
 {
     const uint32_t queue_id = ix->queue_id;
 
@@ -916,10 +916,7 @@ static int xdp_interface_bind_socket(if_xdp* ix)
 
     uint32_t xdp_flags = xdp_interface_mode_flags(ix->xdp_attach_mode);
 
-    /* Keep generic-XDP interfaces on the zero-copy bind path when the
-     * driver provides it.  XDP_USE_SG is retained so a packet may span
-     * multiple UMEM frames; if the device rejects multi-frame support the
-     * caller can retry without this flag. */
+
     uint16_t bind_flags = XDP_USE_NEED_WAKEUP | XDP_USE_SG;
 
     struct xsk_socket_config cfg = {
@@ -975,12 +972,12 @@ static int xdp_interface_bind_socket(if_xdp* ix)
     DEBUG_LOG("xdp: xsk create ok if=%s fd=%d bind_flags=0x%x\n",
                ix->info->name, xsk_socket__fd(ix->xsk), (unsigned int)cfg.bind_flags);
 
-	    /* 初始填充 FQ，使内核可以把到达的包写入 UMEM。 */
+        /* 初始填充 FQ，使内核可以把到达的包写入 UMEM。 */
     xdp_umem_refill_fill_ring(ix, &ix->fq);
     return 0;
 }
 
-static int xdp_configure_hw_rss(if_info* info, int queues)
+static int xdp_configure_hw_rss(if_info *info, int queues)
 {
     /* Interfaces omitted from open_if do not own AF_XDP queues.  A single
      * queue needs no traffic distribution and may legitimately expose no
@@ -1016,7 +1013,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
 
     size_t strings_size = sizeof(struct ethtool_gstrings) +
                           (size_t)sset.count * ETH_GSTRING_LEN;
-    struct ethtool_gstrings* strings = calloc(1, strings_size);
+    struct ethtool_gstrings *strings = calloc(1, strings_size);
     if (!strings) {
         close(fd);
         return -1;
@@ -1035,7 +1032,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
 
     uint32_t rxhash_index = UINT32_MAX;
     for (uint32_t i = 0; i < strings->len; i++) {
-        const char* name = (const char*)strings->data +
+        const char *name = (const char*)strings->data +
                            (size_t)i * ETH_GSTRING_LEN;
         if (strncmp(name, "rx-hashing", ETH_GSTRING_LEN) == 0) {
             rxhash_index = i;
@@ -1054,7 +1051,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
     size_t get_size = sizeof(struct ethtool_gfeatures) +
                       (size_t)feature_blocks *
                       sizeof(struct ethtool_get_features_block);
-    struct ethtool_gfeatures* get_features = calloc(1, get_size);
+    struct ethtool_gfeatures *get_features = calloc(1, get_size);
     if (!get_features) {
         close(fd);
         return -1;
@@ -1087,7 +1084,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
         size_t set_size = sizeof(struct ethtool_sfeatures) +
                           (size_t)feature_blocks *
                           sizeof(struct ethtool_set_features_block);
-        struct ethtool_sfeatures* set_features = calloc(1, set_size);
+        struct ethtool_sfeatures *set_features = calloc(1, set_size);
         if (!set_features) {
             close(fd);
             return -1;
@@ -1132,7 +1129,7 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
 
     size_t config_size = (size_t)query.indir_size * sizeof(__u32) +
                          (size_t)query.key_size;
-    struct ethtool_rxfh* rxfh = calloc(1, sizeof(*rxfh) + config_size);
+    struct ethtool_rxfh *rxfh = calloc(1, sizeof(*rxfh) + config_size);
     if (!rxfh) {
         close(fd);
         return -1;
@@ -1163,10 +1160,10 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
         return -1;
     }
 
-    __u32* indir = rxfh->rss_config;
-    __u8* hw_key = (__u8*)(indir + rxfh->indir_size);
+    __u32 *indir = rxfh->rss_config;
+    __u8 *hw_key = (__u8*)(indir + rxfh->indir_size);
     uint32_t key_len = 0;
-    const uint8_t* key = toeplitz_rss_get_key(&key_len);
+    const uint8_t *key = toeplitz_rss_get_key(&key_len);
 
     rxfh->cmd = ETHTOOL_SRSSH;
     /* ETH_RSS_HASH_TOP 位于 bit 0，但 UAPI 头文件只公开字段，没有公开
@@ -1200,9 +1197,9 @@ static int xdp_configure_hw_rss(if_info* info, int queues)
 
 /* ── 对外接口生命周期与收发入口 ────────────────────────── */
 
-static void xdp_interface_write(task* tk)
+static void xdp_interface_write(task *tk)
 {
-    if_xdp* ix = (if_xdp*)tk->argv;
+    if_xdp *ix = (if_xdp*)tk->argv;
     xdp_tx_drain_pending(ix);
 }
 
@@ -1215,7 +1212,7 @@ int xdp_if_start(if_info *info)
     if (queues <= 0)
         return 0;
 
-    worker* w = get_current_worker();
+    worker *w = get_current_worker();
     int w_idx = (int)(w - g_workers);
 
     /* RSS configuration is performed once by the main worker. */
@@ -1230,10 +1227,10 @@ int xdp_if_start(if_info *info)
         if (info->xdp_data[q]) {
             continue;
         }
-		if_xdp* ix = calloc(1, sizeof(*ix));
+        if_xdp *ix = calloc(1, sizeof(*ix));
         if (!ix) {
             ERR_LOG("xdp: calloc if_xdp failed");
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
 
@@ -1243,7 +1240,7 @@ int xdp_if_start(if_info *info)
         if (xdp_interface_bind_socket(ix) != 0) {
             ERR_LOG("xdp: bind failed if=%s q=%d", info->name, q);
             free(ix);
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
 
@@ -1251,9 +1248,9 @@ int xdp_if_start(if_info *info)
         if (!ix->tk) {
             ERR_LOG("xdp: create_task failed if=%s q=%d", info->name, q);
             xdp_interface_unbind_socket(ix);
-			xdp_interface_release_redirect_program(ix);
+            xdp_interface_release_redirect_program(ix);
             free(ix);
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
 
@@ -1269,7 +1266,7 @@ int xdp_if_start(if_info *info)
             xdp_interface_unbind_socket(ix);
             xdp_interface_release_redirect_program(ix);
             free(ix);
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
 
@@ -1278,9 +1275,9 @@ int xdp_if_start(if_info *info)
             ERR_LOG("xdp: create TX kick task failed if=%s q=%d", info->name, q);
             destroy_task(ix->tk);
             xdp_interface_unbind_socket(ix);
-			xdp_interface_release_redirect_program(ix);
+            xdp_interface_release_redirect_program(ix);
             free(ix);
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
         ix->tx_kick_task->cb_loop = xdp_tx_kick_loop;
@@ -1290,15 +1287,15 @@ int xdp_if_start(if_info *info)
             destroy_task(ix->tx_kick_task);
             destroy_task(ix->tk);
             xdp_interface_unbind_socket(ix);
-			xdp_interface_release_redirect_program(ix);
+            xdp_interface_release_redirect_program(ix);
             free(ix);
-			(void)xdp_if_stop(info);
+            (void)xdp_if_stop(info);
             return -1;
         }
 
-	        info->xdp_data[q] = ix;
-	        DEBUG_LOG("xdp: started if=%s q=%d fd=%d", info->name, q, ix->tk->fd);
-	    }
+            info->xdp_data[q] = ix;
+            DEBUG_LOG("xdp: started if=%s q=%d fd=%d", info->name, q, ix->tk->fd);
+        }
 
     return 0;
 }
@@ -1312,29 +1309,29 @@ int xdp_if_stop(if_info *info)
         return 0;
     }
 
-    worker* w = get_current_worker();
+    worker *w = get_current_worker();
     int w_idx = (int)(w - g_workers);
 
     for (int q = w_idx; q < queues; q += g_worker_num) {
-        if_xdp* ix = (if_xdp*)info->xdp_data[q];
+        if_xdp *ix = (if_xdp*)info->xdp_data[q];
         if (!ix)
             continue;
 
-	        DEBUG_LOG("xdp: stopping if=%s q=%d", info->name, q);
-	        info->xdp_data[q] = NULL;
+            DEBUG_LOG("xdp: stopping if=%s q=%d", info->name, q);
+            info->xdp_data[q] = NULL;
 
-			/* Stop callbacks before touching rings. */
-			destroy_task(ix->tx_kick_task);
-			ix->tx_kick_task = NULL;
-		if (ix->tk) {
-			unregister_task(ix->tk);
-			destroy_task(ix->tk);
-			ix->tk = NULL;
-		}
+            /* Stop callbacks before touching rings. */
+            destroy_task(ix->tx_kick_task);
+            ix->tx_kick_task = NULL;
+        if (ix->tk) {
+            unregister_task(ix->tk);
+            destroy_task(ix->tk);
+            ix->tk = NULL;
+        }
         xdp_tx_drop_pending(ix);
         xdp_umem_complete_tx(ix);
 
-		xdp_interface_release_redirect_program(ix);
+        xdp_interface_release_redirect_program(ix);
         xdp_interface_unbind_socket(ix);
         free(ix);
     }
@@ -1342,8 +1339,8 @@ int xdp_if_stop(if_info *info)
     /* Main worker stops last: all queues are gone, safe to detach XDP. */
     if (w == main_worker) {
         int ifindex = (int)if_nametoindex(info->name);
-        xdp_prog_shared** prev = &g_xdp_prog_list;
-        xdp_prog_shared* it = g_xdp_prog_list;
+        xdp_prog_shared ** prev = &g_xdp_prog_list;
+        xdp_prog_shared *it = g_xdp_prog_list;
         while (it) {
             if (it->ifindex == ifindex) {
                 *prev = it->next;
@@ -1361,11 +1358,11 @@ int xdp_if_stop(if_info *info)
 
 void xdp_if_read(task *tk)
 {
-    if_xdp* ix = (if_xdp*)tk->argv;
-    if_info* info = ix->info;
+    if_xdp *ix = (if_xdp*)tk->argv;
+    if_info *info = ix->info;
 
 
-    struct xsk_ring_cons* rx  = &ix->rx;
+    struct xsk_ring_cons *rx  = &ix->rx;
     const uint32_t cap = g_xdp_frame_pool.frame_size > frame_rx_headroom()
         ? g_xdp_frame_pool.frame_size - frame_rx_headroom() : 0;
 
@@ -1380,23 +1377,23 @@ void xdp_if_read(task *tk)
 
     for (uint32_t i = 0; i < n; ) {
         /* ---- start of a new packet (first frame: XDP_PKT_CONTD is NOT set) ---- */
-        const struct xdp_desc* desc = xsk_ring_cons__rx_desc(rx, idx + i);
+        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(rx, idx + i);
         if (!desc) {
             ERR_LOG("xdp: rx_desc NULL\n");
             i++;
             continue;
         }
-		if (ix->rx_drop_contd) {
-			bool more = (desc->options & XDP_PKT_CONTD) != 0;
-			uint64_t raw = xsk_umem__extract_addr(desc->addr);
-			xdp_umem_release_addr(raw - raw % g_xdp_frame_pool.frame_size);
-			ix->rx_drop_contd = more;
-			i++;
-			continue;
-		}
+        if (ix->rx_drop_contd) {
+            bool more = (desc->options & XDP_PKT_CONTD) != 0;
+            uint64_t raw = xsk_umem__extract_addr(desc->addr);
+            xdp_umem_release_addr(raw - raw % g_xdp_frame_pool.frame_size);
+            ix->rx_drop_contd = more;
+            i++;
+            continue;
+        }
 
         if (desc->len == 0) {
-			ix->rx_drop_contd = (desc->options & XDP_PKT_CONTD) != 0;
+            ix->rx_drop_contd = (desc->options & XDP_PKT_CONTD) != 0;
             uint64_t raw_addr   = xsk_umem__extract_addr(desc->addr);
             uint64_t frame_addr = raw_addr;
             if ((raw_addr % g_xdp_frame_pool.frame_size) != 0)
@@ -1407,7 +1404,7 @@ void xdp_if_read(task *tk)
         }
 
         if (desc->len > cap) {
-			ix->rx_drop_contd = (desc->options & XDP_PKT_CONTD) != 0;
+            ix->rx_drop_contd = (desc->options & XDP_PKT_CONTD) != 0;
             WARN_LOG("xdp: drop oversize desc len=%u cap=%u if=%s\n", desc->len, cap,
                      info ? info->name : "?");
             uint64_t raw_addr   = xsk_umem__extract_addr(desc->addr);
@@ -1419,14 +1416,14 @@ void xdp_if_read(task *tk)
             continue;
         }
         /* ---- build scatter-gather skb: collect first frame + all CONTD frames ---- */
-        data_info*  infos = NULL;
-        data_info*  infos_tail = NULL;
+        data_info *infos = NULL;
+        data_info *infos_tail = NULL;
         uint32_t    frame_count = 0;
-		bool packet_bad = false;
+        bool packet_bad = false;
 
         do {
-            const struct xdp_desc* d = xsk_ring_cons__rx_desc(rx, idx + i);
-			bool more = d && ((d->options & XDP_PKT_CONTD) != 0);
+            const struct xdp_desc *d = xsk_ring_cons__rx_desc(rx, idx + i);
+            bool more = d && ((d->options & XDP_PKT_CONTD) != 0);
             if (!d || d->len == 0) {
                 if (d && d->len == 0) {
                     uint64_t z_raw = xsk_umem__extract_addr(d->addr);
@@ -1435,10 +1432,10 @@ void xdp_if_read(task *tk)
                         z_fa = z_raw - (z_raw % g_xdp_frame_pool.frame_size);
                     xdp_umem_release_addr(z_fa);
                 }
-				packet_bad = true;
+                packet_bad = true;
                 i++;
-				if (!more) break;
-				continue;
+                if (!more) break;
+                continue;
             }
 
             uint64_t raw_addr   = xsk_umem__extract_addr(d->addr);
@@ -1450,95 +1447,95 @@ void xdp_if_read(task *tk)
                 data_addr  = raw_addr;
             }
 
-            void* frame = xsk_umem__get_data(g_xdp_frame_pool.buffer, frame_addr);
+            void *frame = xsk_umem__get_data(g_xdp_frame_pool.buffer, frame_addr);
             if (!frame) {
                 xdp_umem_release_addr(frame_addr);
-				packet_bad = true;
+                packet_bad = true;
                 i++;
-				if (!more) break;
-				continue;
+                if (!more) break;
+                continue;
             }
 
-            uint8_t*  payload = (uint8_t*)xsk_umem__get_data(g_xdp_frame_pool.buffer, data_addr);
+            uint8_t *payload = (uint8_t*)xsk_umem__get_data(g_xdp_frame_pool.buffer, data_addr);
             if (!payload) {
                 xdp_umem_release_addr(frame_addr);
-				packet_bad = true;
+                packet_bad = true;
                 i++;
-				if (!more) break;
-				continue;
+                if (!more) break;
+                continue;
             }
-			if (packet_bad || d->len > cap) {
-				xdp_umem_release_addr(frame_addr);
-				packet_bad = true;
-				i++;
-				if (!more) break;
-				continue;
-			}
+            if (packet_bad || d->len > cap) {
+                xdp_umem_release_addr(frame_addr);
+                packet_bad = true;
+                i++;
+                if (!more) break;
+                continue;
+            }
 
             uint32_t chunk = d->len;
 
-            frame_slot* slot = frame_slot_from_rx_frame(frame);
+            frame_slot *slot = frame_slot_from_rx_frame(frame);
             if (!slot) {
                 xdp_umem_release_addr(frame_addr);
-				packet_bad = true;
+                packet_bad = true;
                 i++;
-				if (!more) break;
-				continue;
+                if (!more) break;
+                continue;
             }
             /* The kernel has consumed the FQ descriptor.  Transfer its
              * existing frame reference to data_info; taking another one here
              * would keep every received frame permanently out of the pool. */
             uint32_t pkt_offset = (uint32_t)(payload - slot->data);
-            data_info* ni = create_data_info(slot, 0, slot->slot_size,
+            data_info *ni = create_data_info(slot, 0, slot->slot_size,
                                              pkt_offset, pkt_offset + chunk);
             if (!ni) {
                 PUT_REF(slot);
-				packet_bad = true;
+                packet_bad = true;
                 i++;
-				if (!more) break;
-				continue;
+                if (!more) break;
+                continue;
             }
-			if (infos_tail)
-				infos_tail->next = ni;
-			else
-				infos = ni;
-			infos_tail = ni;
-			frame_count++;
+            if (infos_tail)
+                infos_tail->next = ni;
+            else
+                infos = ni;
+            infos_tail = ni;
+            frame_count++;
             i++;
 
-			/* XDP_PKT_CONTD on the current descriptor means another follows. */
+            /* XDP_PKT_CONTD on the current descriptor means another follows. */
             if (!more)
                 break;
-			if (i >= n) {
-				packet_bad = true;
-				ix->rx_drop_contd = true;
+            if (i >= n) {
+                packet_bad = true;
+                ix->rx_drop_contd = true;
                 break;
-			}
+            }
 
         } while (1);
 
-		if (packet_bad) {
-			while (infos) {
-				data_info* next = infos->next;
-				free_data_info(infos);
-				infos = next;
-			}
-			continue;
-		}
+        if (packet_bad) {
+            while (infos) {
+                data_info *next = infos->next;
+                free_data_info(infos);
+                infos = next;
+            }
+            continue;
+        }
 
         if (frame_count == 0)
             continue;
 
-		skbuff* skb = skb_alloc_with_data_info(infos);
-	        if (!skb) {
-	            ERR_LOG("xdp: skb allocation failed\n");
-	            while (infos) {
-	                data_info* next = infos->next;
-	                free_data_info(infos);
-	                infos = next;
-	            }
-	            continue;
-	        }
+        skbuff *skb = skb_alloc_with_data_info(infos);
+            if (!skb) {
+                ERR_LOG("xdp: skb allocation failed\n");
+                while (infos) {
+                    data_info *next = infos->next;
+                    free_data_info(infos);
+                    infos = next;
+                }
+                continue;
+            }
         /* Only native and HW-offload modes guarantee HW checksum validation.
          * In generic/SKB mode the kernel stack never validates before AF_XDP
          * userspace receives the packet. */
@@ -1558,10 +1555,10 @@ void xdp_if_read(task *tk)
     xdp_umem_refill_fill_ring(ix, &ix->fq);
     xdp_umem_complete_tx(ix);
     drained += n;
-	}
+    }
 }
 
-static int xdp_tx_send(if_xdp* ix, skbuff* skb)
+static int xdp_tx_send(if_xdp *ix, skbuff *skb)
 {
     if (ix->pending_tx_queue.element_number)
         return xdp_tx_enqueue(ix, skb);
@@ -1574,9 +1571,9 @@ static int xdp_tx_send(if_xdp* ix, skbuff* skb)
 }
 
 /* Pick a TX queue owned by the current worker using skb-address hash. */
-static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb)
+static if_xdp *xdp_tx_pick(if_info *info, skbuff *skb)
 {
-    worker* w = get_current_worker();
+    worker *w = get_current_worker();
     int w_idx = (int)(w - g_workers);
     uint32_t queues = info->xdp_queue_count;
 
@@ -1592,21 +1589,21 @@ static if_xdp* xdp_tx_pick(if_info* info, skbuff* skb)
 
 int xdp_if_send(if_info *info, skbuff *skb)
 {
-    if_xdp* ix = xdp_tx_pick(info, skb);
+    if_xdp *ix = xdp_tx_pick(info, skb);
     if (!ix)
         return -ENETDOWN;
 
     return xdp_tx_send(ix, skb);
 }
 
-static int xdp_process_queued_send(skbuff* skb)
+static int xdp_process_queued_send(skbuff *skb)
 {
     return xdp_if_send(skb->route->if_info, skb);
 }
 
 int xdp_transmit_skb(struct if_info *info, skbuff *skb)
 {
-    if_xdp* ix = xdp_tx_pick(info, skb);
+    if_xdp *ix = xdp_tx_pick(info, skb);
     if (ix)
         return xdp_tx_send(ix, skb);
 
@@ -1615,7 +1612,7 @@ int xdp_transmit_skb(struct if_info *info, skbuff *skb)
         return -ENETDOWN;
     uint32_t h = (uint32_t)((uintptr_t)skb);
     uint32_t pick = h % queues;
-    worker* txw = &g_workers[pick % (uint32_t)g_worker_num];
+    worker *txw = &g_workers[pick % (uint32_t)g_worker_num];
 
     worker_enqueue_skb(txw, skb, xdp_process_queued_send);
     return 0;

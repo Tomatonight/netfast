@@ -1,13 +1,13 @@
 #ifndef XDP_H
 #define XDP_H
 
-#include <stdbool.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
-
 #include <xdp/xsk.h>
-#include "queue.h"
+
 #include "frame_cache.h"
+#include "queue.h"
 
 struct task;
 struct if_info;
@@ -17,7 +17,7 @@ struct bpf_link;
 struct bpf_object;
 typedef struct req req;
 
-// AF_XDP核心配置（全局共享�?
+/* Global AF_XDP configuration shared by all workers. */
 #define XDP_TX_METADATA_LEN FRAME_TX_METADATA_LEN
 #define XDP_ALIGN16(value) FRAME_ALIGN16(value)
 #define XDP_RX_FRAME_HEADROOM FRAME_SLOT_FULL_HEADROOM
@@ -74,25 +74,25 @@ void xdp_frame_free(void *frame);
 
 
 typedef struct if_xdp {
-	struct xsk_socket *xsk;
-	struct xsk_ring_cons rx;
-	struct xsk_ring_prod tx;
-	struct xsk_ring_prod fq;
-	struct xsk_ring_cons cq;
-	struct task* tk;
-	struct task* tx_kick_task;
-	struct if_info* info;
-	void* prog_shared;
-	struct bpf_object* xdp_obj;
-	struct bpf_link* xdp_link;
-	int xsks_map_fd;
-	int ifindex;
-	uint32_t queue_id;
-	uint32_t xdp_attach_mode;
-	queue pending_tx_queue;
-	uint32_t pending_tx_frames;
-	uint32_t tx_kick_pending;
-	bool rx_drop_contd;
+    struct xsk_socket *xsk;
+    struct xsk_ring_cons rx;
+    struct xsk_ring_prod tx;
+    struct xsk_ring_prod fq;
+    struct xsk_ring_cons cq;
+    struct task *tk;
+    struct task *tx_kick_task;
+    struct if_info *info;
+    void *prog_shared;
+    struct bpf_object *xdp_obj;
+    struct bpf_link *xdp_link;
+    int xsks_map_fd;
+    int ifindex;
+    uint32_t queue_id;
+    uint32_t xdp_attach_mode;
+    queue pending_tx_queue;
+    uint32_t pending_tx_frames;
+    uint32_t tx_kick_pending;
+    bool rx_drop_contd;
 } if_xdp;
 
 int xdp_init(void);
@@ -108,4 +108,4 @@ int xdp_if_send(struct if_info *info, struct skbuff *skb);
 int xdp_transmit_skb(struct if_info *info, struct skbuff *skb);
 
 
-#endif
+#endif /* XDP_H */

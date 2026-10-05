@@ -11,13 +11,13 @@ static uint32_t hash_round_size(uint32_t requested)
     return size >= requested ? size : 0;
 }
 
-hash* hash_create(uint32_t requested, ptrdiff_t key_offset, uint32_t key_len)
+hash *hash_create(uint32_t requested, ptrdiff_t key_offset, uint32_t key_len)
 {
     uint32_t size = hash_round_size(requested);
     if (!size)
         return NULL;
 
-    hash* h = calloc(1, sizeof(*h));
+    hash *h = calloc(1, sizeof(*h));
     if (!h)
         return NULL;
     h->buckets = calloc(size, sizeof(*h->buckets));
@@ -33,9 +33,9 @@ hash* hash_create(uint32_t requested, ptrdiff_t key_offset, uint32_t key_len)
     return h;
 }
 
-hash* hash_create_safe(uint32_t size, ptrdiff_t key_offset, uint32_t key_len)
+hash *hash_create_safe(uint32_t size, ptrdiff_t key_offset, uint32_t key_len)
 {
-    hash* h = hash_create(size, key_offset, key_len);
+    hash *h = hash_create(size, key_offset, key_len);
     if (!h)
         return NULL;
 
@@ -49,7 +49,7 @@ hash* hash_create_safe(uint32_t size, ptrdiff_t key_offset, uint32_t key_len)
     return h;
 }
 
-void hash_destroy(hash* h)
+void hash_destroy(hash *h)
 {
     if (!h)
         return;
@@ -58,7 +58,7 @@ void hash_destroy(hash* h)
     free(h);
 }
 
-uint32_t general_hash_algorithm(const uint8_t* data, uint32_t len)
+uint32_t general_hash_algorithm(const uint8_t *data, uint32_t len)
 {
     uint32_t value = 2166136261u;
     for (uint32_t i = 0; i < len; i++) {
@@ -68,10 +68,10 @@ uint32_t general_hash_algorithm(const uint8_t* data, uint32_t len)
     return value;
 }
 
-hash_node* hash_find_node_locked(const hash* h, uint32_t index,
-                                 const void* key, uint32_t value)
+hash_node *hash_find_node_locked(const hash *h, uint32_t index,
+                                 const void *key, uint32_t value)
 {
-    for (hash_node* node = h->buckets[index]; node; node = node->next) {
+    for (hash_node *node = h->buckets[index]; node; node = node->next) {
         if (node->hash == value &&
             memcmp(hash_node_key(h, node), key, h->key_len) == 0)
             return node;
@@ -79,7 +79,7 @@ hash_node* hash_find_node_locked(const hash* h, uint32_t index,
     return NULL;
 }
 
-void hash_link_node_locked(hash* h, uint32_t index, hash_node* node,
+void hash_link_node_locked(hash *h, uint32_t index, hash_node *node,
                            uint32_t value)
 {
     node->hash = value;
@@ -92,9 +92,9 @@ void hash_link_node_locked(hash* h, uint32_t index, hash_node* node,
     h->buckets[index] = node;
 }
 
-void hash_unlink_node_locked(hash_node* node)
+void hash_unlink_node_locked(hash_node *node)
 {
-    hash* h = node->owner;
+    hash *h = node->owner;
     *node->pprev = node->next;
     if (node->next)
         node->next->pprev = node->pprev;
@@ -104,19 +104,19 @@ void hash_unlink_node_locked(hash_node* node)
     atomic_fetch_sub_explicit(&h->element_count, 1u, memory_order_release);
 }
 
-hash_node* hash_find_node(const hash* h, const void* key)
+hash_node *hash_find_node(const hash *h, const void *key)
 {
     uint32_t value = general_hash_algorithm(key, h->key_len);
     uint32_t index = hash_bucket_index(h, value);
     HASH_BUCKET_RDLOCK(h, index);
-    hash_node* node = hash_find_node_locked(h, index, key, value);
+    hash_node *node = hash_find_node_locked(h, index, key, value);
     HASH_BUCKET_UNLOCK(h, index);
     return node;
 }
 
-bool hash_add_node(hash* h, hash_node* node)
+bool hash_add_node(hash *h, hash_node *node)
 {
-    const void* key = hash_node_key(h, node);
+    const void *key = hash_node_key(h, node);
     uint32_t value = general_hash_algorithm(key, h->key_len);
     uint32_t index = hash_bucket_index(h, value);
     HASH_BUCKET_WRLOCK(h, index);
@@ -127,7 +127,7 @@ bool hash_add_node(hash* h, hash_node* node)
     return available;
 }
 
-void hash_del_node(hash* h, hash_node* node)
+void hash_del_node(hash *h, hash_node *node)
 {
     uint32_t index = hash_bucket_index(h, node->hash);
     HASH_BUCKET_WRLOCK(h, index);
@@ -135,19 +135,19 @@ void hash_del_node(hash* h, hash_node* node)
     HASH_BUCKET_UNLOCK(h, index);
 }
 
-hash_node* hash_del_key(hash* h, const void* key)
+hash_node *hash_del_key(hash *h, const void *key)
 {
     uint32_t value = general_hash_algorithm(key, h->key_len);
     uint32_t index = hash_bucket_index(h, value);
     HASH_BUCKET_WRLOCK(h, index);
-    hash_node* node = hash_find_node_locked(h, index, key, value);
+    hash_node *node = hash_find_node_locked(h, index, key, value);
     if (node)
         hash_unlink_node_locked(node);
     HASH_BUCKET_UNLOCK(h, index);
     return node;
 }
 
-bool hash_is_empty(const hash* h)
+bool hash_is_empty(const hash *h)
 {
     return atomic_load_explicit(&h->element_count,
                                 memory_order_acquire) == 0;

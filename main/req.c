@@ -1,24 +1,26 @@
+#include "req.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
-#include "req.h"
-#include "req_async.h"
-#include "req_socket.h"
 #include "fd_entry.h"
 #include "log.h"
+#include "req_async.h"
+#include "req_socket.h"
 #include "socket.h"
+#include "stack.h"
 #include "worker.h"
 
-req* req_create(void)
+req *req_create(void)
 {
-    req* r = calloc(1, sizeof(*r));
+    req *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     spin_lock_init(&r->done_mtx);
     pthread_mutex_init(&r->done_wait_mtx, NULL);
@@ -27,7 +29,7 @@ req* req_create(void)
     return r;
 }
 
-void req_init(req* r)
+void req_init(req *r)
 {
     memset(r, 0, sizeof(*r));
     spin_lock_init(&r->done_mtx);
@@ -37,7 +39,14 @@ void req_init(req* r)
 
 }
 
-int req_push_wait(worker* w, req* r)
+static void req_destroy_sync_state(req *r)
+{
+    pthread_cond_destroy(&r->done_cv);
+    pthread_mutex_destroy(&r->done_wait_mtx);
+    (void)pthread_spin_destroy(&r->done_mtx);
+}
+
+int req_push_wait(worker *w, req *r)
 {
     if (!w) {
         errno = EBADF;
@@ -47,6 +56,32 @@ int req_push_wait(worker* w, req* r)
     bool no_wait = r->flag.no_wait;
     r->worker = w;
 
+    worker *current = get_current_worker();
+    if (current && current != w && !no_wait) {
+        /* A worker callback cannot wait for another worker. */
+        errno = EAGAIN;
+        req_destroy_sync_state(r);
+        return -1;
+    }
+
+    if (current == w && !no_wait) {
+        /* Execute synchronous fd APIs inline when already on the owner.
+         * A NULL worker marks the inline request, so a would-block result
+         * never attaches a stack request to a socket. */
+        r->worker = NULL;
+        stack_process_request(r);
+        if (!r->done)
+            req_notify(r, -EAGAIN);
+
+        int ret = r->ret;
+        req_destroy_sync_state(r);
+        if (ret < 0) {
+            errno = -ret;
+            return -1;
+        }
+        return ret;
+    }
+
     if (!no_wait)
         pthread_mutex_lock(&r->done_wait_mtx);
     notify_queue_push(&w->stack.req_msg, &r->node);
@@ -54,9 +89,7 @@ int req_push_wait(worker* w, req* r)
         while (!r->done)
             pthread_cond_wait(&r->done_cv, &r->done_wait_mtx);
         pthread_mutex_unlock(&r->done_wait_mtx);
-        pthread_cond_destroy(&r->done_cv);
-        pthread_mutex_destroy(&r->done_wait_mtx);
-        (void)pthread_spin_destroy(&r->done_mtx);
+        req_destroy_sync_state(r);
     }
 
     /* An asynchronous request may already have been completed and freed by
@@ -107,7 +140,7 @@ int net_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 
 int net_listen(int fd, int backlog)
 {
-    fd_entry* entry = hold_fd_entry(fd);
+    fd_entry *entry = hold_fd_entry(fd);
     if (!entry || !entry->ops->listen) {
         errno = entry ? ENOTSOCK : EBADF;
         PUT_REF(entry);
@@ -120,7 +153,7 @@ int net_listen(int fd, int backlog)
 
 int net_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 {
-    fd_entry* entry = hold_fd_entry(fd);
+    fd_entry *entry = hold_fd_entry(fd);
     if (!entry || !entry->ops->accept) {
         errno = entry ? ENOTSOCK : EBADF;
         PUT_REF(entry);
@@ -265,7 +298,7 @@ int net_fcntl(int fd, int cmd, ...)
 
 int net_close(int fd)
 {
-    fd_entry* entry = hold_fd_entry(fd);
+    fd_entry *entry = hold_fd_entry(fd);
     if (!entry || !entry->ops->close) {
         PUT_REF(entry);
         errno = EBADF;
@@ -278,7 +311,7 @@ int net_close(int fd)
 
 int net_shutdown(int fd, int how)
 {
-    fd_entry* entry = hold_fd_entry(fd);
+    fd_entry *entry = hold_fd_entry(fd);
     if (!entry || !entry->ops->shutdown) {
         errno = entry ? ENOTSOCK : EBADF;
         PUT_REF(entry);
@@ -349,12 +382,12 @@ int net_clear_callback(int fd)
     return net_set_callback(fd, 0, NULL, NULL);
 }
 
-void req_notify(req* r, int ret)
+void req_notify(req *r, int ret)
 {
     bool notify_free;
     bool async;
     bool wake_waiter = !r->flag.no_wait;
-    async_cq* cq = NULL;
+    async_cq *cq = NULL;
 
     if (wake_waiter)
         pthread_mutex_lock(&r->done_wait_mtx);

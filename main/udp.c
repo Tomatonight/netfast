@@ -1,37 +1,39 @@
+#include "udp.h"
+
 #include <errno.h>
 #include <fcntl.h>
-#include "udp.h"
-#include "log.h"
+
 #include "base.h"
-#include "queue.h"
+#include "ether.h"
+#include "fd_entry.h"
+#include "icmp.h"
 #include "ip.h"
 #include "ipv6.h"
 #include "ipv6_ext.h"
-#include "ether.h"
-#include "fd_entry.h"
-#include "worker.h" /* g_workers/g_worker_num */
-#include "icmp.h"
+#include "log.h"
+#include "queue.h"
 #include "rss.h"
+#include "tcp_metrics.h"
 #include "thread.h"
+#include "worker.h" /* g_workers/g_worker_num */
 
 /* ── 报文输出、查找和首部构造 ──────────────────────────── */
 
 /* IP fragmentation mutates and splits its input skb.  Preserve other
  * references, while allowing the normal single-owner send to fragment in
  * place. */
-static int udp_output(skbuff* skb)
+static int udp_output(skbuff *skb)
 {
-    skbuff* output = skb;
+    skbuff *output = skb;
     uint32_t ip_header = skb->family == AF_INET6
         ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
-    if (route_info_is_valid(skb->route, skb->route_generation) &&
-        skb_data_len(skb) + ip_header > get_route_mtu(skb->route) &&
-        GET_REF_CNT(skb) > 1) {
-        output = skb_clone(skb);
-        if (!output)
-            return -ENOMEM;
-    }
-
+    uint32_t mtu = route_info_is_valid(skb->route, skb->route_generation)
+        ? get_route_mtu(skb->route) : 0;
+    if (mtu && skb->sock && skb->sock->metrics)
+        mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
+                              get_current_time_ms());
+    if (mtu && skb_data_len(skb) + ip_header > mtu)
+        return -EMSGSIZE;
     int ret = skb->family == AF_INET6
         ? ipv6_output(output) : ipv4_output(output);
     if (output != skb)
@@ -39,10 +41,9 @@ static int udp_output(skbuff* skb)
     return ret;
 }
 
-static Socket* udp_lookup_recv_socket(uint32_t src_ip, uint16_t src_port,
-                                      uint32_t dst_ip, uint16_t dst_port, worker** socket_worker){
-
-    Socket* sock = search_socket_by_tuple(dst_ip, dst_port, src_ip, src_port, g_stack_maps->udp.tuple_hash4, socket_worker);
+static Socket *udp_lookup_recv_socket(uint32_t src_ip, uint16_t src_port,
+                                      uint32_t dst_ip, uint16_t dst_port, worker ** socket_worker) {
+    Socket *sock = search_socket_by_tuple(dst_ip, dst_port, src_ip, src_port, g_stack_maps->udp.tuple_hash4, socket_worker);
     if (sock) return sock;
 
     sock = search_socket_by_tuple(dst_ip, dst_port, 0, 0, g_stack_maps->udp.tuple_hash4, socket_worker);
@@ -51,12 +52,12 @@ static Socket* udp_lookup_recv_socket(uint32_t src_ip, uint16_t src_port,
     return search_socket_by_tuple(INADDR_ANY, dst_port, 0, 0, g_stack_maps->udp.tuple_hash4, socket_worker);
 }
 
-static Socket* udp_lookup_recv_socket6(const uint8_t src_ip[16], uint16_t src_port,
+static Socket *udp_lookup_recv_socket6(const uint8_t src_ip[16], uint16_t src_port,
                                        const uint8_t dst_ip[16], uint16_t dst_port,
-                                       worker** socket_worker)
+                                       worker ** socket_worker)
 {
     static const uint8_t zero[16];
-    Socket* sock = search_socket_by_tuple6(dst_ip, dst_port, src_ip, src_port,
+    Socket *sock = search_socket_by_tuple6(dst_ip, dst_port, src_ip, src_port,
                                             g_stack_maps->udp.tuple_hash6,
                                             socket_worker);
     if (sock)
@@ -71,8 +72,8 @@ static Socket* udp_lookup_recv_socket6(const uint8_t src_ip[16], uint16_t src_po
                                    socket_worker);
 }
 
-static void udp_build_header(Socket* sock, skbuff* skb){
-    udp_hdr* hdr = skb->udp_hdr;
+static void udp_build_header(Socket *sock, skbuff *skb) {
+    udp_hdr *hdr = skb->udp_hdr;
     skb->tx_checksum_offset = 0;
     uint16_t udp_len = (uint16_t)skb_data_len(skb);
     hdr->sport = sock->sport;
@@ -104,7 +105,7 @@ static void udp_build_header(Socket* sock, skbuff* skb){
     if (hdr->check == 0)
         hdr->check = 0xffffu;
 }
-static int udp_queue_socket_skb(Socket* sock, skbuff* skb)
+static int udp_queue_socket_skb(Socket *sock, skbuff *skb)
 {
     uint32_t data_len = skb_data_len(skb);
     if (data_len > SOCKET_USEABLE_RECV_BUFF_SIZE(sock))
@@ -117,11 +118,11 @@ static int udp_queue_socket_skb(Socket* sock, skbuff* skb)
     return (int)data_len;
 }
 
-static int udp_receive_on_worker(skbuff* skb)
+static int udp_receive_on_worker(skbuff *skb)
 {
-    udp_hdr* udp = skb->udp_hdr;
-    worker* socket_worker;
-    Socket* sock;
+    udp_hdr *udp = skb->udp_hdr;
+    worker *socket_worker;
+    Socket *sock;
     uint32_t rss = udp->sport;
     if (skb->family == AF_INET6) {
         sock = udp_lookup_recv_socket6(skb->ipv6_hdr->saddr, udp->sport,
@@ -130,7 +131,7 @@ static int udp_receive_on_worker(skbuff* skb)
         for (uint32_t i = 0; i < 16; ++i)
             rss = rss * 33u + skb->ipv6_hdr->saddr[i];
     } else {
-        ipv4_hdr* ip = skb->ipv4_hdr;
+        ipv4_hdr *ip = skb->ipv4_hdr;
         sock = udp_lookup_recv_socket(ip->saddr, udp->sport,
                                       ip->daddr, udp->dport,
                                       &socket_worker);
@@ -147,43 +148,43 @@ static int udp_receive_on_worker(skbuff* skb)
         worker_enqueue_skb(socket_worker, skb, udp_receive_on_worker);
         return 0;
     }
-    Socket* aim_sock = sock->tuple_node.next ? socket_select(sock, rss) : sock;
+    Socket *aim_sock = sock->tuple_node.next ? socket_select(sock, rss) : sock;
     udp_queue_socket_skb(aim_sock, skb);
     return 0;
 }
 
 /* ── 输入路径 ──────────────────────────────────────────── */
 
-int udp_recv(skbuff* skb){
-    if (skb_data0_len(skb) < sizeof(udp_hdr))
+int udp_recv(skbuff *skb) {
+    if (unlikely(skb_data0_len(skb) < sizeof(udp_hdr)))
         return -1;
 
-    udp_hdr* udp=(udp_hdr*)skb_start(skb);
+    udp_hdr *udp=(udp_hdr*)skb_start(skb);
     skb->udp_hdr = udp;
     uint16_t udp_total_len = ntohs(udp->len);
-    if (udp_total_len < sizeof(udp_hdr)) {
+    if (unlikely(udp_total_len < sizeof(udp_hdr))) {
         DEBUG_LOG("Invalid UDP length=%u", udp_total_len);
         return -1;
     }
 
     uint32_t avail = skb_data_len(skb);
-    if (udp_total_len > avail) {
-		DEBUG_LOG("UDP length exceeds available data udp_len=%u avail=%u", udp_total_len, avail);
+    if (unlikely(udp_total_len > avail)) {
+        DEBUG_LOG("UDP length exceeds available data udp_len=%u avail=%u", udp_total_len, avail);
         return -1;
     }
-	if (skb->family == AF_INET6 && udp->check == 0)
-		return -1;
-	if ((skb->family == AF_INET6 || udp->check)
-	    && !skb->flag.is_hw_rcv_checksum
-	    && (skb->family == AF_INET6
-	        ? skb_checksum_protocol6(skb, udp_total_len,
-	                                 skb->ipv6_hdr->saddr,
-	                                 skb->ipv6_hdr->daddr, IPPROTO_UDP)
-	        : skb_checksum_protocol(skb, udp_total_len,
-	                                skb->ipv4_hdr->saddr,
-	                                skb->ipv4_hdr->daddr,
-	                                IPPROTO_UDP)) != 0)
-		return -1;
+    if (skb->family == AF_INET6 && udp->check == 0)
+        return -1;
+    if ((skb->family == AF_INET6 || udp->check)
+        && !skb->flag.is_hw_rcv_checksum
+        && (skb->family == AF_INET6
+            ? skb_checksum_protocol6(skb, udp_total_len,
+                                     skb->ipv6_hdr->saddr,
+                                     skb->ipv6_hdr->daddr, IPPROTO_UDP)
+            : skb_checksum_protocol(skb, udp_total_len,
+                                    skb->ipv4_hdr->saddr,
+                                    skb->ipv4_hdr->daddr,
+                                    IPPROTO_UDP)) != 0)
+        return -1;
     skb_truncate(skb, udp_total_len);
     if (!skb_consume(skb, sizeof(*udp), true))
         return -1;
@@ -191,10 +192,10 @@ int udp_recv(skbuff* skb){
 }
 /* ── Socket 协议操作回调 ───────────────────────────────── */
 
-static int udp_bind(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
+static int udp_bind(struct Socket *sock, req *r, const struct sockaddr_in *addr, socklen_t addrlen)
 {
     (void)r;
-    bind_table* bound_table = udp_bound_table(sock->family);
+    bind_table *bound_table = udp_bound_table(sock->family);
     int ret = socket_bind_local(sock, addr, addrlen, bound_table);
     if (ret < 0)
         return ret;
@@ -207,12 +208,12 @@ static int udp_bind(struct Socket *sock, req* r, const struct sockaddr_in *addr,
     return 0;
 }
 
-static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *addr, socklen_t addrlen)
+static int udp_connect(struct Socket *sock, req *r, const struct sockaddr_in *addr, socklen_t addrlen)
 {
     bool was_connected = sock->flag.is_connected;
     bool was_hashed = sock->flag.is_hash;
     bool is_v6 = sock->family == AF_INET6;
-    const struct sockaddr_in6* addr6 = (const struct sockaddr_in6*)addr;
+    const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6*)addr;
     socklen_t required = is_v6 ? sizeof(*addr6) : sizeof(*addr);
     uint32_t old_dip = sock->dip;
     uint8_t old_dip6[16];
@@ -256,7 +257,7 @@ static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *ad
 
     /* Ensure the final tuple maps to this worker before installing it. */
     {
-        worker* tuple_worker = rss_select_worker_by_tuple(sock->family,
+        worker *tuple_worker = rss_select_worker_by_tuple(sock->family,
             is_v6 ? sock->sip6 : (const uint8_t*)&sock->sip,
             is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
             sock->sport, sock->dport);
@@ -282,12 +283,12 @@ static int udp_connect(struct Socket *sock, req* r, const struct sockaddr_in *ad
     return 0;
 }
 
-static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, int flags, sockaddr_in* daddr, socklen_t* addrlen){
-    if(!sock->flag.is_bound){
+static int udp_recvfrom(struct Socket *sock, req *r, void *buf, uint32_t len, int flags, sockaddr_in *daddr, socklen_t *addrlen) {
+    if (!sock->flag.is_bound) {
         //DEBUG_LOG("UDP Socket is not bound");
         return -ENOTCONN;
     }
-    if(!sock->flag.is_hash){
+    if (!sock->flag.is_hash) {
         //DEBUG_LOG("UDP Socket is not hashed");
         return -ENOTCONN;
     }
@@ -298,21 +299,21 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     }
 
     queue *q=&sock->recv_queue;
-    if(q->element_number==0){
-        /* MSG_DONTWAIT or O_NONBLOCK �?EAGAIN */
+    if (q->element_number==0) {
+        /* MSG_DONTWAIT or O_NONBLOCK returns EAGAIN. */
         if (!r || (flags & MSG_DONTWAIT) || (sock->file_flags & O_NONBLOCK)) {
             return -EAGAIN;
         }
 
         /* Blocking semantics */
-        if(!sock->options.recv_timeout){
+        if (!sock->options.recv_timeout) {
             stack_wait_request(sock, r, REQ_WAITING_READ);
             return REQ_PENDING;
         }
 
         /* SO_RCVTIMEO semantics */
-        if(r->status == REQ_WAITING_READ && r->timeout_task
-            && r->timeout_task->timeout <= get_current_time_ms()){
+        if (r->status == REQ_WAITING_READ && r->timeout_task
+            && r->timeout_task->timeout <= get_current_time_ms()) {
             return -EAGAIN;
         }
 
@@ -323,7 +324,7 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     bool is_peek = (flags & MSG_PEEK) != 0;
 
     /* MSG_PEEK: look at the head without dequeuing, no accounting change */
-    skbuff* skb = is_peek ? SKB_FROM_NODE(get_queue_first(q), queue_node)
+    skbuff *skb = is_peek ? SKB_FROM_NODE(get_queue_first(q), queue_node)
                           : SKB_FROM_NODE(pop_queue(q), queue_node);
 
     uint32_t avail = skb_data_len(skb);
@@ -382,13 +383,13 @@ static int udp_recvfrom(struct Socket *sock, req* r, void *buf, uint32_t len, in
     return (int)((truncated && (flags & MSG_TRUNC)) ? avail : recv_len);
 }
 
-static int udp_read(struct Socket *sock, req* r, void *buf, uint32_t len)
+static int udp_read(struct Socket *sock, req *r, void *buf, uint32_t len)
 {
     return udp_recvfrom(sock, r, buf, len, 0, NULL, NULL);
 }
 
 
-static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len, int flags, sockaddr_in* dest_addr, socklen_t addrlen){
+static int udp_sendto(struct Socket *sock, req *r, const void *buf, uint32_t len, int flags, sockaddr_in *dest_addr, socklen_t addrlen) {
     (void)flags;
     int ret = 0;
     uint8_t orig_sip6[16], orig_dip6[16];
@@ -399,14 +400,14 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     uint16_t orig_dport = sock->dport;
     bool was_bound = sock->flag.is_bound;
     bool is_v6 = sock->family == AF_INET6;
-    struct sockaddr_in6* dest6 = (struct sockaddr_in6*)dest_addr;
+    struct sockaddr_in6 *dest6 = (struct sockaddr_in6*)dest_addr;
     static const uint8_t zero6[16];
 
     uint32_t max_payload = UINT16_MAX - sizeof(udp_hdr) -
         (is_v6 ? 0u : (uint32_t)sizeof(ipv4_hdr));
     if (len > max_payload)
         return -EMSGSIZE;
-    bind_table* bound_table = udp_bound_table(sock->family);
+    bind_table *bound_table = udp_bound_table(sock->family);
 
     socklen_t required = is_v6 ? sizeof(*dest6) : sizeof(*dest_addr);
     if (dest_addr && addrlen < required)
@@ -466,7 +467,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     } else if ((is_v6 && memcmp(sock->sip6, zero6, 16) == 0) ||
                (!is_v6 && sock->sip == 0)) {
         uint8_t saddr[16];
-        const uint8_t* daddr = is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip;
+        const uint8_t *daddr = is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip;
         if (!if_search_best_saddr_by_daddr(sock->route->if_info, sock->family,
                                            daddr, saddr)) {
             ret = -EADDRNOTAVAIL;
@@ -492,7 +493,7 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
 
     /* Ensure the final (sip, sport, dip, dport) tuple maps to this worker. */
     {
-        worker* tuple_worker = rss_select_worker_by_tuple(sock->family,
+        worker *tuple_worker = rss_select_worker_by_tuple(sock->family,
             is_v6 ? sock->sip6 : (const uint8_t*)&sock->sip,
             is_v6 ? sock->dip6 : (const uint8_t*)&sock->dip,
             sock->sport, sock->dport);
@@ -519,14 +520,14 @@ static int udp_sendto(struct Socket *sock, req* r, const void *buf, uint32_t len
     uint32_t udp_l2_len = sock->route->if_info->l2_len;
     uint32_t hdr_len = sizeof(udp_hdr) +
         (is_v6 ? MAX_IP6_HDR_WITH_EXT_LEN : sizeof(ipv4_hdr)) + udp_l2_len;
-    skbuff* skb = skb_alloc(hdr_len + len);
+    skbuff *skb = skb_alloc(hdr_len + len);
     if (!skb) {
         ERR_LOG("skb alloc failed");
         ret = -ENOMEM;
         goto exit;
     }
     skb_reserve(skb, hdr_len);
-    udp_hdr* udp = (udp_hdr*)skb_data_push(
+    udp_hdr *udp = (udp_hdr*)skb_data_push(
         skb, sizeof(*udp), sizeof(*udp));
     if (!udp) {
         PUT_REF(skb);
@@ -581,28 +582,28 @@ exit:
     return ret;
 }
 
-static int udp_write(struct Socket *sock, req* r, const void *buf, uint32_t len)
+static int udp_write(struct Socket *sock, req *r, const void *buf, uint32_t len)
 {
     return udp_sendto(sock, r, buf, len, 0, NULL, 0);
 }
 
 
 
-static int udp_getsockname(struct Socket *sock, req* r, struct sockaddr_in *addr, socklen_t *addrlen)
+static int udp_getsockname(struct Socket *sock, req *r, struct sockaddr_in *addr, socklen_t *addrlen)
 {
     (void)r;
     struct sockaddr_storage out;
     socklen_t required;
     memset(&out, 0, sizeof(out));
     if (sock->family == AF_INET6) {
-        struct sockaddr_in6* addr6 = (struct sockaddr_in6*)&out;
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)&out;
         addr6->sin6_family = AF_INET6;
         memcpy(&addr6->sin6_addr, sock->sip6, 16);
         addr6->sin6_port = sock->sport;
         addr6->sin6_scope_id = sock->sip6_scope_id;
         required = sizeof(*addr6);
     } else {
-        struct sockaddr_in* addr4 = (struct sockaddr_in*)&out;
+        struct sockaddr_in *addr4 = (struct sockaddr_in*)&out;
         addr4->sin_family = AF_INET;
         addr4->sin_addr.s_addr = sock->sip;
         addr4->sin_port = sock->sport;
@@ -615,7 +616,7 @@ static int udp_getsockname(struct Socket *sock, req* r, struct sockaddr_in *addr
     return 0;
 }
 
-static int udp_getpeername(struct Socket *sock, req* r, struct sockaddr_in *addr, socklen_t *addrlen)
+static int udp_getpeername(struct Socket *sock, req *r, struct sockaddr_in *addr, socklen_t *addrlen)
 {
     (void)r;
     if (!sock->flag.is_connected)
@@ -624,14 +625,14 @@ static int udp_getpeername(struct Socket *sock, req* r, struct sockaddr_in *addr
     socklen_t required;
     memset(&out, 0, sizeof(out));
     if (sock->family == AF_INET6) {
-        struct sockaddr_in6* addr6 = (struct sockaddr_in6*)&out;
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)&out;
         addr6->sin6_family = AF_INET6;
         memcpy(&addr6->sin6_addr, sock->dip6, 16);
         addr6->sin6_port = sock->dport;
         addr6->sin6_scope_id = sock->dip6_scope_id;
         required = sizeof(*addr6);
     } else {
-        struct sockaddr_in* addr4 = (struct sockaddr_in*)&out;
+        struct sockaddr_in *addr4 = (struct sockaddr_in*)&out;
         addr4->sin_family = AF_INET;
         addr4->sin_addr.s_addr = sock->dip;
         addr4->sin_port = sock->dport;
@@ -644,7 +645,7 @@ static int udp_getpeername(struct Socket *sock, req* r, struct sockaddr_in *addr
     return 0;
 }
 
-static int udp_setsockopt(struct Socket* sock, req* r, int level, int optname, const void* optval, socklen_t optlen)
+static int udp_setsockopt(struct Socket *sock, req *r, int level, int optname, const void *optval, socklen_t optlen)
 {
     (void)r;
     if (level == SOL_SOCKET)
@@ -652,7 +653,7 @@ static int udp_setsockopt(struct Socket* sock, req* r, int level, int optname, c
     return -ENOPROTOOPT;
 }
 
-static int udp_getsockopt(struct Socket* sock, req* r, int level,int optname,void* optval,socklen_t* optlen)
+static int udp_getsockopt(struct Socket *sock, req *r, int level,int optname,void *optval,socklen_t *optlen)
 {
     (void)r;
     if (*optlen == 0)
@@ -663,19 +664,24 @@ static int udp_getsockopt(struct Socket* sock, req* r, int level,int optname,voi
     return -ENOPROTOOPT;
 }
 
-static int udp_release(struct Socket *sock, req* r)
+static int udp_release(struct Socket *sock, req *r)
 {
     (void)r;
     destroy_socket(sock);
     return 0;
 }
 
-static int udp_icmp_process(struct Socket* sock,
-                            const icmp_error_info* info, int err)
+static int udp_icmp_process(struct Socket *sock,
+                            const icmp_error_info *info, int err)
 {
-    (void)info;
     if (!sock->flag.is_bound || !sock->flag.is_connected) {
         return 0;
+    }
+
+    if (err == EMSGSIZE && info->mtu) {
+        (void)ip_metrics_update_pmtu(sock->metrics, info->mtu,
+                                      get_route_mtu(sock->route),
+                                      get_current_time_ms());
     }
 
     sock->error = err;

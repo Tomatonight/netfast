@@ -28,7 +28,7 @@ struct {
 #define XDP_MAX_V6_EXT    4
 
 static __always_inline int xdp_port_owned(
-    __u16 port, const netfast_xdp_config* config)
+    __u16 port, const netfast_xdp_config *config)
 {
     return port >= config->source_port_first &&
            port <= config->source_port_last;
@@ -37,10 +37,10 @@ static __always_inline int xdp_port_owned(
 /* XDP sees ingress packets.  For a normal TCP/UDP ingress packet, only the
  * destination port belongs to the local NetFast socket. */
 static __always_inline int xdp_ingress_port_owned(
-    const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
-    const __be16* ports = (const __be16 *)cursor;
+    const __be16 *ports = (const __be16 *)cursor;
     if ((const void *)(ports + 2) > data_end)
         return 0;
 
@@ -51,10 +51,10 @@ static __always_inline int xdp_ingress_port_owned(
  * error.  For a packet sent by a local NetFast socket, that quoted packet's
  * source port is the local port, so ICMP needs a separate source-port test. */
 static __always_inline int xdp_quoted_source_port_owned(
-    const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
-    const __be16* ports = (const __be16 *)cursor;
+    const __be16 *ports = (const __be16 *)cursor;
     if ((const void *)(ports + 2) > data_end)
         return 0;
 
@@ -62,10 +62,10 @@ static __always_inline int xdp_quoted_source_port_owned(
 }
 
 static __always_inline int xdp_ipv4_icmp_error(
-    const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
-    const struct icmphdr* icmp = (const void *)cursor;
+    const struct icmphdr *icmp = (const void *)cursor;
     if ((const void *)(icmp + 1) > data_end)
         return 0;
 
@@ -74,7 +74,7 @@ static __always_inline int xdp_ipv4_icmp_error(
         icmp->type != ICMP_PARAMETERPROB)
         return 0;
 
-    const struct iphdr* quoted = (const void *)(icmp + 1);
+    const struct iphdr *quoted = (const void *)(icmp + 1);
     if ((const void *)(quoted + 1) > data_end ||
         quoted->version != 4 || quoted->ihl < 5)
         return 0;
@@ -91,15 +91,15 @@ static __always_inline int xdp_ipv4_icmp_error(
 }
 
 static __always_inline int xdp_ipv6_quoted_ports(
-    const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
-    const struct ipv6hdr* quoted = (const void *)cursor;
+    const struct ipv6hdr *quoted = (const void *)cursor;
     if ((const void *)(quoted + 1) > data_end)
         return 0;
 
     __u8 next_header = quoted->nexthdr;
-    const __u8* next = (const __u8 *)(quoted + 1);
+    const __u8 *next = (const __u8 *)(quoted + 1);
 
 #pragma unroll
     for (int i = 0; i < XDP_MAX_V6_EXT; i++) {
@@ -150,8 +150,8 @@ static __always_inline int xdp_ipv6_quoted_ports(
 }
 
 static __always_inline int xdp_ipv6_icmp_error(
-    const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
     if (cursor + 1 > (const __u8 *)data_end)
         return 0;
@@ -167,8 +167,8 @@ static __always_inline int xdp_ipv6_icmp_error(
 }
 
 static __always_inline int xdp_l4_owned(
-    __u8 protocol, const __u8* cursor, void* data_end,
-    const netfast_xdp_config* config)
+    __u8 protocol, const __u8 *cursor, void *data_end,
+    const netfast_xdp_config *config)
 {
     if (protocol == IPPROTO_ICMP)
         return xdp_ipv4_icmp_error(cursor, data_end, config);
@@ -180,9 +180,9 @@ static __always_inline int xdp_l4_owned(
 }
 
 static __always_inline int xdp_parse_ethernet(
-    void** data, void* data_end, __u16* protocol)
+    void ** data, void *data_end, __u16 *protocol)
 {
-    struct ethhdr* eth = *data;
+    struct ethhdr *eth = *data;
     if ((void *)(eth + 1) > data_end)
         return -1;
 
@@ -209,7 +209,7 @@ static __always_inline int xdp_parse_ethernet(
     return 0;
 }
 
-static __always_inline int xdp_redirect_current_queue(struct xdp_md* ctx)
+static __always_inline int xdp_redirect_current_queue(struct xdp_md *ctx)
 {
     __u32 queue = ctx->rx_queue_index;
     if (!bpf_map_lookup_elem(&xsks_map, &queue))
@@ -218,14 +218,14 @@ static __always_inline int xdp_redirect_current_queue(struct xdp_md* ctx)
 }
 
 static __always_inline int xdp_ipv6_owned(
-    void* data, void* data_end, const netfast_xdp_config* config)
+    void *data, void *data_end, const netfast_xdp_config *config)
 {
-    struct ipv6hdr* ip6 = data;
+    struct ipv6hdr *ip6 = data;
     if ((void *)(ip6 + 1) > data_end)
         return 0;
 
     __u8 next_header = ip6->nexthdr;
-    __u8* cursor = (__u8 *)(ip6 + 1);
+    __u8 *cursor = (__u8 *)(ip6 + 1);
 
     if (next_header == IPPROTO_FRAGMENT)
         return config->redirect_fragments;
@@ -252,9 +252,9 @@ static __always_inline int xdp_ipv6_owned(
 }
 
 static __always_inline int xdp_ipv4_owned(
-    void* data, void* data_end, const netfast_xdp_config* config)
+    void *data, void *data_end, const netfast_xdp_config *config)
 {
-    struct iphdr* ip = data;
+    struct iphdr *ip = data;
     if ((void *)(ip + 1) > data_end || ip->ihl < 5)
         return 0;
 
@@ -275,16 +275,16 @@ static __always_inline int xdp_ipv4_owned(
 }
 
 SEC("xdp.frags")
-int xdp_redirect(struct xdp_md* ctx)
+int xdp_redirect(struct xdp_md *ctx)
 {
     __u32 config_key = NETFAST_XDP_CONFIG_KEY;
-    const netfast_xdp_config* config =
+    const netfast_xdp_config *config =
         bpf_map_lookup_elem(&netfast_cfg, &config_key);
     if (!config)
         return XDP_PASS;
 
-    void* data = (void *)(long)ctx->data;
-    void* data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
     __u16 protocol;
     if (xdp_parse_ethernet(&data, data_end, &protocol) < 0)
         return XDP_PASS;

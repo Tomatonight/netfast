@@ -2,8 +2,8 @@
 
 #include <errno.h>
 #include <linux/genetlink.h>
-#include <linux/netlink.h>
 #include <linux/netdev.h>
+#include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -22,9 +22,9 @@
 #define NETLINK_DUMP_TIMEOUT_MS 5000u
 #define NETLINK_GENERIC_TIMEOUT_MS 1000u
 
-static int netlink_attr_put(void* buffer, size_t capacity,
-                            struct nlmsghdr* nlh, uint16_t type,
-                            const void* data, size_t len)
+static int netlink_attr_put(void *buffer, size_t capacity,
+                            struct nlmsghdr *nlh, uint16_t type,
+                            const void *data, size_t len)
 {
     size_t offset = NLMSG_ALIGN(nlh->nlmsg_len);
     size_t attr_len = NLA_HDRLEN + len;
@@ -33,7 +33,7 @@ static int netlink_attr_put(void* buffer, size_t capacity,
     if (offset + total > capacity)
         return -EMSGSIZE;
 
-    struct nlattr* attr = (struct nlattr*)((uint8_t*)buffer + offset);
+    struct nlattr *attr = (struct nlattr*)((uint8_t*)buffer + offset);
     attr->nla_type = type;
     attr->nla_len = (uint16_t)attr_len;
     memcpy((uint8_t*)attr + NLA_HDRLEN, data, len);
@@ -45,13 +45,13 @@ static int netlink_attr_put(void* buffer, size_t capacity,
 
 static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
                                 uint8_t version, uint32_t seq,
-                                uint16_t request_type, const void* request_data,
+                                uint16_t request_type, const void *request_data,
                                 size_t request_len, uint16_t response_type,
-                                void* response_data, size_t response_len)
+                                void *response_data, size_t response_len)
 {
     uint8_t request[256] = {0};
-    struct nlmsghdr* nlh = (struct nlmsghdr*)request;
-    struct genlmsghdr* genl = (struct genlmsghdr*)NLMSG_DATA(nlh);
+    struct nlmsghdr *nlh = (struct nlmsghdr*)request;
+    struct genlmsghdr *genl = (struct genlmsghdr*)NLMSG_DATA(nlh);
 
     nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
     nlh->nlmsg_type = family;
@@ -65,7 +65,7 @@ static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
     if (ret < 0)
         return ret;
 
-    struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
+    struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
     ssize_t sent = sendto(fd, request, nlh->nlmsg_len, 0,
                           (struct sockaddr*)&kernel, sizeof(kernel));
     if (sent != (ssize_t)nlh->nlmsg_len)
@@ -77,7 +77,7 @@ static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
         if (now >= deadline)
             return -ETIMEDOUT;
 
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
         ret = poll(&pfd, 1, (int)(deadline - now));
         if (ret < 0) {
             if (errno == EINTR)
@@ -96,14 +96,14 @@ static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
         }
 
         int remaining = (int)received;
-        for (struct nlmsghdr* msg = (struct nlmsghdr*)reply;
+        for (struct nlmsghdr *msg = (struct nlmsghdr*)reply;
              NLMSG_OK(msg, remaining); msg = NLMSG_NEXT(msg, remaining)) {
             if (msg->nlmsg_seq != seq)
                 continue;
             if (msg->nlmsg_type == NLMSG_ERROR) {
                 if (msg->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr)))
                     return -EPROTO;
-                const struct nlmsgerr* error =
+                const struct nlmsgerr *error =
                     (const struct nlmsgerr*)NLMSG_DATA(msg);
                 return error->error ? error->error : -ENOENT;
             }
@@ -112,9 +112,9 @@ static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
                 continue;
 
             size_t attr_len = msg->nlmsg_len - NLMSG_HDRLEN - GENL_HDRLEN;
-            const uint8_t* pos = (const uint8_t*)NLMSG_DATA(msg) + GENL_HDRLEN;
+            const uint8_t *pos = (const uint8_t*)NLMSG_DATA(msg) + GENL_HDRLEN;
             while (attr_len >= sizeof(struct nlattr)) {
-                const struct nlattr* attr = (const struct nlattr*)pos;
+                const struct nlattr *attr = (const struct nlattr*)pos;
                 if (attr->nla_len < NLA_HDRLEN || attr->nla_len > attr_len)
                     return -EPROTO;
 
@@ -137,7 +137,7 @@ static int netlink_genl_request(int fd, uint16_t family, uint8_t command,
     }
 }
 
-int netlink_get_xsk_features(uint32_t ifindex, uint64_t* features)
+int netlink_get_xsk_features(uint32_t ifindex, uint64_t *features)
 {
     if (!ifindex || !features)
         return -EINVAL;
@@ -147,7 +147,7 @@ int netlink_get_xsk_features(uint32_t ifindex, uint64_t* features)
     if (fd < 0)
         return -errno;
 
-    struct sockaddr_nl local = {.nl_family = AF_NETLINK};
+    struct sockaddr_nl local = { .nl_family = AF_NETLINK };
     int ret = bind(fd, (struct sockaddr*)&local, sizeof(local));
     if (ret < 0) {
         ret = -errno;
@@ -171,7 +171,7 @@ int netlink_get_xsk_features(uint32_t ifindex, uint64_t* features)
     return ret;
 }
 
-static void netlink_process_msg(struct nlmsghdr* nlh)
+static void netlink_process_msg(struct nlmsghdr *nlh)
 {
     switch (nlh->nlmsg_type) {
         case RTM_NEWLINK:
@@ -217,7 +217,7 @@ static int netlink_send_dump(int fd, int type, uint32_t seq)
     return -1;
 }
 
-static int netlink_dump_error(const struct nlmsghdr* nlh)
+static int netlink_dump_error(const struct nlmsghdr *nlh)
 {
     if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
         errno = EPROTO;
@@ -225,7 +225,7 @@ static int netlink_dump_error(const struct nlmsghdr* nlh)
         return -1;
     }
 
-    const struct nlmsgerr* error = (const struct nlmsgerr*)NLMSG_DATA(nlh);
+    const struct nlmsgerr *error = (const struct nlmsgerr*)NLMSG_DATA(nlh);
     if (error->error == 0)
         return 0;
     errno = -error->error;
@@ -259,7 +259,7 @@ static int netlink_dump_sync(int fd)
                 return -1;
             }
 
-            struct pollfd pfd = {.fd = fd, .events = POLLIN};
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
             int poll_ret = poll(&pfd, 1, (int)(deadline - now));
             if (poll_ret < 0) {
                 if (errno == EINTR)
@@ -288,7 +288,7 @@ static int netlink_dump_sync(int fd)
             }
 
             int remaining = (int)received;
-            struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
+            struct nlmsghdr *nlh = (struct nlmsghdr*)buf;
             for (; NLMSG_OK(nlh, remaining);
                  nlh = NLMSG_NEXT(nlh, remaining)) {
                 if (nlh->nlmsg_seq == seq) {
@@ -312,39 +312,39 @@ static int netlink_dump_sync(int fd)
 }
 
 
-static void netlink_err_cb(struct task* tk)
+static void netlink_err_cb(struct task *tk)
 {
     ERR_LOG("netlink: epoll error/hup on fd=%d", tk->fd);
     exit(-1);
 }
 
-static void netlink_close(worker* w)
+static void netlink_close(worker *w)
 {
     close(w->stack.netlink_fd);
     w->stack.netlink_fd = -1;
 }
 
-int netlink_init(worker* w)
+int netlink_init(worker *w)
 {
-	struct sockaddr_nl sa = {0};
+    struct sockaddr_nl sa = {0};
 
-	w->stack.netlink_fd = socket(AF_NETLINK,
+    w->stack.netlink_fd = socket(AF_NETLINK,
                                  SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
                                  NETLINK_ROUTE);
-	if (w->stack.netlink_fd < 0) {
+    if (w->stack.netlink_fd < 0) {
         ERR_LOG("netlink: Socket failed: %s", strerror(errno));
-		return -1;
-	}
+        return -1;
+    }
 
-	sa.nl_family = AF_NETLINK;
+    sa.nl_family = AF_NETLINK;
     sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE |
                    RTMGRP_NEIGH | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
 
     if (bind(w->stack.netlink_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         ERR_LOG("netlink: bind failed: %s", strerror(errno));
-		netlink_close(w);
-		return -1;
-	}
+        netlink_close(w);
+        return -1;
+    }
 
     if (netlink_dump_sync(w->stack.netlink_fd) < 0) {
         ERR_LOG("netlink: initial dump failed");
@@ -352,7 +352,7 @@ int netlink_init(worker* w)
         return -1;
     }
 
-    task* tk = create_task(TASK_TYPE_FD_READ);
+    task *tk = create_task(TASK_TYPE_FD_READ);
     if (!tk) {
         ERR_LOG("netlink_init: create_task failed");
         netlink_close(w);
@@ -369,10 +369,10 @@ int netlink_init(worker* w)
         return -1;
     }
 
-	return 0;
+    return 0;
 }
 
-void netlink_recv_cb(struct task* tk) {
+void netlink_recv_cb(struct task *tk) {
     int fd = tk->fd;
     char buf[NETLINK_BUFFER_SIZE];
     for (;;) {
@@ -397,7 +397,7 @@ void netlink_recv_cb(struct task* tk) {
         }
 
         int remaining = (int)received;
-        struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
+        struct nlmsghdr *nlh = (struct nlmsghdr*)buf;
         for (; NLMSG_OK(nlh, remaining);
              nlh = NLMSG_NEXT(nlh, remaining)) {
             if (nlh->nlmsg_type == NLMSG_DONE)
@@ -408,7 +408,7 @@ void netlink_recv_cb(struct task* tk) {
                     ERR_LOG("netlink: NLMSG_ERROR but too short len=%u", nlh->nlmsg_len);
                     continue;
                 }
-                struct nlmsgerr* e = (struct nlmsgerr*)NLMSG_DATA(nlh);
+                struct nlmsgerr *e = (struct nlmsgerr*)NLMSG_DATA(nlh);
                 if (e->error != 0) {
                     ERR_LOG("netlink: NLMSG_ERROR=%d (%s) for type=%u seq=%u", e->error, strerror(-e->error),
                             e->msg.nlmsg_type, e->msg.nlmsg_seq);

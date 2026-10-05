@@ -1,8 +1,8 @@
 #ifndef IPV6_H
 #define IPV6_H
 
-#include <stdint.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 
 typedef struct skbuff skbuff;
 
@@ -40,8 +40,8 @@ static inline uint32_t ipv6_make_vtf(uint8_t tc, uint32_t flow_label)
 }
 
 int ipv6_init(void);
-int ipv6_recv(skbuff* skb);
-int ipv6_output(skbuff* skb);
-int ipv6_forward(skbuff* skb);
+int ipv6_recv(skbuff *skb);
+int ipv6_output(skbuff *skb);
+int ipv6_forward(skbuff *skb);
 
 #endif /* IPV6_H */

@@ -1,3 +1,5 @@
+#include "worker.h"
+
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -9,12 +11,11 @@
 #include "log.h"
 #include "loopback.h"
 #include "netlink.h"
-#include "worker.h"
 
-worker* main_worker = NULL;
-worker* g_workers = NULL;
+worker *main_worker = NULL;
+worker *g_workers = NULL;
 int g_worker_num = 0;
-static __thread worker* current_worker = NULL;
+static __thread worker *current_worker = NULL;
 
 static long worker_online_cpu_count(void)
 {
@@ -34,9 +35,9 @@ int worker_bind_cpu(pthread_t tid, int cpu)
     return pthread_setaffinity_np(tid, sizeof(set), &set);
 }
 
-static void* worker_thread_main(void* arg)
+static void *worker_thread_main(void *arg)
 {
-    worker* w = arg;
+    worker *w = arg;
     int idx = (int)(w - g_workers);
     int n_cpus = worker_online_cpu_count();
     worker_bind_cpu(pthread_self(), idx % n_cpus);
@@ -67,7 +68,7 @@ static void* worker_thread_main(void* arg)
     return NULL;
 }
 
-static int worker_wait_started(worker* w)
+static int worker_wait_started(worker *w)
 {
     worker_startup_state state;
     while ((state = atomic_load_explicit(&w->startup_state,
@@ -81,7 +82,7 @@ static int worker_wait_started(worker* w)
     return 0;
 }
 
-int worker_init(worker* w)
+int worker_init(worker *w)
 {
     atomic_init(&w->startup_state, WORKER_STARTUP_PENDING);
     w->master = create_thread();
@@ -96,7 +97,7 @@ int worker_init(worker* w)
     return 0;
 }
 
-static int worker_start(worker* w)
+static int worker_start(worker *w)
 {
     int error = pthread_create(&w->master_tid, NULL, worker_thread_main, w);
     if (error != 0) {
@@ -129,24 +130,31 @@ int worker_start_all(void)
     return worker_wait_started(main_worker);
 }
 
-worker* get_current_worker(void)
+worker *get_current_worker(void)
 {
     return current_worker;
 }
 
-void set_current_worker(worker* w)
+void set_current_worker(worker *w)
 {
     current_worker = w;
 }
 
-worker* worker_select_random(void)
+worker *worker_select_random(void)
 {
     static uint32_t idx = 0;
     return &g_workers[idx++ % (uint32_t)g_worker_num];
 }
 
-void worker_move_request(req* req, worker* new_worker)
+void worker_move_request(req *req, worker *new_worker)
 {
+    if (!req->worker) {
+        /* Inline requests cannot migrate without leaving a stack object
+         * queued after req_push_wait() has returned. */
+        req_notify(req, -EAGAIN);
+        return;
+    }
+
     req->worker = new_worker;
 
     if (LIST_ATTACHED(&req->pn.node))
@@ -158,29 +166,29 @@ void worker_move_request(req* req, worker* new_worker)
     notify_queue_push(&new_worker->stack.req_msg, &req->node);
 }
 
-void worker_enqueue_skb(worker* w, skbuff* skb,
-                        int (*skb_process)(skbuff* skb))
+void worker_enqueue_skb(worker *w, skbuff *skb,
+                        int (*skb_process)(skbuff *skb))
 {
     INC_REF(skb);
     skb->process = skb_process;
     notify_queue_push(&w->stack.pkt_msg, &skb->node);
 }
 
-void submit_req_2_worker(worker* w, void* argv, int (*cb)(void*), bool wait)
+void submit_req_2_worker(worker *w, void *argv, int (*cb)(void*), bool wait)
 {
     if (wait) {
         req r;
         req_init(&r);
 
         r.type = REQ_WORKER_REQ;
-        r.argv.worker_req = (typeof(r.argv.worker_req)){
+        r.argv.worker_req = (typeof(r.argv.worker_req)) {
             .argv = argv,
             .cb = cb,
         };
 
         req_push_wait(w, &r);
     } else {
-        req* r = req_create();
+        req *r = req_create();
         if (!r)
             return;
 
@@ -194,7 +202,7 @@ void submit_req_2_worker(worker* w, void* argv, int (*cb)(void*), bool wait)
     }
 }
 
-void worker_process_submitted_request(req* r)
+void worker_process_submitted_request(req *r)
 {
     int (*cb)(void*) = r->argv.worker_req.cb;
     int ret = 0;

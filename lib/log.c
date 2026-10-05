@@ -1,7 +1,5 @@
 #include "log.h"
 
-#include "init.h"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -11,6 +9,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "init.h"
 
 static int file_fd = -1;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -46,7 +46,7 @@ static bool log_rate_limit_allow(log_rate_limit *limit, uint64_t *suppressed)
     }
 }
 
-static void log_write_all(int fd, const char* data, size_t len)
+static void log_write_all(int fd, const char *data, size_t len)
 {
     size_t offset = 0;
     while (offset < len) {

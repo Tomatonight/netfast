@@ -4,8 +4,8 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "ipv6.h"
 #include "hash.h"
+#include "ipv6.h"
 #include "list.h"
 
 typedef struct skbuff skbuff;
@@ -28,7 +28,7 @@ typedef struct ipv6_frag_hdr {
 #define IPV6_FRAG_OFFSET_MASK  0xFFF8u
 #define IPV6_FRAG_MF_MASK      0x0001u
 
-static inline void ipv6_frag_set(ipv6_frag_hdr* fh, uint16_t offset8, bool mf)
+static inline void ipv6_frag_set(ipv6_frag_hdr *fh, uint16_t offset8, bool mf)
 {
     uint16_t v = (offset8 << 3) & IPV6_FRAG_OFFSET_MASK;
     if (mf)
@@ -63,16 +63,16 @@ typedef struct ipq6 {
 
 /* ── 分片链节点（挂载在 ipq6::frag_head 上）────────────── */
 typedef struct ipq6_frag {
-    skbuff*   skb;
+    skbuff *skb;
     uint32_t  offset;    /* 8-byte units */
     uint32_t  len;       /* payload bytes */
     list_node node;
 } ipq6_frag;
 
 /* ── 接口 ──────────────────────────────────────────────── */
-bool    ipv6_has_frag(const skbuff* skb);
-skbuff* ipv6_defrag(skbuff* skb);
-bool    ipv6_frag(skbuff* skb);
-void    ipq6_timer(task* tk);
+bool    ipv6_has_frag(const skbuff *skb);
+skbuff *ipv6_defrag(skbuff *skb);
+bool    ipv6_frag(skbuff *skb);
+void    ipq6_timer(task *tk);
 
 #endif /* IPV6_EXT_H */

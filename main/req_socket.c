@@ -1,10 +1,11 @@
+#include "req_socket.h"
+
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "req.h"
 #include "fd_entry.h"
-#include "req_socket.h"
+#include "req.h"
 #include "worker.h"
 
 /* Copy an address supplied by the caller into a request-owned
@@ -28,7 +29,7 @@ static int req_copy_sockaddr(struct sockaddr_storage *dst,
     return 0;
 }
 
-static int req_socket_bind(fd_entry* entry, const struct sockaddr *addr, socklen_t addrlen)
+static int req_socket_bind(fd_entry *entry, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (!addr) {
         errno = EFAULT;
@@ -49,7 +50,7 @@ static int req_socket_bind(fd_entry* entry, const struct sockaddr *addr, socklen
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_connect(fd_entry* entry, const struct sockaddr *addr,
+static int req_socket_connect(fd_entry *entry, const struct sockaddr *addr,
                        socklen_t addrlen)
 {
     if (!addr) {
@@ -71,7 +72,7 @@ static int req_socket_connect(fd_entry* entry, const struct sockaddr *addr,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_listen(fd_entry* entry, int backlog)
+static int req_socket_listen(fd_entry *entry, int backlog)
 {
     req r;
     req_init(&r);
@@ -82,7 +83,7 @@ static int req_socket_listen(fd_entry* entry, int backlog)
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_accept(fd_entry* entry, struct sockaddr *addr,
+static int req_socket_accept(fd_entry *entry, struct sockaddr *addr,
                              socklen_t *addrlen)
 {
     req r;
@@ -95,7 +96,7 @@ static int req_socket_accept(fd_entry* entry, struct sockaddr *addr,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_write(fd_entry* entry, const void *buf, uint32_t len)
+static int req_socket_write(fd_entry *entry, const void *buf, uint32_t len)
 {
     req r;
     req_init(&r);
@@ -106,7 +107,7 @@ static int req_socket_write(fd_entry* entry, const void *buf, uint32_t len)
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_read(fd_entry* entry, void *buf, uint32_t len)
+static int req_socket_read(fd_entry *entry, void *buf, uint32_t len)
 {
     req r;
     req_init(&r);
@@ -117,7 +118,7 @@ static int req_socket_read(fd_entry* entry, void *buf, uint32_t len)
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_sendto(fd_entry* entry, const void *buf, uint32_t len, int flags,
+static int req_socket_sendto(fd_entry *entry, const void *buf, uint32_t len, int flags,
                       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     /* A connected socket may pass a NULL destination (the kernel API permits
@@ -144,7 +145,7 @@ static int req_socket_sendto(fd_entry* entry, const void *buf, uint32_t len, int
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_recvfrom(fd_entry* entry, void *buf, uint32_t len, int flags,
+static int req_socket_recvfrom(fd_entry *entry, void *buf, uint32_t len, int flags,
                         struct sockaddr *src_addr, socklen_t *addrlen)
 {
     req r;
@@ -158,7 +159,7 @@ static int req_socket_recvfrom(fd_entry* entry, void *buf, uint32_t len, int fla
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_getsockname(fd_entry* entry, struct sockaddr *addr,
+static int req_socket_getsockname(fd_entry *entry, struct sockaddr *addr,
                            socklen_t *addrlen)
 {
     req r;
@@ -170,7 +171,7 @@ static int req_socket_getsockname(fd_entry* entry, struct sockaddr *addr,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_getpeername(fd_entry* entry, struct sockaddr *addr,
+static int req_socket_getpeername(fd_entry *entry, struct sockaddr *addr,
                            socklen_t *addrlen)
 {
     req r;
@@ -182,7 +183,7 @@ static int req_socket_getpeername(fd_entry* entry, struct sockaddr *addr,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_setsockopt(fd_entry* entry, int level, int optname,
+static int req_socket_setsockopt(fd_entry *entry, int level, int optname,
                           const void *optval, socklen_t optlen)
 {
     req r;
@@ -196,7 +197,7 @@ static int req_socket_setsockopt(fd_entry* entry, int level, int optname,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_getsockopt(fd_entry* entry, int level, int optname,
+static int req_socket_getsockopt(fd_entry *entry, int level, int optname,
                           void *optval, socklen_t *optlen)
 {
     req r;
@@ -210,7 +211,7 @@ static int req_socket_getsockopt(fd_entry* entry, int level, int optname,
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_fcntl(fd_entry* entry, int cmd, int arg)
+static int req_socket_fcntl(fd_entry *entry, int cmd, int arg)
 {
     req r;
     req_init(&r);
@@ -222,7 +223,7 @@ static int req_socket_fcntl(fd_entry* entry, int cmd, int arg)
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_close(fd_entry* entry)
+static int req_socket_close(fd_entry *entry)
 {
     req r;
     req_init(&r);
@@ -232,7 +233,7 @@ static int req_socket_close(fd_entry* entry)
     return req_push_wait(fd_entry_get_worker(entry), &r);
 }
 
-static int req_socket_shutdown(fd_entry* entry, int how)
+static int req_socket_shutdown(fd_entry *entry, int how)
 {
     req r;
     req_init(&r);
@@ -251,7 +252,10 @@ int socket_req(int family, int type, int protocol)
     req_fill(&r, REQ_SOCKET, Socket,
              .family = family, .type = type, .protocol = protocol);
 
-    return req_push_wait(worker_select_random(), &r);
+    worker *worker = get_current_worker();
+    if (!worker)
+        worker = worker_select_random();
+    return req_push_wait(worker, &r);
 }
 
 const fd_entry_ops socket_fd_ops = {

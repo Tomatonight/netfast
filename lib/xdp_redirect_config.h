@@ -13,4 +13,4 @@ typedef struct netfast_xdp_config {
     __u8 reserved[3];
 } netfast_xdp_config;
 
-#endif
+#endif /* XDP_REDIRECT_CONFIG_H */

@@ -12,15 +12,15 @@ const uint8_t TOEPLITZ_RSS_DEFAULT_KEY[TOEPLITZ_RSS_KEY_LEN] = {
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
 };
 
-const uint8_t* toeplitz_rss_get_key(uint32_t* out_len)
+const uint8_t *toeplitz_rss_get_key(uint32_t *out_len)
 {
     if (out_len)
         *out_len = TOEPLITZ_RSS_KEY_LEN;
     return TOEPLITZ_RSS_DEFAULT_KEY;
 }
 
-uint32_t toeplitz_hash(const uint8_t* key, uint32_t key_len,
-                       const uint8_t* data, uint32_t data_len)
+uint32_t toeplitz_hash(const uint8_t *key, uint32_t key_len,
+                       const uint8_t *data, uint32_t data_len)
 {
     if (key_len < 4)
         return 0;
@@ -46,8 +46,8 @@ uint32_t toeplitz_hash(const uint8_t* key, uint32_t key_len,
     return hash;
 }
 
-worker* rss_select_worker_by_tuple(sa_family_t family,
-    const uint8_t* saddr, const uint8_t* daddr,
+worker *rss_select_worker_by_tuple(sa_family_t family,
+    const uint8_t *saddr, const uint8_t *daddr,
     uint16_t sport, uint16_t dport)
 {
     if (!g_workers || g_worker_num <= 0)
@@ -62,7 +62,7 @@ worker* rss_select_worker_by_tuple(sa_family_t family,
     memcpy(tuple + 2U * addr_len + sizeof(sport), &dport, sizeof(dport));
 
     uint32_t key_len;
-    const uint8_t* key = toeplitz_rss_get_key(&key_len);
+    const uint8_t *key = toeplitz_rss_get_key(&key_len);
     uint32_t hash = toeplitz_hash(key, key_len, tuple, tuple_len);
     return &g_workers[hash % (uint32_t)g_worker_num];
 }

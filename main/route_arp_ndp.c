@@ -1,17 +1,19 @@
-#include <stdio.h>
-#include <string.h>
-#include <stddef.h>
-#include <stdlib.h>
+#include "route_arp_ndp.h"
+
+#include <arpa/inet.h>
 #include <errno.h>
-#include <stdatomic.h>
 #include <linux/neighbour.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <arpa/inet.h>
-#include "route_arp_ndp.h"
-#include "log.h"
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "base.h"
 #include "init.h"
+#include "log.h"
 #include "netlink.h"
 #include "skbuff.h"
 #include "socket.h"
@@ -76,7 +78,7 @@ static _Thread_local struct {
 } g_ndp_probe_cache[NDP_PROBE_CACHE_SIZE];
 static _Thread_local uint32_t g_ndp_probe_cache_index;
 
-static bool ndp_probe_allowed(const uint8_t* ip, uint32_t ifindex, uint64_t now_ms)
+static bool ndp_probe_allowed(const uint8_t *ip, uint32_t ifindex, uint64_t now_ms)
 {
     for (int i = 0; i < NDP_PROBE_CACHE_SIZE; i++) {
         if (memcmp(g_ndp_probe_cache[i].ip, ip, 16) == 0 &&
@@ -94,7 +96,7 @@ static bool ndp_probe_allowed(const uint8_t* ip, uint32_t ifindex, uint64_t now_
     return true;
 }
 
-static bool ndp_entry_usable(const ndp_info* entry)
+static bool ndp_entry_usable(const ndp_info *entry)
 {
     static const uint8_t zero_mac[6] = {0};
     if (!entry || memcmp(entry->mac, zero_mac, sizeof(zero_mac)) == 0)
@@ -104,10 +106,10 @@ static bool ndp_entry_usable(const ndp_info* entry)
                             NUD_PROBE | NUD_PERMANENT | NUD_NOARP)) != 0;
 }
 
-static void neighbor_trigger_probe(sa_family_t family, const uint8_t* ip,
+static void neighbor_trigger_probe(sa_family_t family, const uint8_t *ip,
                                    uint32_t ifindex)
 {
-    if_info* info = search_if_by_index(ifindex);
+    if_info *info = search_if_by_index(ifindex);
     if (!info)
         return;
 
@@ -139,14 +141,14 @@ static void neighbor_trigger_probe(sa_family_t family, const uint8_t* ip,
     PUT_REF(info);
 }
 
-static void route_info_destroy(void* ptr)
+static void route_info_destroy(void *ptr)
 {
-    route_info* info = (route_info*)ptr;
+    route_info *info = (route_info*)ptr;
     PUT_REF(info->if_info);
     free(info);
 }
 
-static route_info* route_info_create(const route_info* info)
+static route_info *route_info_create(const route_info *info)
 {
     CREATE_REF(route_info, route, route_info_destroy);
     if (!route)
@@ -154,7 +156,7 @@ static route_info* route_info_create(const route_info* info)
 
     memcpy(route, info, offsetof(route_info, if_info));
 
-    if_info* ifi = NULL;
+    if_info *ifi = NULL;
     if (REF_USABLE(info->if_info)) {
         GET_REF(ifi, info->if_info);
     } else if (route->if_name[0]) {
@@ -173,13 +175,13 @@ static route_info* route_info_create(const route_info* info)
     return route;
 }
 
-static void ndp_info_destroy(void* ptr)
+static void ndp_info_destroy(void *ptr)
 {
-    ndp_info* info = (ndp_info*)ptr;
+    ndp_info *info = (ndp_info*)ptr;
     free(info);
 }
 
-static ndp_info* ndp_info_create(const ndp_info* in)
+static ndp_info *ndp_info_create(const ndp_info *in)
 {
     CREATE_REF(ndp_info, ndp, ndp_info_destroy);
     if (!ndp)
@@ -189,7 +191,7 @@ static ndp_info* ndp_info_create(const ndp_info* in)
     return ndp;
 }
 
-static bool route_info_equal(const route_info* a, const route_info* b)
+static bool route_info_equal(const route_info *a, const route_info *b)
 {
     if (a == b)
         return true;
@@ -221,15 +223,15 @@ static bool route_info_equal(const route_info* a, const route_info* b)
     return a->metric == b->metric;
 }
 
-static void route_copy_attr(route_info* dst, const route_info* src)
+static void route_copy_attr(route_info *dst, const route_info *src)
 {
     dst->mtu = src->mtu;
     memcpy(dst->prefsrc, src->prefsrc, sizeof(dst->prefsrc));
 }
 
-static int route4_add_cb(trie_node* node, uint64_t info)
+static int route4_add_cb(trie_node *node, uint64_t info)
 {
-    route_info* in = (route_info*)info;
+    route_info *in = (route_info*)info;
     bool created_head = false;
     if (!node->exist_element) {
         node->element = (uint64_t)create_list_node(0);
@@ -239,8 +241,8 @@ static int route4_add_cb(trie_node* node, uint64_t info)
         created_head = true;
     }
 
-    list_node* head = (list_node*)node->element;
-    route_info* it;
+    list_node *head = (list_node*)node->element;
+    route_info *it;
     FOR_EACH_LIST_OFFSET(head, it, route_info, list) {
         if (route_info_equal(it, in)) {
             route_copy_attr(it, in);
@@ -248,7 +250,7 @@ static int route4_add_cb(trie_node* node, uint64_t info)
         }
     }
 
-    route_info* route = route_info_create(in);
+    route_info *route = route_info_create(in);
     if (!route) {
         if (created_head) {
             destroy_list_node(head, NULL);
@@ -261,15 +263,15 @@ static int route4_add_cb(trie_node* node, uint64_t info)
     return 0;
 }
 
-static int route4_delete_cb(trie_node* node, uint64_t info)
+static int route4_delete_cb(trie_node *node, uint64_t info)
 {
-    route_info* in = (route_info*)info;
+    route_info *in = (route_info*)info;
     if (!node->exist_element)
         return 0;
 
-    list_node* head = (list_node*)node->element;
-    route_info* it;
-    list_node* tmp_node;
+    list_node *head = (list_node*)node->element;
+    route_info *it;
+    list_node *tmp_node;
     FOR_EACH_LIST_SAFE_OFFSET(head, it, tmp_node, route_info, list) {
         if (route_info_equal(it, in)) {
             remove_list_node(&it->list);
@@ -286,14 +288,14 @@ static int route4_delete_cb(trie_node* node, uint64_t info)
     return 0;
 }
 
-static uint64_t route4_search_cb(trie_node* node, void* argv)
+static uint64_t route4_search_cb(trie_node *node, void *argv)
 {
     (void)argv;
     if (!node->exist_element)
         return 0;
-    list_node* head = (list_node*)node->element;
-    route_info* element;
-    route_info* selected = NULL;
+    list_node *head = (list_node*)node->element;
+    route_info *element;
+    route_info *selected = NULL;
     uint32_t min_metric = 0xFFFFFFFF;
     FOR_EACH_LIST_OFFSET(head, element, route_info, list) {
         if (element->metric < min_metric) {
@@ -307,15 +309,15 @@ static uint64_t route4_search_cb(trie_node* node, void* argv)
     return (uint64_t)selected;
 }
 
-static uint64_t route6_search_cb_impl(trie_node* node, void* argv)
+static uint64_t route6_search_cb_impl(trie_node *node, void *argv)
 {
-    const route_key* key = (const route_key*)argv;
+    const route_key *key = (const route_key*)argv;
     if (!node->exist_element)
         return 0;
 
-    list_node* head = (list_node*)node->element;
-    route_info* element;
-    route_info* selected = NULL;
+    list_node *head = (list_node*)node->element;
+    route_info *element;
+    route_info *selected = NULL;
     uint32_t min_metric = UINT32_MAX;
     FOR_EACH_LIST_OFFSET(head, element, route_info, list) {
         if (key->ifindex && element->ifindex != key->ifindex)
@@ -330,9 +332,9 @@ static uint64_t route6_search_cb_impl(trie_node* node, void* argv)
     return (uint64_t)selected;
 }
 
-static int arp_add_cb(trie_node* node, uint64_t info)
+static int arp_add_cb(trie_node *node, uint64_t info)
 {
-    ndp_info* in = (ndp_info*)info;
+    ndp_info *in = (ndp_info*)info;
     bool created_head = false;
     if (!node->exist_element) {
         node->element = (uint64_t)create_list_node(0);
@@ -342,8 +344,8 @@ static int arp_add_cb(trie_node* node, uint64_t info)
         created_head = true;
     }
 
-    list_node* head = (list_node*)node->element;
-    ndp_info* entry;
+    list_node *head = (list_node*)node->element;
+    ndp_info *entry;
     FOR_EACH_LIST_OFFSET(head, entry, ndp_info, list) {
         if (entry->ifindex == in->ifindex) {
             memcpy(entry, in, offsetof(ndp_info, ref));
@@ -351,7 +353,7 @@ static int arp_add_cb(trie_node* node, uint64_t info)
         }
     }
 
-    ndp_info* new_entry = ndp_info_create(in);
+    ndp_info *new_entry = ndp_info_create(in);
     if (!new_entry) {
         if (created_head) {
             destroy_list_node(head, NULL);
@@ -364,15 +366,15 @@ static int arp_add_cb(trie_node* node, uint64_t info)
     return 0;
 }
 
-static int arp_delete_cb(trie_node* node, uint64_t info)
+static int arp_delete_cb(trie_node *node, uint64_t info)
 {
-    ndp_info* in = (ndp_info*)info;
+    ndp_info *in = (ndp_info*)info;
     if (!node->exist_element || !node->element)
         return 0;
 
-    list_node* head = (list_node*)node->element;
-    ndp_info* entry;
-    list_node* tmp;
+    list_node *head = (list_node*)node->element;
+    ndp_info *entry;
+    list_node *tmp;
     FOR_EACH_LIST_SAFE_OFFSET(head, entry, tmp, ndp_info, list) {
         if (!in || entry->ifindex == in->ifindex) {
             remove_list_node(&entry->list);
@@ -387,13 +389,13 @@ static int arp_delete_cb(trie_node* node, uint64_t info)
     return 0;
 }
 
-static uint64_t arp_search_cb(trie_node* node, void* argv)
+static uint64_t arp_search_cb(trie_node *node, void *argv)
 {
-    const ndp_key* key = (const ndp_key*)argv;
+    const ndp_key *key = (const ndp_key*)argv;
     if (!node->exist_element)
         return 0;
-    list_node* head = (list_node*)node->element;
-    ndp_info* entry;
+    list_node *head = (list_node*)node->element;
+    ndp_info *entry;
     FOR_EACH_LIST_OFFSET(head, entry, ndp_info, list) {
         if (key->ifindex == 0 || entry->ifindex == key->ifindex) {
             INC_REF(entry);
@@ -404,18 +406,18 @@ static uint64_t arp_search_cb(trie_node* node, void* argv)
 }
 
 /* IPv6 trie 复用相同的条目管理逻辑，只替换地址查找实现。 */
-static int ndp_add_cb(trie_node* node, uint64_t info)
+static int ndp_add_cb(trie_node *node, uint64_t info)
     { return arp_add_cb(node, info); }
-static int ndp_delete_cb(trie_node* node, uint64_t info)
+static int ndp_delete_cb(trie_node *node, uint64_t info)
     { return arp_delete_cb(node, info); }
-static uint64_t ndp_search_cb(trie_node* node, void* argv)
+static uint64_t ndp_search_cb(trie_node *node, void *argv)
     { return arp_search_cb(node, argv); }
 
-static int route6_add_cb(trie_node* node, uint64_t info)
+static int route6_add_cb(trie_node *node, uint64_t info)
     { return route4_add_cb(node, info); }
-static int route6_delete_cb(trie_node* node, uint64_t info)
+static int route6_delete_cb(trie_node *node, uint64_t info)
     { return route4_delete_cb(node, info); }
-static uint64_t route6_search_cb(trie_node* node, void* argv)
+static uint64_t route6_search_cb(trie_node *node, void *argv)
     { return route6_search_cb_impl(node, argv); }
 
 DEFINE_TRIE(ipv4_route_table, TRIE_IPV4, route4_add_cb, route4_delete_cb, route4_search_cb, true);
@@ -430,7 +432,7 @@ int route_init(void)
     return 0;
 }
 
-route_info* search_route_table(const route_key* key)
+route_info *search_route_table(const route_key *key)
 {
     if (key->ip_family == AF_INET6) {
         uint64_t ret = search_trie_element(&ipv6_route_table,
@@ -445,10 +447,10 @@ route_info* search_route_table(const route_key* key)
 }
 
 /* ── 统一设置 skb 路由（v4 / v6）──────────────────────── */
-int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
+int set_skb_route(skbuff *skb, sa_family_t family, const uint8_t *dip)
 {
     uint64_t generation = route_table_generation(family);
-    route_info* route = skb->route;
+    route_info *route = skb->route;
     uint32_t scope_id = family == AF_INET6 && skb->sock
         ? skb->sock->dip6_scope_id : 0;
     if (route_cache_key_matches(route, skb->route_generation, family,
@@ -493,7 +495,7 @@ int set_skb_route(skbuff* skb, sa_family_t family, const uint8_t* dip)
     return 0;
 }
 
-ndp_info* search_ndp_table(const ndp_key* key)
+ndp_info *search_ndp_table(const ndp_key *key)
 {
     uint64_t ret;
     if (key->ip_family == AF_INET6) {
@@ -510,12 +512,12 @@ ndp_info* search_ndp_table(const ndp_key* key)
     return (ndp_info*)ret;
 }
 
-int resolve_neighbor_entry(const ndp_key* key, ndp_info** result)
+int resolve_neighbor_entry(const ndp_key *key, ndp_info ** result)
 {
     if (result)
         *result = NULL;
 
-    ndp_info* entry = search_ndp_table(key);
+    ndp_info *entry = search_ndp_table(key);
     if (entry && (entry->state & NUD_FAILED)) {
         PUT_REF(entry);
         return -EHOSTUNREACH;
@@ -536,7 +538,7 @@ int resolve_neighbor_entry(const ndp_key* key, ndp_info** result)
 }
 
 
-int ndp_add_entry(const ndp_info* info)
+int ndp_add_entry(const ndp_info *info)
 {
     if (info->ip_family == AF_INET6)
         return add_trie_element(&ndp_table, (uint64_t)(uintptr_t)info->ip,
@@ -546,7 +548,7 @@ int ndp_add_entry(const ndp_info* info)
     return add_trie_element(&arp_table, ip, 32, (uint64_t)info);
 }
 
-int ndp_delete_entry(const ndp_info* info)
+int ndp_delete_entry(const ndp_info *info)
 {
     if (info->ip_family == AF_INET6)
         return delete_trie_element(&ndp_table, (uint64_t)(uintptr_t)info->ip,
@@ -556,7 +558,7 @@ int ndp_delete_entry(const ndp_info* info)
     return delete_trie_element(&arp_table, ip, 32, (uint64_t)info);
 }
 
-int route_add_entry(const route_info* info)
+int route_add_entry(const route_info *info)
 {
     int ret;
     if (info->ip_family == AF_INET6) {
@@ -574,7 +576,7 @@ int route_add_entry(const route_info* info)
     return ret;
 }
 
-int route_delete_entry(const route_info* info)
+int route_delete_entry(const route_info *info)
 {
     int ret;
     if (info->ip_family == AF_INET6) {
@@ -592,10 +594,10 @@ int route_delete_entry(const route_info* info)
     return ret;
 }
 
-static void route_parse_metrics(route_info* info, const struct rtattr* metrics)
+static void route_parse_metrics(route_info *info, const struct rtattr *metrics)
 {
     int len = RTA_PAYLOAD(metrics);
-    struct rtattr* attr = RTA_DATA(metrics);
+    struct rtattr *attr = RTA_DATA(metrics);
     for (; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
         if (attr->rta_type == RTAX_MTU && RTA_PAYLOAD(attr) >= sizeof(uint32_t))
             memcpy(&info->mtu, RTA_DATA(attr), sizeof(info->mtu));
@@ -712,17 +714,17 @@ int parse_neighbor_event(struct nlmsghdr *nlh)
     return ndp_delete_entry(&info);
 }
 
-bool route_info_is_valid(const route_info* info, uint64_t cached_generation)
+bool route_info_is_valid(const route_info *info, uint64_t cached_generation)
 {
     return info &&
            cached_generation == route_table_generation(info->ip_family) &&
            REF_USABLE(info) && REF_USABLE(info->if_info);
 }
 
-bool route_cache_key_matches(const route_info* route, uint64_t generation,
-                             sa_family_t family, const uint8_t* cached_dest,
+bool route_cache_key_matches(const route_info *route, uint64_t generation,
+                             sa_family_t family, const uint8_t *cached_dest,
                              uint32_t cached_scope_id,
-                             const uint8_t* dest, uint32_t scope_id)
+                             const uint8_t *dest, uint32_t scope_id)
 {
     if (!route_info_is_valid(route, generation) ||
         route->ip_family != family ||
@@ -734,9 +736,9 @@ bool route_cache_key_matches(const route_info* route, uint64_t generation,
     return family != AF_INET6 || !scope_id || route->ifindex == scope_id;
 }
 
-bool search_best_saddr_by_daddr(const route_key* key, route_key* answer)
+bool search_best_saddr_by_daddr(const route_key *key, route_key *answer)
 {
-    route_info* info = search_route_table(key);
+    route_info *info = search_route_table(key);
     if (!info) {
         DEBUG_LOG("No route found, cannot determine best source address");
         return false;
@@ -770,10 +772,10 @@ bool search_best_saddr_by_daddr(const route_key* key, route_key* answer)
 
 static void route_element_destroy(uint64_t element)
 {
-    list_node* head = (list_node*)element;
+    list_node *head = (list_node*)element;
 
-    route_info* it;
-    list_node* tmp;
+    route_info *it;
+    list_node *tmp;
     FOR_EACH_LIST_SAFE_OFFSET(head, it, tmp, route_info, list) {
         remove_list_node(&it->list);
         DESTROY_REF(it);
@@ -783,9 +785,9 @@ static void route_element_destroy(uint64_t element)
 
 static void arp_element_destroy(uint64_t element)
 {
-    list_node* head = (list_node*)element;
-    ndp_info* entry;
-    list_node* tmp;
+    list_node *head = (list_node*)element;
+    ndp_info *entry;
+    list_node *tmp;
     FOR_EACH_LIST_SAFE_OFFSET(head, entry, tmp, ndp_info, list) {
         remove_list_node(&entry->list);
         DESTROY_REF(entry);
@@ -803,7 +805,7 @@ void route_arp_clear_tables(void)
     route_table_changed(AF_INET6);
 }
 
-uint32_t get_route_mtu(const route_info* info)
+uint32_t get_route_mtu(const route_info *info)
 {
     if (info->mtu)
         return info->mtu;

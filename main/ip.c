@@ -1,32 +1,32 @@
 #include "ip.h"
-#include "base.h"
-#include "init.h"
-#include "ip_frag.h"
-#include "route_arp_ndp.h"
-#include "skbuff.h"
-#include "udp.h"
-#include "tcp.h"
-#include "icmp.h"
-#include "log.h"
-#include "rss.h"
-#include "worker.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <string.h>
 
+#include "base.h"
+#include "icmp.h"
+#include "init.h"
+#include "ip_frag.h"
+#include "log.h"
+#include "route_arp_ndp.h"
+#include "rss.h"
+#include "skbuff.h"
+#include "tcp.h"
+#include "udp.h"
+#include "worker.h"
 
 static _Atomic(uint32_t) ip_id;
 static const uint8_t default_ttl = 64;
 
-static bool ipv4_build_output_header(skbuff* skb, uint32_t sip, uint32_t dip)
+static bool ipv4_build_output_header(skbuff *skb, uint32_t sip, uint32_t dip)
 {
     if (skb_data_len(skb) > UINT16_MAX - sizeof(ipv4_hdr))
         return false;
 
     uint32_t l2_len = skb->route && skb->route->if_info
         ? skb->route->if_info->l2_len : 0;
-    ipv4_hdr* ip = (ipv4_hdr*)skb_data_push(
+    ipv4_hdr *ip = (ipv4_hdr*)skb_data_push(
         skb, sizeof(ipv4_hdr), sizeof(ipv4_hdr) + l2_len);
     if (!ip)
         return false;
@@ -36,6 +36,10 @@ static bool ipv4_build_output_header(skbuff* skb, uint32_t sip, uint32_t dip)
     ip->tot_len = htons((uint16_t)skb_data_len(skb));
     ip->id = htons((uint16_t)atomic_fetch_add_explicit(
         &ip_id, 1u, memory_order_relaxed));
+    /* TCP uses ICMP Frag Needed for PMTUD; do not let an intermediate IPv4
+     * router fragment the segment before it can report the path MTU. */
+    if (skb->protocol == IPPROTO_TCP)
+        ip->frag_off = htons(IPV4_FRAG_DF);
     ip->ttl = default_ttl;
     ip->protocol = (uint8_t)skb->protocol;
     ip->saddr = sip;
@@ -59,20 +63,20 @@ int ipv4_init(void)
     return tcp_metrics_init();
 }
 
-static bool ipv4_validate_header(skbuff* skb)
+static bool ipv4_validate_header(skbuff *skb)
 {
-    ipv4_hdr* ip = skb->ipv4_hdr;
+    ipv4_hdr *ip = skb->ipv4_hdr;
     if (IPV4_VHL_VERSION(ip->vhl) != 4)
         return false;
 
     uint32_t hdr_len = (uint32_t)IPV4_VHL_IHL(ip->vhl) * 4u;
-    if (hdr_len < sizeof(*ip) || hdr_len > skb_data0_len(skb))
+    if (unlikely(hdr_len < sizeof(*ip) || hdr_len > skb_data0_len(skb)))
         return false;
     if (!ip->ttl)
         return false;
 
     uint32_t total_len = ntohs(ip->tot_len);
-    if (total_len < hdr_len || total_len > skb_data_len(skb))
+    if (unlikely(total_len < hdr_len || total_len > skb_data_len(skb)))
         return false;
 
     if (!skb->flag.is_hw_rcv_checksum)
@@ -86,7 +90,7 @@ static bool ipv4_validate_header(skbuff* skb)
     return true;
 }
 
-static worker* ipv4_select_fragment_worker(const ipv4_hdr* hdr)
+static worker *ipv4_select_fragment_worker(const ipv4_hdr *hdr)
 {
     if (g_worker_num <= 1)
         return get_current_worker();
@@ -99,7 +103,7 @@ static worker* ipv4_select_fragment_worker(const ipv4_hdr* hdr)
  * the eventual accepted socket before doing checksum, route and TCP work.
  * SYN/handshake packets may make one extra hop back to the listener owner;
  * established traffic then stays on its tuple worker. */
-static worker* ipv4_select_tcp_worker(skbuff* skb, ipv4_hdr* ip)
+static worker *ipv4_select_tcp_worker(skbuff *skb, ipv4_hdr *ip)
 {
     if (g_worker_num <= 1 || IPV4_VHL_VERSION(ip->vhl) != 4 ||
         IPV4_VHL_IHL(ip->vhl) < 5 || ip->protocol != IPPROTO_TCP ||
@@ -111,8 +115,8 @@ static worker* ipv4_select_tcp_worker(skbuff* skb, ipv4_hdr* ip)
         uint16_t sport;
         uint16_t dport;
     } ports;
-    if (header_len > skb_data_len(skb) ||
-        !skb_copy_bits(skb, header_len, &ports, sizeof(ports)))
+    if (unlikely(header_len > skb_data_len(skb) ||
+        !skb_copy_bits(skb, header_len, &ports, sizeof(ports))))
         return get_current_worker();
 
     /* Match the NIC's inbound RSS tuple order and tcp_accept(): peer/wire
@@ -122,26 +126,26 @@ static worker* ipv4_select_tcp_worker(skbuff* skb, ipv4_hdr* ip)
         ports.sport, ports.dport);
 }
 
-int ipv4_recv(skbuff* skb)
+int ipv4_recv(skbuff *skb)
 {
     skb->family = AF_INET;
 
-    if (skb_data0_len(skb) < sizeof(ipv4_hdr))
+    if (unlikely(skb_data0_len(skb) < sizeof(ipv4_hdr)))
         return -1;
 
-    ipv4_hdr* ip = (ipv4_hdr*)skb_start(skb);
+    ipv4_hdr *ip = (ipv4_hdr*)skb_start(skb);
     skb->ipv4_hdr = ip;
     skb->l4_private.tcp.ip_ecn = (uint8_t)(ip->tos & 0x03u);
     if (!ipv4_validate_header(skb))
         return -1;
 
-    worker* frag_worker = ipv4_select_fragment_worker(ip);
+    worker *frag_worker = ipv4_select_fragment_worker(ip);
     if (ipv4_is_frag(ip) && frag_worker != get_current_worker()) {
         worker_enqueue_skb(frag_worker, skb, ipv4_recv);
         return 0;
     }
 
-    worker* rss_worker = ipv4_select_tcp_worker(skb, ip);
+    worker *rss_worker = ipv4_select_tcp_worker(skb, ip);
     if (rss_worker != get_current_worker()) {
         worker_enqueue_skb(rss_worker, skb, ipv4_recv);
         return 0;
@@ -149,16 +153,16 @@ int ipv4_recv(skbuff* skb)
 
     if (set_skb_route(skb, AF_INET, (const uint8_t*)&ip->daddr) < 0)
         return -1;
-    route_info* route = skb->route;
+    route_info *route = skb->route;
 
-	if (!route_is_local_host(route) && !route_is_broadcast(route)) {
+    if (!route_is_local_host(route) && !route_is_broadcast(route)) {
         DEBUG_LOG("Forwarding IPv4 packet to " IP_STR, IP_ARG(ip->daddr));
-		return ipv4_forward(skb);
-	}
+        return ipv4_forward(skb);
+    }
 
     if (ipv4_is_frag(ip)) {
         skb->flag.is_frag = 1;
-        skbuff* reassembled_skb = ipv4_defrag(skb);
+        skbuff *reassembled_skb = ipv4_defrag(skb);
         if (!reassembled_skb)
             return 0;
         skb = reassembled_skb;
@@ -193,9 +197,9 @@ int ipv4_recv(skbuff* skb)
     return ret;
 }
 
-int ipv4_output(skbuff* skb)
+int ipv4_output(skbuff *skb)
 {
-    route_info* route = skb->route;
+    route_info *route = skb->route;
     if (!skb->flag.is_forward) {
         uint32_t dip = skb->sock->dip;
         uint32_t sip = skb->sock->sip;
@@ -204,17 +208,22 @@ int ipv4_output(skbuff* skb)
             return -1;
         route = skb->route;
 
-        if (skb->protocol == IPPROTO_TCP &&
-            route->if_info->mtu > sizeof(ipv4_hdr) &&
-            skb_data_len(skb) > route->if_info->mtu - sizeof(ipv4_hdr)) {
-            if (!tcp_skb_frag(skb, route->if_info->mtu))
+        uint32_t mtu = route->if_info->mtu;
+        if (skb->protocol == IPPROTO_TCP && skb->sock &&
+            skb->sock->metrics)
+            mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
+                                   get_current_time_ms());
+
+        if (skb->protocol == IPPROTO_TCP && mtu > sizeof(ipv4_hdr) &&
+            skb_data_len(skb) > mtu - sizeof(ipv4_hdr)) {
+            if (!tcp_skb_frag(skb, mtu))
                 return -1;
         }
 
         if (!ipv4_build_output_header(skb, sip, dip))
             return -1;
         if (skb->frag_list.next) {
-            skbuff* frag;
+            skbuff *frag;
             FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
                 if (!ipv4_build_output_header(frag, sip, dip))
                     return -1;
@@ -235,7 +244,7 @@ int ipv4_output(skbuff* skb)
     return skb_send_frags(skb);
 }
 
-int ipv4_forward(skbuff* skb){
+int ipv4_forward(skbuff *skb) {
     if (!g_cfg.ipv4_forward) {
         DEBUG_LOG("IPv4 forwarding disabled, dropping packet");
         return -1;

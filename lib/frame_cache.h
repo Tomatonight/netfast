@@ -29,7 +29,7 @@ typedef struct page_info page_info;
 typedef struct frame_slot frame_slot;
 
 typedef struct frame_cache {
-    frame_slot* entries[FRAME_SLOT_CLASS_COUNT][THREAD_FRAME_CACHE_LIMIT];
+    frame_slot *entries[FRAME_SLOT_CLASS_COUNT][THREAD_FRAME_CACHE_LIMIT];
     uint16_t count[FRAME_SLOT_CLASS_COUNT];
 } frame_cache;
 
@@ -42,14 +42,14 @@ struct page_info {
 
 struct frame_slot {
     ref_info ref;
-    page_info* page;
-    uint8_t* data;
+    page_info *page;
+    uint8_t *data;
     uint16_t slot_size;
 };
 
 /* FQ entries always own a complete-frame slot at the fixed first-slot
  * offset. */
-static inline frame_slot* frame_slot_from_rx_frame(void* frame)
+static inline frame_slot *frame_slot_from_rx_frame(void *frame)
 {
     return (frame_slot*)((uint8_t*)frame +
                          FRAME_ALIGN16(sizeof(page_info)));
@@ -64,31 +64,31 @@ static inline frame_slot* frame_slot_from_rx_frame(void* frame)
 #define FRAME_SLOT_MAX_SIZE FRAME_SLOT_SIZE_6
 
 typedef struct data_info {
-    frame_slot* slot;
-    uint8_t* buf_start; /* usable memory start, analogous to skb->head */
-    uint8_t* buf_end;   /* usable memory end, analogous to skb->end */
-    uint8_t* start;     /* data start, analogous to skb->data */
-    uint8_t* end;       /* data end, analogous to skb->tail */
-    struct data_info* next;
+    frame_slot *slot;
+    uint8_t *buf_start; /* usable memory start, analogous to skb->head */
+    uint8_t *buf_end;   /* usable memory end, analogous to skb->end */
+    uint8_t *start;     /* data start, analogous to skb->data */
+    uint8_t *end;       /* data end, analogous to skb->tail */
+    struct data_info *next;
 } data_info;
 
 void frame_global_cache_init(void);
-void frame_cache_init(frame_cache* cache);
-void frame_cache_reset(frame_cache* cache);
+void frame_cache_init(frame_cache *cache);
+void frame_cache_reset(frame_cache *cache);
 void frame_global_cache_reset(void);
 
 uint32_t frame_rx_headroom(void);
-frame_slot* frame_slot_alloc(uint32_t min_data_len);
+frame_slot *frame_slot_alloc(uint32_t min_data_len);
 
-void free_data_info(data_info* info);
+void free_data_info(data_info *info);
 /* Allocate a node whose slot is at least size bytes.  The node initially
  * exposes the complete slot as its usable buffer and contains no data. */
-data_info* alloc_data_info(uint32_t size);
+data_info *alloc_data_info(uint32_t size);
 /* Offsets are relative to slot->data.  Both the usable buffer range and the
  * valid data range are expressed explicitly and must satisfy
  * buf_start <= start <= end <= buf_end. */
-data_info* create_data_info(frame_slot* slot, uint32_t buf_start,
+data_info *create_data_info(frame_slot *slot, uint32_t buf_start,
                             uint32_t buf_end, uint32_t start, uint32_t end);
-void copy_data_info(data_info* dst, const data_info* src);
+void copy_data_info(data_info *dst, const data_info *src);
 
-#endif
+#endif /* FRAME_CACHE_H */

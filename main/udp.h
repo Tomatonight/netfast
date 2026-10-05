@@ -1,7 +1,8 @@
 #ifndef UDP_H
 #define UDP_H
-#include"socket.h"
+
 #include "skbuff.h"
+#include "socket.h"
 
 /* UDP header (RFC 768) */
 typedef struct udp_hdr {
@@ -13,6 +14,6 @@ typedef struct udp_hdr {
 
 extern protocol_ops udp_protocol_ops;
 
-int udp_recv(skbuff* skb);
+int udp_recv(skbuff *skb);
 
-#endif
+#endif /* UDP_H */

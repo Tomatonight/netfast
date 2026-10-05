@@ -1,37 +1,37 @@
 #include "icmp.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <string.h>
-#include <arpa/inet.h>
 
+#include "ether.h"
 #include "ip.h"
 #include "ipv6.h"
 #include "ipv6_ext.h"
-#include "socket.h"
-#include "skbuff.h"
-#include "stack.h"
-#include "worker.h"
 #include "log.h"
 #include "route_arp_ndp.h"
-#include "ether.h"
+#include "skbuff.h"
+#include "socket.h"
+#include "stack.h"
+#include "worker.h"
 
-static bool icmp_checksum_ok(const skbuff* skb, uint32_t len)
+static bool icmp_checksum_ok(const skbuff *skb, uint32_t len)
 {
     return skb_checksum(skb, len, 0) == 0;
 }
 
-static int icmp_extract_inner4(const uint8_t* payload, uint32_t payload_len,
-                               icmp_error_info* info)
+static int icmp_extract_inner4(const uint8_t *payload, uint32_t payload_len,
+                               icmp_error_info *info)
 {
-    if (payload_len < sizeof(ipv4_hdr))
+    if (unlikely(payload_len < sizeof(ipv4_hdr)))
         return -1;
 
-    const ipv4_hdr* ip = (const ipv4_hdr*)payload;
+    const ipv4_hdr *ip = (const ipv4_hdr*)payload;
     if (IPV4_VHL_VERSION(ip->vhl) != 4)
         return -1;
 
     uint32_t ihl = (uint32_t)IPV4_VHL_IHL(ip->vhl) * 4u;
-    if (ihl < sizeof(ipv4_hdr) || ihl > payload_len)
+    if (unlikely(ihl < sizeof(ipv4_hdr) || ihl > payload_len))
         return -1;
 
     info->family = AF_INET;
@@ -39,11 +39,11 @@ static int icmp_extract_inner4(const uint8_t* payload, uint32_t payload_len,
     memcpy(info->dst_ip, &ip->daddr, sizeof(ip->daddr));
     info->protocol = ip->protocol;
 
-    const uint8_t* l4 = payload + ihl;
+    const uint8_t *l4 = payload + ihl;
     uint32_t l4_len = payload_len - ihl;
 
-    if ((info->protocol != IPPROTO_UDP && info->protocol != IPPROTO_TCP) ||
-        l4_len < 2u * sizeof(uint16_t))
+    if (unlikely((info->protocol != IPPROTO_UDP && info->protocol != IPPROTO_TCP) ||
+        l4_len < 2u * sizeof(uint16_t)))
         return -1;
 
     memcpy(&info->src_port, l4, sizeof(info->src_port));
@@ -58,13 +58,13 @@ static int icmp_extract_inner4(const uint8_t* payload, uint32_t payload_len,
     return 0;
 }
 
-static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
-                               icmp_error_info* info)
+static int icmp_extract_inner6(const uint8_t *payload, uint32_t payload_len,
+                               icmp_error_info *info)
 {
-    if (payload_len < sizeof(ipv6_hdr))
+    if (unlikely(payload_len < sizeof(ipv6_hdr)))
         return -1;
 
-    const ipv6_hdr* ip6 = (const ipv6_hdr*)payload;
+    const ipv6_hdr *ip6 = (const ipv6_hdr*)payload;
     if (IPV6_VERSION(ip6) != 6)
         return -1;
 
@@ -78,19 +78,19 @@ static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
         if (next == IPV6_NEXTHDR_HOPOPT ||
             next == IPV6_NEXTHDR_ROUTING ||
             next == IPV6_NEXTHDR_DSTOPTS) {
-            if (payload_len - offset < 2u)
+            if (unlikely(payload_len - offset < 2u))
                 return -1;
             uint32_t header_len = ((uint32_t)payload[offset + 1] + 1u) * 8u;
-            if (header_len > payload_len - offset)
+            if (unlikely(header_len > payload_len - offset))
                 return -1;
             next = payload[offset];
             offset += header_len;
             continue;
         }
         if (next == IPV6_NEXTHDR_FRAG) {
-            if (payload_len - offset < sizeof(ipv6_frag_hdr))
+            if (unlikely(payload_len - offset < sizeof(ipv6_frag_hdr)))
                 return -1;
-            const ipv6_frag_hdr* frag = (const ipv6_frag_hdr*)(payload + offset);
+            const ipv6_frag_hdr *frag = (const ipv6_frag_hdr*)(payload + offset);
             if (ntohs(frag->frag_off) & IPV6_FRAG_OFFSET_MASK)
                 return -1;
             next = frag->next_hdr;
@@ -98,10 +98,10 @@ static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
             continue;
         }
         if (next == IPV6_NEXTHDR_AH) {
-            if (payload_len - offset < 2u)
+            if (unlikely(payload_len - offset < 2u))
                 return -1;
             uint32_t header_len = ((uint32_t)payload[offset + 1] + 2u) * 4u;
-            if (header_len > payload_len - offset)
+            if (unlikely(header_len > payload_len - offset))
                 return -1;
             next = payload[offset];
             offset += header_len;
@@ -111,11 +111,11 @@ static int icmp_extract_inner6(const uint8_t* payload, uint32_t payload_len,
     }
 
     info->protocol = next;
-    if ((next != IPPROTO_UDP && next != IPPROTO_TCP) ||
-        payload_len - offset < 2u * sizeof(uint16_t))
+    if (unlikely((next != IPPROTO_UDP && next != IPPROTO_TCP) ||
+        payload_len - offset < 2u * sizeof(uint16_t)))
         return -1;
 
-    const uint8_t* l4 = payload + offset;
+    const uint8_t *l4 = payload + offset;
     memcpy(&info->src_port, l4, sizeof(info->src_port));
     memcpy(&info->dst_port, l4 + sizeof(info->src_port),
            sizeof(info->dst_port));
@@ -180,10 +180,10 @@ static int icmp6_error_to_errno(uint8_t type, uint8_t code)
     }
 }
 
-static void icmp_deliver_error(skbuff* skb, const icmp_error_info* info,
+static void icmp_deliver_error(skbuff *skb, const icmp_error_info *info,
                                int err, int (*resume)(skbuff*))
 {
-    hash* tuple_hash;
+    hash *tuple_hash;
     if (info->protocol == IPPROTO_UDP)
         tuple_hash = info->family == AF_INET6
             ? g_stack_maps->udp.tuple_hash6 : g_stack_maps->udp.tuple_hash4;
@@ -193,8 +193,8 @@ static void icmp_deliver_error(skbuff* skb, const icmp_error_info* info,
     else
         return;
 
-    worker* aim;
-    Socket* sock;
+    worker *aim;
+    Socket *sock;
     if (info->family == AF_INET6) {
         sock = search_socket_by_tuple6(info->src_ip, info->src_port,
                                        info->dst_ip, info->dst_port,
@@ -220,12 +220,12 @@ static void icmp_deliver_error(skbuff* skb, const icmp_error_info* info,
 }
 
 
-int icmp_recv(skbuff* skb)
-{ 
-    if (skb_data0_len(skb) < sizeof(icmp_hdr))
+int icmp_recv(skbuff *skb)
+{
+    if (unlikely(skb_data0_len(skb) < sizeof(icmp_hdr)))
         return -1;
 
-    icmp_hdr* icmp = (icmp_hdr*)skb_start(skb);
+    icmp_hdr *icmp = (icmp_hdr*)skb_start(skb);
     skb->icmp_hdr = icmp;
 
     uint32_t icmp_len = skb_data_len(skb);
@@ -238,7 +238,7 @@ int icmp_recv(skbuff* skb)
         return 0;
 
     /* Need at least: icmp_hdr + quoted ipv4 hdr + 8 bytes */
-    if (icmp_len < sizeof(icmp_hdr) + sizeof(ipv4_hdr) + 8) {
+    if (unlikely(icmp_len < sizeof(icmp_hdr) + sizeof(ipv4_hdr) + 8)) {
         DEBUG_LOG("icmp_recv: dest unreach too short len=%u", icmp_len);
         return -1;
     }
@@ -266,12 +266,12 @@ int icmp_recv(skbuff* skb)
     return 0;
 }
 
-int icmp6_recv(skbuff* skb)
+int icmp6_recv(skbuff *skb)
 {
-    if (skb_data0_len(skb) < sizeof(icmp_hdr))
+    if (unlikely(skb_data0_len(skb) < sizeof(icmp_hdr)))
         return -1;
 
-    icmp_hdr* icmp6 = (icmp_hdr*)skb_start(skb);
+    icmp_hdr *icmp6 = (icmp_hdr*)skb_start(skb);
     skb->icmp_hdr = icmp6;
     uint32_t icmp6_len = skb_data_len(skb);
 
@@ -288,7 +288,7 @@ int icmp6_recv(skbuff* skb)
         return 0;
 
     uint32_t payload_len = icmp6_len - (uint32_t)sizeof(*icmp6);
-    if (payload_len < sizeof(ipv6_hdr) + 2u * sizeof(uint16_t)) {
+    if (unlikely(payload_len < sizeof(ipv6_hdr) + 2u * sizeof(uint16_t))) {
         DEBUG_LOG("icmp6_recv: error quote too short len=%u", icmp6_len);
         return -1;
     }
@@ -312,9 +312,9 @@ int icmp6_recv(skbuff* skb)
 /* Build and send ICMP Destination Unreachable.
  * RFC792 requires to include original IP header + 8 bytes of its payload.
  */
-int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
+int icmp_send_dest_unreach(skbuff *orig_skb, uint8_t code)
 {
-    ipv4_hdr* oip = orig_skb->ipv4_hdr;
+    ipv4_hdr *oip = orig_skb->ipv4_hdr;
 
     /* Only generate errors for unicast IPv4 packets (best-effort). */
     if (oip->saddr == 0 || oip->daddr == 0)
@@ -326,64 +326,64 @@ int icmp_send_dest_unreach(skbuff* orig_skb, uint8_t code)
         return -1;
     }
 
-	uint8_t quote[sizeof(ipv4_hdr) + 8];
-	memcpy(quote, oip, oihl);
-	memcpy(quote + oihl, orig_skb->l4_hdr, 8);
-	uint32_t icmp_payload_len = oihl + 8u;
+    uint8_t quote[sizeof(ipv4_hdr) + 8];
+    memcpy(quote, oip, oihl);
+    memcpy(quote + oihl, orig_skb->l4_hdr, 8);
+    uint32_t icmp_payload_len = oihl + 8u;
     uint32_t icmp_len = (uint32_t)sizeof(icmp_hdr) + icmp_payload_len;
 
-	/* Look up the route to the original sender for L2 header sizing. */
-	route_key rkey = { .ip_family = AF_INET };
-	memcpy(rkey.dip, &oip->saddr, sizeof(oip->saddr));
-	route_info* icmp_route = search_route_table(&rkey);
-	uint32_t icmp_l2_len = icmp_route ? icmp_route->if_info->l2_len
-	                                  : (uint32_t)sizeof(ether_hdr);
-	uint32_t alloc_len = icmp_l2_len + sizeof(ipv4_hdr) + icmp_len;
-	skbuff* skb = skb_alloc(alloc_len);
+    /* Look up the route to the original sender for L2 header sizing. */
+    route_key rkey = { .ip_family = AF_INET };
+    memcpy(rkey.dip, &oip->saddr, sizeof(oip->saddr));
+    route_info *icmp_route = search_route_table(&rkey);
+    uint32_t icmp_l2_len = icmp_route ? icmp_route->if_info->l2_len
+                                      : (uint32_t)sizeof(ether_hdr);
+    uint32_t alloc_len = icmp_l2_len + sizeof(ipv4_hdr) + icmp_len;
+    skbuff *skb = skb_alloc(alloc_len);
     if (!skb) {
         PUT_REF(icmp_route);
         return -1;
-	}
-	skb_reserve(skb, icmp_l2_len + sizeof(ipv4_hdr));
+    }
+    skb_reserve(skb, icmp_l2_len + sizeof(ipv4_hdr));
 
-	skb->route = icmp_route;  /* ipv4_output will use this route */
+    skb->route = icmp_route;  /* ipv4_output will use this route */
     skb->family = AF_INET;
     skb->protocol = IPPROTO_ICMP;
 
-	Socket tmp = {0};
+    Socket tmp = {0};
     skb->sock = &tmp;
     tmp.sip = oip->daddr;
     tmp.dip = oip->saddr;
 
 
     /* Build ICMP message */
-	icmp_hdr* icmp = (icmp_hdr*)skb_data_put(skb, icmp_len, 0);
-	if (!icmp) {
-		PUT_REF(skb);
-		return -1;
-	}
+    icmp_hdr *icmp = (icmp_hdr*)skb_data_put(skb, icmp_len, 0);
+    if (!icmp) {
+        PUT_REF(skb);
+        return -1;
+    }
     memset(icmp, 0, sizeof(*icmp));
     icmp->type = ICMP_DEST_UNREACH;
     icmp->code = code;
     icmp->checksum = 0;
 
-	memcpy((uint8_t*)icmp + sizeof(icmp_hdr), quote, icmp_payload_len);
-	icmp->checksum = skb_checksum(skb, icmp_len, 0);
+    memcpy((uint8_t*)icmp + sizeof(icmp_hdr), quote, icmp_payload_len);
+    icmp->checksum = skb_checksum(skb, icmp_len, 0);
 
     int ret = ipv4_output(skb);
 
-	skb->sock = NULL;
+    skb->sock = NULL;
     PUT_REF(skb);
 
     return ret;
 }
 
-int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu)
+int icmp6_send_packet_too_big(skbuff *orig_skb, uint32_t mtu)
 {
     if (!mtu)
         return -1;
 
-    ipv6_hdr* original = orig_skb->ipv6_hdr;
+    ipv6_hdr *original = orig_skb->ipv6_hdr;
     static const uint8_t zero[16];
     if (memcmp(original->saddr, zero, sizeof(zero)) == 0 ||
         original->daddr[0] == 0xff)
@@ -401,7 +401,7 @@ int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu)
     if (orig_skb->recv_if)
         key.ifindex = (uint32_t)orig_skb->recv_if->ifindex;
     memcpy(key.dip, original->saddr, sizeof(key.dip));
-    route_info* route = search_route_table(&key);
+    route_info *route = search_route_table(&key);
     if (!route)
         return -1;
 
@@ -417,14 +417,14 @@ int icmp6_send_packet_too_big(skbuff* orig_skb, uint32_t mtu)
 
     uint32_t l2_len = route->if_info->l2_len;
     uint32_t icmp_len = (uint32_t)sizeof(icmp_hdr) + quote_len;
-    skbuff* reply = skb_alloc(l2_len + IPV6_HDR_LEN + icmp_len);
+    skbuff *reply = skb_alloc(l2_len + IPV6_HDR_LEN + icmp_len);
     if (!reply) {
         PUT_REF(route);
         return -1;
     }
     skb_reserve(reply, l2_len + IPV6_HDR_LEN);
 
-    icmp_hdr* icmp = (icmp_hdr*)skb_data_put(reply, icmp_len, 0);
+    icmp_hdr *icmp = (icmp_hdr*)skb_data_put(reply, icmp_len, 0);
     if (!icmp) {
         PUT_REF(reply);
         PUT_REF(route);

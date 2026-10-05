@@ -1,23 +1,24 @@
 #include "ipv6.h"
-#include "ip.h"
-#include "skbuff.h"
-#include "base.h"
-#include "init.h"
-#include "route_arp_ndp.h"
-#include "ether.h"
-#include "udp.h"
-#include "tcp.h"
-#include "log.h"
-#include "worker.h"
-#include "ipv6_ext.h"
-#include "icmp.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
 
-static bool ipv6_build_output_header(skbuff* skb, const uint8_t sip[16],
+#include "base.h"
+#include "ether.h"
+#include "icmp.h"
+#include "init.h"
+#include "ip.h"
+#include "ipv6_ext.h"
+#include "log.h"
+#include "route_arp_ndp.h"
+#include "skbuff.h"
+#include "tcp.h"
+#include "udp.h"
+#include "worker.h"
+
+static bool ipv6_build_output_header(skbuff *skb, const uint8_t sip[16],
                                      const uint8_t dip[16])
 {
     if (skb_data_len(skb) > UINT16_MAX)
@@ -25,7 +26,7 @@ static bool ipv6_build_output_header(skbuff* skb, const uint8_t sip[16],
 
     uint32_t l2_len = skb->route && skb->route->if_info
         ? skb->route->if_info->l2_len : 0;
-    ipv6_hdr* ip6 = (ipv6_hdr*)skb_data_push(
+    ipv6_hdr *ip6 = (ipv6_hdr*)skb_data_push(
         skb, IPV6_HDR_LEN, IPV6_HDR_LEN + l2_len);
     if (!ip6)
         return false;
@@ -49,8 +50,8 @@ int ipv6_init(void)
 
 /* ── 跳过扩展头，找到 L4 协议号 ────────────────────────── */
 /* Parse extension headers after the fixed IPv6 header has been consumed. */
-static int ipv6_skip_extension_headers(skbuff* skb, uint8_t initial_nh,
-                             uint8_t* out_proto)
+static int ipv6_skip_extension_headers(skbuff *skb, uint8_t initial_nh,
+                             uint8_t *out_proto)
 {
     uint8_t nh = initial_nh;
     uint32_t offset = 0;
@@ -66,11 +67,11 @@ static int ipv6_skip_extension_headers(skbuff* skb, uint8_t initial_nh,
             /* 长度编码为 (hdr_ext_len + 1) * 8 */
             {
                 uint8_t ext[2];
-                if (!skb_copy_bits(skb, offset, ext, sizeof(ext)))
+                if (unlikely(!skb_copy_bits(skb, offset, ext, sizeof(ext))))
                     return -1;
                 nh = ext[0];
                 uint32_t hdr_len = (uint32_t)(ext[1] + 1u) * 8u;
-                if (hdr_len < 8u || hdr_len > skb_data_len(skb) - offset)
+                if (unlikely(hdr_len < 8u || hdr_len > skb_data_len(skb) - offset))
                     return -1;
                 offset += hdr_len;
             }
@@ -78,7 +79,7 @@ static int ipv6_skip_extension_headers(skbuff* skb, uint8_t initial_nh,
         case IPV6_NEXTHDR_FRAG:
             {
                 ipv6_frag_hdr fh;
-                if (!skb_copy_bits(skb, offset, &fh, sizeof(fh)))
+                if (unlikely(!skb_copy_bits(skb, offset, &fh, sizeof(fh))))
                     return -1;
                 nh = fh.next_hdr;
                 offset += sizeof(fh);
@@ -92,7 +93,7 @@ static int ipv6_skip_extension_headers(skbuff* skb, uint8_t initial_nh,
             goto done;
         }
         *out_proto = nh;
-        if (offset > skb_data_len(skb))
+        if (unlikely(offset > skb_data_len(skb)))
                 return -1;
     }
 
@@ -107,7 +108,7 @@ done:
     return 0;
 }
 
-static inline worker* ipv6_select_fragment_worker(const ipv6_hdr* ip6)
+static inline worker *ipv6_select_fragment_worker(const ipv6_hdr *ip6)
 {
     if (g_worker_num <= 1)
         return get_current_worker();
@@ -121,9 +122,9 @@ static inline worker* ipv6_select_fragment_worker(const ipv6_hdr* ip6)
 }
 
 /* ── IPv6 首部校验 ────────────────────────────────────── */
-static bool ipv6_validate_header(skbuff* skb)
+static bool ipv6_validate_header(skbuff *skb)
 {
-    ipv6_hdr* ip6 = skb->ipv6_hdr;
+    ipv6_hdr *ip6 = skb->ipv6_hdr;
 
     if (IPV6_VERSION(ip6) != 6)
         return false;
@@ -131,7 +132,7 @@ static bool ipv6_validate_header(skbuff* skb)
         return false;
 
     uint32_t total = IPV6_HDR_LEN + ntohs(ip6->payload_len);
-    if (skb_data_len(skb) < total)
+    if (unlikely(skb_data_len(skb) < total))
         return false;
     if (skb_data_len(skb) > total)
         skb_truncate(skb, total);
@@ -140,15 +141,15 @@ static bool ipv6_validate_header(skbuff* skb)
 }
 
 /* ── IPv6 接收 ────────────────────────────────────────── */
-int ipv6_recv(skbuff* skb)
+int ipv6_recv(skbuff *skb)
 {
     int ret = 0;
     skb->family = AF_INET6;
 
-    if (skb_data0_len(skb) < IPV6_HDR_LEN)
+    if (unlikely(skb_data0_len(skb) < IPV6_HDR_LEN))
         return -1;
 
-    ipv6_hdr* ip6 = (ipv6_hdr*)skb_start(skb);
+    ipv6_hdr *ip6 = (ipv6_hdr*)skb_start(skb);
     skb->ipv6_hdr = ip6;
     skb->l4_private.tcp.ip_ecn =
         (uint8_t)(IPV6_TRAFFIC_CLASS(ip6) & 0x03u);
@@ -157,7 +158,7 @@ int ipv6_recv(skbuff* skb)
         return -1;
 
     bool fragmented = ipv6_has_frag(skb);
-    worker* fragment_worker = fragmented
+    worker *fragment_worker = fragmented
         ? ipv6_select_fragment_worker(ip6) : get_current_worker();
     if (fragment_worker != get_current_worker()) {
         worker_enqueue_skb(fragment_worker, skb, ipv6_recv);
@@ -167,7 +168,7 @@ int ipv6_recv(skbuff* skb)
     if (set_skb_route(skb, AF_INET6, ip6->daddr) < 0)
         return -1;
 
-    route_info* route = skb->route;
+    route_info *route = skb->route;
     if (!route_is_local_host(route)) {
         DEBUG_LOG("Forwarding IPv6 packet");
         return ipv6_forward(skb);
@@ -175,7 +176,7 @@ int ipv6_recv(skbuff* skb)
 
     /* 分片重组（必须在 consume IPv6 头之前，已重组包跳过） */
     if (!skb->flag.is_defrag && fragmented) {
-        skbuff* reassembled = ipv6_defrag(skb);
+        skbuff *reassembled = ipv6_defrag(skb);
         if (!reassembled)
             return 0;  /* 等待更多分片 */
         skb = reassembled;
@@ -225,28 +226,33 @@ fail_reassembled:
 }
 
 /* ── IPv6 输出 ────────────────────────────────────────── */
-int ipv6_output(skbuff* skb)
+int ipv6_output(skbuff *skb)
 {
-    route_info* route = skb->route;
+    route_info *route = skb->route;
     if (!skb->flag.is_forward) {
-        const uint8_t* dip = skb->sock->dip6;
-        const uint8_t* sip = skb->sock->sip6;
+        const uint8_t *dip = skb->sock->dip6;
+        const uint8_t *sip = skb->sock->sip6;
 
         if (set_skb_route(skb, AF_INET6, dip) < 0)
             return -1;
         route = skb->route;
 
-        if (skb->protocol == IPPROTO_TCP &&
-            route->if_info->mtu > IPV6_HDR_LEN &&
-            skb_data_len(skb) > route->if_info->mtu - IPV6_HDR_LEN) {
-            if (!tcp_skb_frag(skb, route->if_info->mtu))
+        uint32_t mtu = route->if_info->mtu;
+        if (skb->protocol == IPPROTO_TCP && skb->sock &&
+            skb->sock->metrics)
+            mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
+                                   get_current_time_ms());
+
+        if (skb->protocol == IPPROTO_TCP && mtu > IPV6_HDR_LEN &&
+            skb_data_len(skb) > mtu - IPV6_HDR_LEN) {
+            if (!tcp_skb_frag(skb, mtu))
                 return -1;
         }
 
         if (!ipv6_build_output_header(skb, sip, dip))
             return -1;
         if (skb->frag_list.next) {
-            skbuff* frag;
+            skbuff *frag;
             FOR_EACH_LIST_OFFSET(&skb->frag_list, frag, skbuff, frag_list) {
                 if (!ipv6_build_output_header(frag, sip, dip))
                     return -1;
@@ -275,7 +281,7 @@ int ipv6_output(skbuff* skb)
 }
 
 /* ── IPv6 转发 ────────────────────────────────────────── */
-int ipv6_forward(skbuff* skb)
+int ipv6_forward(skbuff *skb)
 {
     if (!g_cfg.ipv6_forward) {
         DEBUG_LOG("IPv6 forwarding disabled, dropping packet");

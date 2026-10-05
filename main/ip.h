@@ -31,8 +31,8 @@ typedef struct ipv4_hdr {
     uint32_t options[0];
 } __attribute__((packed)) ipv4_hdr;
 int ipv4_init(void);
-int ipv4_recv(skbuff* skb);
-int ipv4_output(skbuff* skb);
-int ipv4_forward(skbuff* skb);
+int ipv4_recv(skbuff *skb);
+int ipv4_output(skbuff *skb);
+int ipv4_forward(skbuff *skb);
 
-#endif
+#endif /* IP_H */
