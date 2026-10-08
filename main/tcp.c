@@ -21,7 +21,7 @@
 #include "rss.h"
 #include "skbuff.h"
 #include "stack.h"
-#include "tcp_metrics.h"
+#include "ip_metrics.h"
 #include "worker.h"
 #include "xdp.h"
 
@@ -458,7 +458,7 @@ static int tcp_pcb_init(Socket *sock) {
     pcb->last_ack = iss;
 
     /* TCP state-processing details follow RFC 793 and RFC 5961. */
-    pcb->retransmit_timeout = tcp_metrics_default_rto();
+    pcb->retransmit_timeout = ip_metrics_default_rto();
 
     return 0;
 
@@ -704,7 +704,7 @@ static void tcp_timer_cb(task *tk)
                 tcp_ca_rto_timeout(pcb);
 
                 pcb->retransmit_timeout =
-                    tcp_metrics_backoff(pcb->retransmit_timeout);
+                    ip_metrics_backoff(pcb->retransmit_timeout);
                 tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,
                                 get_current_time_ms() + pcb->retransmit_timeout,
                                 true);
@@ -834,20 +834,33 @@ static int tcp_set_socket_route(Socket *sock, const uint8_t *dip,
 {
     tcp_pcb *pcb = (tcp_pcb*)sock->pcb;
     if (set_socket_route(sock, dip, if_index) < 0) {
+        PUT_REF(pcb->metrics);
+        pcb->metrics = NULL;
         return -1;
     }
     if (route_is_broadcast(sock->route) || route_is_multicast(sock->route)) {
         route_info *route = sock->route;
         sock->route = NULL;
         PUT_REF(route);
+        PUT_REF(pcb->metrics);
+        pcb->metrics = NULL;
         return -1;
     }
 
-    if (pcb->metrics != sock->metrics) {
+    ip_metrics *metrics = ip_metrics_get(
+        sock->family, dip, sock->route->ifindex);
+    if (!metrics) {
         PUT_REF(pcb->metrics);
-        GET_REF(pcb->metrics, sock->metrics);
+        pcb->metrics = NULL;
+        return -1;
     }
-    pcb->retransmit_timeout = tcp_metrics_rto(pcb->metrics);
+    if (pcb->metrics != metrics) {
+        PUT_REF(pcb->metrics);
+        pcb->metrics = metrics;
+    } else {
+        PUT_REF(metrics);
+    }
+    pcb->retransmit_timeout = ip_metrics_rto(pcb->metrics);
 
     tcp_update_mss(pcb);
 
@@ -1171,7 +1184,7 @@ static void tcp_update_retransmit_tree(tcp_pcb *pcb) {
 
     if (acked_bytes) {
         pcb->retransmits_out = 0;
-        pcb->retransmit_timeout = tcp_metrics_rto(pcb->metrics);
+        pcb->retransmit_timeout = ip_metrics_rto(pcb->metrics);
 
         socket_notify_event(pcb->sock, notify_data_write);
 
@@ -1775,9 +1788,9 @@ static int tcp_input(Socket *sock, skbuff *skb)
                     sample = (uint32_t)(now - pcb->rtt_meas_time);
                 }
 
-                if (sample && pcb->metrics) {
+                if (sample) {
                     pcb->retransmit_timeout =
-                        tcp_metrics_sample(pcb->metrics, sample);
+                        ip_metrics_sample(pcb->metrics, sample);
                 }
                 pcb->rtt_meas_time = 0;
 
@@ -2951,12 +2964,8 @@ static int tcp_icmp_process(Socket *sock, const icmp_error_info *info, int err)
 
     if (err == EMSGSIZE && info->mtu) {
         uint32_t link_mtu = get_route_mtu(sock->route);
-        if (ip_metrics_update_pmtu(sock->metrics, info->mtu, link_mtu,
+        if (ip_metrics_update_pmtu(pcb->metrics, info->mtu, link_mtu,
                                    get_current_time_ms())) {
-            if (pcb->metrics != sock->metrics) {
-                PUT_REF(pcb->metrics);
-                GET_REF(pcb->metrics, sock->metrics);
-            }
             tcp_update_mss(pcb);
 
             tcp_update_timer(pcb, &pcb->retransmit_deadline_ms,

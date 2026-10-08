@@ -238,9 +238,10 @@ int ipv6_output(skbuff *skb)
         route = skb->route;
 
         uint32_t mtu = route->if_info->mtu;
-        if (skb->protocol == IPPROTO_TCP && skb->sock &&
-            skb->sock->metrics)
-            mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
+        tcp_pcb *pcb = skb->protocol == IPPROTO_TCP && skb->sock
+            ? (tcp_pcb*)skb->sock->pcb : NULL;
+        if (pcb && pcb->metrics)
+            mtu = ip_metrics_pmtu(pcb->metrics, mtu,
                                    get_current_time_ms());
 
         if (skb->protocol == IPPROTO_TCP && mtu > IPV6_HDR_LEN &&

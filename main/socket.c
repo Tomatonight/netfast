@@ -15,7 +15,6 @@
 #include "req_socket.h"
 #include "rss.h"
 #include "tcp.h"
-#include "tcp_metrics.h"
 #include "udp.h"
 #include "worker.h"
 
@@ -476,7 +475,6 @@ void destroy_socket(Socket *sock) {
         PUT_REF(skb);
     }
     PUT_REF(sock->route);
-    PUT_REF(sock->metrics);
     free(sock);
 }
 
@@ -1314,25 +1312,12 @@ bool socket_route_is_valid(const Socket *sock, const uint8_t *dest_ip,
                                    sock->route_scope_id, dest_ip, scope_id);
 }
 
-static void socket_refresh_metrics(Socket *sock, const uint8_t *dest_ip)
-{
-    ip_metrics *metrics = ip_metrics_get(
-        sock->family, dest_ip, sock->route ? sock->route->ifindex : 0);
-    if (metrics != sock->metrics) {
-        PUT_REF(sock->metrics);
-        sock->metrics = metrics;
-    } else {
-        PUT_REF(metrics);
-    }
-}
-
 int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
 {
     uint64_t generation = route_table_generation(sock->family);
 
     if (sock->family == AF_INET6) {
         if (socket_route_is_valid(sock, dest_ip, scope_id)) {
-            socket_refresh_metrics(sock, dest_ip);
             return 0;
         }
 
@@ -1343,7 +1328,6 @@ int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
         if (!route) {
             PUT_REF(sock->route);
             sock->route = NULL;
-            PUT_REF(sock->metrics);
             sock->route_generation = generation;
             return -1;
         }
@@ -1356,13 +1340,11 @@ int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
         sock->route_generation = generation;
         memcpy(sock->route_dest, dest_ip, 16);
         sock->route_scope_id = scope_id;
-        socket_refresh_metrics(sock, dest_ip);
         return 0;
     }
 
     /* IPv4 */
     if (socket_route_is_valid(sock, dest_ip, scope_id)) {
-        socket_refresh_metrics(sock, dest_ip);
         return 0;
     }
     route_key key = { .ip_family = AF_INET };
@@ -1371,7 +1353,6 @@ int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
     if (!route) {
         PUT_REF(sock->route);
         sock->route = NULL;
-        PUT_REF(sock->metrics);
         sock->route_generation = generation;
         return -1;
     }
@@ -1384,7 +1365,6 @@ int set_socket_route(Socket *sock, const uint8_t *dest_ip, uint32_t scope_id)
     sock->route_generation = generation;
     memcpy(sock->route_dest, dest_ip, 4);
     sock->route_scope_id = 0;
-    socket_refresh_metrics(sock, dest_ip);
     return 0;
 }
 

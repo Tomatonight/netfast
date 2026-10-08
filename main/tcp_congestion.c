@@ -39,7 +39,7 @@ static inline double tcp_cubic_wt(const tcp_cubic *cubic, uint64_t t)
 static inline uint64_t tcp_cubic_cwnd(const tcp_pcb *pcb,
                                      const tcp_cubic *cubic, uint64_t t)
 {
-    uint32_t rtt_ms = pcb->metrics ? pcb->metrics->rtt : 0;
+    uint32_t rtt_ms = ip_metrics_srtt(pcb->metrics);
     uint64_t next_rtt = t > UINT64_MAX - rtt_ms ? UINT64_MAX : t + rtt_ms;
     double wt_rtt = tcp_cubic_wt(cubic, next_rtt) * pcb->snd_mss;
     uint64_t cwnd = pcb->snd_cwnd;

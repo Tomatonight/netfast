@@ -3,7 +3,7 @@
 
 #include "socket.h"
 #include "tcp_congestion.h"
-#include "tcp_metrics.h"
+#include "ip_metrics.h"
 #include "tcp_rack.h"
 #include "tcp_sack.h"
 #include "thread.h"
@@ -117,7 +117,7 @@ typedef struct tcp_skb_tree {
 
 typedef struct tcp_pcb {
     Socket *sock;
-    tcp_metrics *metrics;
+    ip_metrics *metrics;
     enum tcp_state state;
     task *timer_task;
 

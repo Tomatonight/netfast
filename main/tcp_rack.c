@@ -90,7 +90,7 @@ void tcp_rack_update_last_acked(tcp_pcb *pcb, skbuff *skb)
 
 bool tcp_rack_skb_lost(tcp_pcb *pcb, skbuff *skb)
 {
-    uint64_t rtt_ms = tcp_metrics_srtt(pcb->metrics);
+    uint64_t rtt_ms = ip_metrics_srtt(pcb->metrics);
     if (!tcp_rack_sent_after(pcb->rack.last_send_acked_ms,
                              pcb->rack.last_send_acked_end_seq,
                              skb->l4_private.tcp.pkt_send_ms,
@@ -152,7 +152,7 @@ void tcp_rack_update_timer(tcp_pcb *pcb) {
                             pcb->rack.last_send_acked_end_seq,
                             skb->l4_private.tcp.pkt_send_ms,
                             skb->l4_private.tcp.seq_end)) {
-        uint64_t rtt_ms = tcp_metrics_srtt(pcb->metrics);
+        uint64_t rtt_ms = ip_metrics_srtt(pcb->metrics);
         deadline = tcp_rack_skb_lost(pcb, skb)
             ? get_current_time_ms()
             : skb->l4_private.tcp.pkt_send_ms +

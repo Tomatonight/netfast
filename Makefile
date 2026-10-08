@@ -59,7 +59,7 @@ SRC_MAIN := \
 	main/stack.c \
 	main/tcp.c \
 	main/tcp_congestion.c \
-	main/tcp_metrics.c \
+	main/ip_metrics.c \
 	main/tcp_rack.c \
 	main/tcp_sack.c \
 	main/udp.c \

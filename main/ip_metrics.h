@@ -1,5 +1,5 @@
-#ifndef TCP_METRICS_H
-#define TCP_METRICS_H
+#ifndef IP_METRICS_H
+#define IP_METRICS_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -8,21 +8,21 @@
 #include "hash.h"
 
 /* Retransmission-timeout policy (milliseconds). */
-#define TCP_RETRANSMIT_TIMEOUT_MS_MAX 10000u
-#define TCP_RTO_MIN_MS                1000u
+#define IP_METRICS_RTO_MAX_MS 10000u
+#define IP_METRICS_RTO_MIN_MS 1000u
 
 /* 共享的按目的地 metrics 以 (目的地 IP, 出口 ifindex) 为 key。
  * IPv4 地址放在 dip 前 4 字节、其余补零，因此 v4/v6 共用同一个
  * 20 字节连续 key 布局（dip[16] + ifindex）。 */
-typedef struct ip_metric_key {
+typedef struct ip_metrics_key {
     uint8_t dip[16];
     uint32_t ifindex;
-} ip_metric_key;
+} ip_metrics_key;
 
 typedef struct ip_metrics {
     ref_info ref;
     hash_node node;
-    ip_metric_key key;
+    ip_metrics_key key;
     int family;
     _Atomic uint32_t rtt;
     _Atomic uint32_t last_rtt_ms;
@@ -31,13 +31,9 @@ typedef struct ip_metrics {
     _Atomic uint64_t pmtu_updated_ms;
 } ip_metrics;
 
-/* Source compatibility for the TCP congestion/RACK code.  The object is
- * now an IP-path metric; TCP only owns the RTT part of it. */
-typedef ip_metrics tcp_metrics;
-
-/* 按地址族拆分的共享缓存（由 tcp_metrics_init() 创建）。 */
-extern hash *tcp_metrics_hash_v4;
-extern hash *tcp_metrics_hash_v6;
+/* 按地址族拆分的共享缓存（由 ip_metrics_init() 创建）。 */
+extern hash *ip_metrics_hash_v4;
+extern hash *ip_metrics_hash_v6;
 
 ip_metrics *ip_metrics_get(int family, const uint8_t *dip, uint32_t ifindex);
 bool ip_metrics_update_pmtu(ip_metrics *metrics, uint32_t mtu,
@@ -45,14 +41,14 @@ bool ip_metrics_update_pmtu(ip_metrics *metrics, uint32_t mtu,
 uint32_t ip_metrics_pmtu(const ip_metrics *metrics, uint32_t link_mtu,
                          uint64_t now_ms);
 
-int tcp_metrics_init(void);
+int ip_metrics_init(void);
 
 /* RFC 6298 estimator and all RTO policy helpers. */
-uint32_t tcp_metrics_default_rto(void);
+uint32_t ip_metrics_default_rto(void);
 /* Return the smoothed RTT, including the conservative initial estimate. */
-uint32_t tcp_metrics_srtt(const tcp_metrics *metrics);
-uint32_t tcp_metrics_sample(tcp_metrics *metrics, uint32_t measured_rtt);
-uint32_t tcp_metrics_rto(const tcp_metrics *metrics);
-uint32_t tcp_metrics_backoff(uint32_t rto);
+uint32_t ip_metrics_srtt(const ip_metrics *metrics);
+uint32_t ip_metrics_sample(ip_metrics *metrics, uint32_t measured_rtt);
+uint32_t ip_metrics_rto(const ip_metrics *metrics);
+uint32_t ip_metrics_backoff(uint32_t rto);
 
-#endif /* TCP_METRICS_H */
+#endif /* IP_METRICS_H */

@@ -13,7 +13,6 @@
 #include "log.h"
 #include "queue.h"
 #include "rss.h"
-#include "tcp_metrics.h"
 #include "thread.h"
 #include "worker.h" /* g_workers/g_worker_num */
 
@@ -29,9 +28,6 @@ static int udp_output(skbuff *skb)
         ? IPV6_HDR_LEN : sizeof(ipv4_hdr);
     uint32_t mtu = route_info_is_valid(skb->route, skb->route_generation)
         ? get_route_mtu(skb->route) : 0;
-    if (mtu && skb->sock && skb->sock->metrics)
-        mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
-                              get_current_time_ms());
     if (mtu && skb_data_len(skb) + ip_header > mtu)
         return -EMSGSIZE;
     int ret = skb->family == AF_INET6
@@ -674,14 +670,9 @@ static int udp_release(struct Socket *sock, req *r)
 static int udp_icmp_process(struct Socket *sock,
                             const icmp_error_info *info, int err)
 {
+    (void)info;
     if (!sock->flag.is_bound || !sock->flag.is_connected) {
         return 0;
-    }
-
-    if (err == EMSGSIZE && info->mtu) {
-        (void)ip_metrics_update_pmtu(sock->metrics, info->mtu,
-                                      get_route_mtu(sock->route),
-                                      get_current_time_ms());
     }
 
     sock->error = err;

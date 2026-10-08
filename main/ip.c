@@ -60,7 +60,7 @@ int ipv4_init(void)
     ipv4_id_init();
     if (route_init() < 0)
         return -1;
-    return tcp_metrics_init();
+    return ip_metrics_init();
 }
 
 static bool ipv4_validate_header(skbuff *skb)
@@ -209,9 +209,10 @@ int ipv4_output(skbuff *skb)
         route = skb->route;
 
         uint32_t mtu = route->if_info->mtu;
-        if (skb->protocol == IPPROTO_TCP && skb->sock &&
-            skb->sock->metrics)
-            mtu = ip_metrics_pmtu(skb->sock->metrics, mtu,
+        tcp_pcb *pcb = skb->protocol == IPPROTO_TCP && skb->sock
+            ? (tcp_pcb*)skb->sock->pcb : NULL;
+        if (pcb && pcb->metrics)
+            mtu = ip_metrics_pmtu(pcb->metrics, mtu,
                                    get_current_time_ms());
 
         if (skb->protocol == IPPROTO_TCP && mtu > sizeof(ipv4_hdr) &&

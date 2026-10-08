@@ -22,7 +22,6 @@ typedef struct bind_slot bind_slot;
 typedef struct bind_table bind_table;
 typedef struct tuple_entry tuple_entry;
 typedef struct icmp_error_info icmp_error_info;
-typedef struct ip_metrics ip_metrics;
 struct thread;
 
 #define SOCKET_USEABLE_RECV_BUFF_SIZE(sock) \
@@ -117,7 +116,6 @@ typedef struct Socket {
     uint32_t send_buffer_len_max;
 
     route_info *route;
-    ip_metrics *metrics;
     uint64_t route_generation;
     uint8_t route_dest[16];
     uint32_t route_scope_id;
